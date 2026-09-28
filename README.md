@@ -1,51 +1,49 @@
 # buds-naiveproxy
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Ubuntu%20%7C%20Debian-orange.svg)](#系统与架构支持)
-[![Protocol](https://img.shields.io/badge/Protocol-HTTP%2F2%20%7C%20HTTP%2F3%20QUIC-success.svg)](#协议优势)
+```text
+  _               _                                 _                               
+ | |__  _   _  __| |___       _ __   __ _ _ ____  _| |_ __  _ __ _____  ___   _ 
+ | '_ \| | | |/ _` / __|_____| '_ \ / _` | '__\ \/ / | '_ \| '__/ _ \ \/ / | | |
+ | |_) | |_| | (_| \__ \_____| | | | (_| | |   >  <| | |_) | | | (_) >  <| |_| |
+ |_.__/ \__,_|\__,_|___/     |_| |_|\__,_|_|  /_/\_\_| .__/|_|  \___/_/\_\\__, |
+                                                     |_|                  |___/ 
+```
 
-一个工业级、遵循**最小特权原则**（Least Privilege）与 **Systemd 严格沙箱隔离**的 NaiveProxy 官方原版组件自动化交互式部署与运维控制台。
+> **A minimalist, least-privilege NaiveProxy orchestration script.**  
+> 专为 Linux 设计的 NaiveProxy 自动化部署与沙箱化运维工具，专注于进程权限隔离与网关无冲突协同。
 
 ---
 
-## ⚡ 极速开始 (One-Line Quick Start)
+## 快速开始
 
-在任意全新的 Ubuntu / Debian 服务器（或已有 Nginx 网站的服务器）上，以 root 权限执行以下单行命令即可启动交互式安装控制台：
+在目标 Linux 服务器（Debian 11+ / Ubuntu 20.04+）上执行：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Buds-2025/buds-naiveproxy/main/install.sh)
 ```
 
-> [!TIP]
-> 脚本支持通过管道免下载直接执行，内置完整的交互式控制台，支持安装、状态监控、客户端配置导出、实时日志审计与一键干净卸载。
+支持管道流直接交互。再次运行同一命令可呼出管理菜单（状态检查、热重载、审计跟踪、干净卸载）。
 
 ---
 
-## 🛡️ 核心安全与架构特性
+## 设计哲学
 
-1. **绝对零破坏共存（Zero-Conflict Architecture）**：
-   - 自动检测 80/443 端口占用情况。若宿主机已有 Nginx（如个人博客、静态站），脚本自动走 `--nginx` 模式无缝申请 Let's Encrypt 证书；
-   - 强制隔离全局 `auto_https off`，绝不擅自抢占或干扰 80/443 端口。
-2. **最小特权沙箱隔离（Least Privilege Sandbox）**：
-   - 自动创建独立的系统非特权专有用户 `caddy`（登录 Shell 设置为 `/usr/sbin/nologin`，彻底阻断 SSH 登录风险）；
-   - Systemd 服务级硬化配置：开启 `ProtectSystem=strict`、`ProtectHome=yes`、`NoNewPrivileges=yes` 与 Linux Capability `CAP_NET_BIND_SERVICE` 精准赋权；
-   - 证书文件权限收紧为 `600`（私钥）与 `644`（公钥），仅 `caddy` 自身可读。
-3. **企业级指纹混淆与主动探测防御**：
-   - 自动消除 Caddy 原生特征，将响应头伪装为 `Server: nginx` 或 `Server: cloudflare`；
-   - 开启现代 Web 网关标配的 `encode zstd gzip` 传输压缩与 HSTS (`Strict-Transport-Security`, `nosniff`, `DENY`) 安全头；
-   - 内置 `probe_resistance` 防御密钥机制，面对未授权主动嗅探与 GFW 扫描时，自动回源展示高逼真企业级边缘网关文档站。
-4. **低内存编译自动防护（OOM Protection）**：
-   - 检测到机器物理内存低于 2GB 时，自动调度 2GB 临时 Swap 虚拟内存，确保 Go 编译期间不会触发 Linux OOM Killer，编译完成后自动释放，即使 512MB / 1GB 小鸡也能丝滑搭建。
-5. **内核级网络加速**：
-   - 一键开启 Linux 官方 Google BBR 拥塞控制算法，结合 7.5MB `rmem_max`/`wmem_max` 核心网络缓冲区微调，晚高峰跨境吞吐量显著提升。
-6. **全自动证书续期与平滑重载**：
-   - 部署 Certbot Deploy-Hook 钩子脚本，每 60 天后台无感自动续期并执行 `systemctl reload caddy`，零停机、零断流。
+* **特权最小化（Least Privilege）**  
+  服务运行于独立系统用户 `caddy`（`nologin`）。Systemd 层面启用 `ProtectSystem=strict`、`ProtectHome=yes`、`NoNewPrivileges=yes`，并通过 Linux Capabilities 仅赋予 `CAP_NET_BIND_SERVICE`。
+* **零冲突共存（Gateway Coexistence）**  
+  不强占 `80`/`443` 端口。针对已存在 Nginx 的宿主机，通过 Certbot 模块化申请与续签，强制保留 `auto_https off`，绝不修改宿主机已有网站配置。
+* **特征常态化（Fingerprint Normalization）**  
+  消除 Caddy 特有响应头，自适应回退为 `Server: nginx` 或 `Server: cloudflare`；集成 `encode zstd gzip` 动态压缩与 HSTS 传输安全策略，行为与生产级 Web 网关保持一致。
+* **主动探测规避（Probe Resistance）**  
+  集成 `probe_resistance` 密钥路径过滤。未携带认证凭证的随机嗅探与恶意扫描将静默路由至预置的静态网关页面，削弱主动探测威胁。
+* **低开销运行**  
+  Caddy + Go 官方原生编译，空闲内存占用约 15MB~30MB。构建时遇低内存机器（< 2GB）自动调度临时 Swap，防止 OOM 崩溃。
 
 ---
 
-## 💻 客户端接入指引 (Client Configuration)
+## 客户端配置范例
 
-安装完成后，脚本将在当前目录生成标准客户端配置文件 `naive_client.json`：
+安装完成后，程序将在执行目录生成 `naive_client.json`：
 
 ```json
 {
@@ -54,54 +52,36 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Buds-2025/buds-naiveproxy/ma
 }
 ```
 
-### 1. v2rayN 客户端
-1. 前往 [NaiveProxy GitHub Releases](https://github.com/klzgrad/naiveproxy/releases) 下载适合您系统架构的客户端，解压得到 `naive.exe`，放入 v2rayN 根目录或 `v2rayN-Core` 文件夹中；
-2. 在 v2rayN 界面点击 **服务器** -> **添加自定义配置服务器**；
-3. Core 类型选择 **`naive`**，导入或粘贴上述 JSON 内容，Socks 监听端口填 `10808`；
-4. 设为活动服务器即可连接。
-
-### 2. 原生命令行客户端
-```bash
-./naive naive_client.json
-```
+* **v2rayN**：下载 [NaiveProxy 官方 Releases](https://github.com/klzgrad/naiveproxy/releases) 内核放入目录，添加自定义配置服务器，类型选择 `naive`。
+* **CLI 原生运行**：`./naive naive_client.json`。
 
 ---
 
-## 🛠️ 管理控制台常用命令
-
-除了再次运行 `bash <(curl ...)` 调出管理控制台外，您也可以直接使用 Linux 原生命令进行维护：
+## 运维速查
 
 ```bash
-# 查看服务状态
-systemctl status caddy
-
-# 平滑热重载配置（修改配置后使用，不中断已有连接）
-systemctl reload caddy
-
-# 查看 Caddy 运行日志
-journalctl -u caddy -f
-
-# 查看 JSON 访问审计日志（监控扫描器探测）
-tail -f /var/log/caddy/access.log
-
-# 校验配置文件语法
-/usr/local/bin/caddy validate --config /etc/caddy/Caddyfile
+systemctl status caddy         # 查看运行状态
+systemctl reload caddy         # 平滑热重载（不中断活跃连接）
+journalctl -u caddy -f         # 跟踪服务日志
+tail -f /var/log/caddy/access.log  # 实时审计访问日志（JSON 格式）
+/usr/local/bin/caddy validate --config /etc/caddy/Caddyfile  # 校验语法
 ```
 
 ---
 
-## 📂 项目文件结构
+## 风险规避与使用说明
 
-```text
-buds-naiveproxy/
-├── .gitignore                 # Git 忽略规则（阻断敏感信息泄露）
-├── README.md                  # 开源项目说明文档
-├── install.sh                 # 核心自动化交互式安装与运维脚本
-└── naive_config.example.json  # 客户端配置示例模板
-```
+1. **非绝对安全声明**  
+   任何代理技术都无法提供 100% 的不可封锁保障。虽然 NaiveProxy 基于 Chromium 网络栈与真实 TLS 握手特征，但审查系统仍可能通过 IP 归属地、连接频次、流量时序分析（Traffic Analysis）或针对特定非标准端口的异常流量实施限速或阻断。
+2. **域名与证书合规**  
+   请使用解析记录准确的自有合规域名，并确保证书由权威 CA（如 Let's Encrypt）有效签发。切勿在证书无效或解析未生效时强行连接，否则客户端可能直接报错或触发 SNI 审计异常。
+3. **资源与端口策略**  
+   建议选择 `8443`、`2096` 等常见 TLS 备用端口，避免使用冷门高位端口引起异常关注。避免长期单 IP 满载占用境外骨干网出口，降低被运营商策略性流控的几率。
+4. **免责条款**  
+   本项目仅供网络协议工程研究、学术探索与服务安全加固评估使用。使用者需严格遵守当地法律法规，作者不对因使用此脚本而导致的任何 IP 阻断、数据丢失或合规风险负责。
 
 ---
 
-## 📄 许可证
+## 许可证
 
-本项目基于 [MIT 许可证](LICENSE) 开源。
+[MIT License](LICENSE)
