@@ -396,23 +396,81 @@ check_root() {
 }
 
 get_domain() {
-    local domain
-    domain=$(sed -n 's/^[[:space:]]*sni:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$CLIENT_CONFIG_FILE" 2>/dev/null | head -1)
-    [[ -z "$domain" ]] && domain=$(grep -o 'live/[^/]*' /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh 2>/dev/null | cut -d'/' -f2 | head -1)
+    local domain=""
+    if [[ -f "$CLIENT_CONFIG_FILE" ]]; then
+        domain=$(awk -F': *' '/^[[:space:]]*sni:/ {gsub(/^["'\'' ]+|["'\'' \r]+$/, "", $2); print $2; exit}' "$CLIENT_CONFIG_FILE" 2>/dev/null)
+    fi
+    if [[ -z "$domain" ]]; then
+        domain=$(grep -o 'live/[^/]*' /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh 2>/dev/null | cut -d'/' -f2 | head -1)
+    fi
     [[ -z "$domain" ]] && domain="your.domain.com"
     echo "$domain"
 }
 
 get_password() {
-    sed -n 's/^[[:space:]]*password:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_FILE" 2>/dev/null | head -1
+    local pwd=""
+    if [[ -f "$CONFIG_FILE" ]]; then
+        pwd=$(awk '
+          /^[[:space:]]*auth:/ { in_auth=1; in_obfs=0 }
+          /^[[:space:]]*obfs:/ { in_auth=0; in_obfs=1 }
+          in_auth && /^[[:space:]]*password:/ {
+            sub(/^[[:space:]]*password:[[:space:]]*/, "");
+            gsub(/^["'\'' ]+|["'\'' \r]+$/, "");
+            print;
+            exit;
+          }
+        ' "$CONFIG_FILE" 2>/dev/null)
+    fi
+    if [[ -z "$pwd" && -f "$CLIENT_CONFIG_FILE" ]]; then
+        pwd=$(awk '
+          /^[[:space:]]*auth:/ {
+            sub(/^[[:space:]]*auth:[[:space:]]*/, "");
+            gsub(/^["'\'' ]+|["'\'' \r]+$/, "");
+            print;
+            exit;
+          }
+        ' "$CLIENT_CONFIG_FILE" 2>/dev/null)
+    fi
+    echo "$pwd"
 }
 
 get_obfs_pwd() {
-    sed -n 's/^[[:space:]]*password:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_FILE" 2>/dev/null | tail -1
+    local obfs=""
+    if [[ -f "$CONFIG_FILE" ]]; then
+        obfs=$(awk '
+          /^[[:space:]]*obfs:/ { in_obfs=1; in_auth=0 }
+          /^[[:space:]]*auth:/ { in_obfs=0 }
+          in_obfs && /^[[:space:]]*password:/ {
+            sub(/^[[:space:]]*password:[[:space:]]*/, "");
+            gsub(/^["'\'' ]+|["'\'' \r]+$/, "");
+            print;
+            exit;
+          }
+        ' "$CONFIG_FILE" 2>/dev/null)
+    fi
+    if [[ -z "$obfs" && -f "$CLIENT_CONFIG_FILE" ]]; then
+        obfs=$(awk '
+          /^[[:space:]]*obfs:/ { in_obfs=1 }
+          in_obfs && /^[[:space:]]*password:/ {
+            sub(/^[[:space:]]*password:[[:space:]]*/, "");
+            gsub(/^["'\'' ]+|["'\'' \r]+$/, "");
+            print;
+            exit;
+          }
+        ' "$CLIENT_CONFIG_FILE" 2>/dev/null)
+    fi
+    echo "$obfs"
 }
 
 get_listen() {
-    sed -n 's/^[[:space:]]*listen:[[:space:]]*\(.*\)/\1/p' "$CONFIG_FILE" 2>/dev/null | tr -d ' :' | head -1
+    local listen=""
+    if [[ -f "$CONFIG_FILE" ]]; then
+        listen=$(sed -n 's/^[[:space:]]*listen:[[:space:]]*\(.*\)/\1/p' "$CONFIG_FILE" 2>/dev/null | tr -d ' :\r' | head -1)
+    fi
+    if [[ -z "$listen" && -f "$CLIENT_CONFIG_FILE" ]]; then
+        listen=$(sed -n 's/^[[:space:]]*server:[[:space:]]*[^:]*:\(.*\)/\1/p' "$CLIENT_CONFIG_FILE" 2>/dev/null | tr -d ' \r' | head -1)
+    fi
+    echo "$listen"
 }
 
 status() {
@@ -446,7 +504,7 @@ start() {
 }
 
 link() {
-    if [[ ! -f "$CONFIG_FILE" ]]; then
+    if [[ ! -f "$CONFIG_FILE" && ! -f "$CLIENT_CONFIG_FILE" ]]; then
         echo -e "${C_RED}✖ 未检测到 Hysteria 2 配置文件。${C_RESET}"
         return 1
     fi
@@ -458,24 +516,40 @@ link() {
     listen=$(get_listen)
     base_port=$(echo "$listen" | cut -d '-' -f 1)
 
+    local obfs_param=""
+    if [[ -n "$obfs_pwd" ]]; then
+        obfs_param="&obfs=salamander&obfs-password=${obfs_pwd}"
+    fi
+
     echo -e "\n${C_GRAY}╭──────────────────────────────────────────────────────────╮${C_RESET}"
     echo -e "${C_GRAY}│${C_RESET}  ${C_BCYAN}buds-hy2${C_RESET}  ·  节点连接凭据与客户端导入                  ${C_GRAY}│${C_RESET}"
     echo -e "${C_GRAY}╰──────────────────────────────────────────────────────────╯${C_RESET}\n"
 
     echo -e "  ${C_DIM}域名 (SNI)  :${C_RESET} ${C_BOLD}${domain}${C_RESET}"
-    echo -e "  ${C_DIM}监听端口    :${C_RESET} ${C_CYAN}${listen}${C_RESET}"
+    echo -e "  ${C_DIM}监听端口    :${C_RESET} ${C_CYAN}${listen}${C_RESET} (基准: ${base_port})"
     echo -e "  ${C_DIM}认证密码    :${C_RESET} ${C_BOLD}${password}${C_RESET}"
     echo -e "  ${C_DIM}协议混淆    :${C_RESET} salamander"
     echo -e "  ${C_DIM}混淆密钥    :${C_RESET} ${C_BOLD}${obfs_pwd}${C_RESET}"
     echo -e "  ${C_DIM}伪装反代    :${C_RESET} https://news.ycombinator.com/\n"
 
-    echo -e "  ${C_GRAY}┌─ 格式 1 · 专属主节点链接 (端口跳跃 · 防限速) ───────────${C_RESET}"
-    echo -e "  ${C_GRAY}│${C_RESET}  ${C_YELLOW}hysteria2://${password}@${domain}:${listen}/?sni=${domain}&obfs=salamander&obfs-password=${obfs_pwd}#${domain}-Hy2${C_RESET}"
-    echo -e "  ${C_GRAY}└──────────────────────────────────────────────────────────${C_RESET}\n"
+    if [[ "$listen" =~ "-" ]]; then
+        local link_hop="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=1&allowInsecure=1${obfs_param}&mport=${listen}#${domain}-Hy2"
+        local link_single="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=1&allowInsecure=1${obfs_param}#${domain}-Hy2-Single"
 
-    echo -e "  ${C_GRAY}┌─ 格式 2 · 基准单端口链接 (全客户端兼容备用) ─────────────${C_RESET}"
-    echo -e "  ${C_GRAY}│${C_RESET}  ${C_YELLOW}hysteria2://${password}@${domain}:${base_port}/?sni=${domain}&obfs=salamander&obfs-password=${obfs_pwd}#${domain}-Hy2-Single${C_RESET}"
-    echo -e "  ${C_GRAY}└──────────────────────────────────────────────────────────${C_RESET}\n"
+        echo -e "  ${C_GRAY}┌─ 格式 1 · 专属主节点链接 (端口跳跃 · v2rayN 兼容 · 防限速) ──${C_RESET}"
+        echo -e "  ${C_GRAY}│${C_RESET}  ${C_YELLOW}${link_hop}${C_RESET}"
+        echo -e "  ${C_GRAY}└──────────────────────────────────────────────────────────${C_RESET}\n"
+
+        echo -e "  ${C_GRAY}┌─ 格式 2 · 基准单端口链接 (固定单端口 · 全客户端兼容备用) ────${C_RESET}"
+        echo -e "  ${C_GRAY}│${C_RESET}  ${C_YELLOW}${link_single}${C_RESET}"
+        echo -e "  ${C_GRAY}└──────────────────────────────────────────────────────────${C_RESET}\n"
+    else
+        local link_main="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=1&allowInsecure=1${obfs_param}#${domain}-Hy2"
+
+        echo -e "  ${C_GRAY}┌─ 节点链接 (v2rayN / Clash Verge / 全客户端兼容) ─────────${C_RESET}"
+        echo -e "  ${C_GRAY}│${C_RESET}  ${C_YELLOW}${link_main}${C_RESET}"
+        echo -e "  ${C_GRAY}└──────────────────────────────────────────────────────────${C_RESET}\n"
+    fi
 
     echo -e "  ${C_CYAN}提示: 在 v2rayN 或 Clash Verge 中按 Ctrl+V 即可直接导入。${C_RESET}\n"
 }
