@@ -18,24 +18,29 @@ SYSCTL_FILE="/etc/sysctl.d/99-hysteria-performance.conf"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 
-# 优雅终端色彩
+# 优雅终端色彩 · MiMo Code 极客调色盘
 C_RESET="\033[0m"
 C_BOLD="\033[1m"
 C_DIM="\033[2m"
-C_CYAN="\033[36m"
-C_BCYAN="\033[1;36m"
-C_GREEN="\033[32m"
-C_BGREEN="\033[1;32m"
-C_YELLOW="\033[33m"
-C_BYELLOW="\033[1;33m"
-C_RED="\033[31m"
-C_BRED="\033[1;31m"
-C_GRAY="\033[90m"
+C_ORANGE="\033[38;5;208m"       # MiMo 标志性暖橙
+C_ORANGE_BOLD="\033[1;38;5;208m"
+C_AMBER="\033[38;5;214m"        # 琥珀黄
+C_SPARK="\033[38;5;222m"        # 星芒粉金
+C_WHITE="\033[1;37m"            # 纯白强调
+C_GRAY_LIGHT="\033[38;5;252m"   # 亮灰文本
+C_GRAY_MID="\033[38;5;244m"     # 哑光灰注释
+C_GRAY_DARK="\033[38;5;238m"    # 极暗分界
+C_GREEN="\033[1;38;5;48m"       # 霓虹翡翠绿
+C_RED="\033[1;38;5;196m"        # 警戒红
+C_CYAN="\033[38;5;51m"          # 赛博青
+C_YELLOW="\033[1;38;5;221m"     # 高亮链接黄
+C_BAR="${C_ORANGE_BOLD}▌${C_RESET}"
+C_SUBBAR="${C_GRAY_MID}▎${C_RESET}"
 
-info() { echo -e "${C_CYAN}❯${C_RESET} $*"; }
-success() { echo -e "${C_BGREEN}✔${C_RESET} $*"; }
-warn() { echo -e "${C_BYELLOW}⚠${C_RESET} $*"; }
-error() { echo -e "${C_BRED}✖${C_RESET} $*"; }
+info() { echo -e "  ${C_ORANGE_BOLD}❯${C_RESET} $*"; }
+success() { echo -e "  ${C_GREEN}✔${C_RESET} $*"; }
+warn() { echo -e "  ${C_AMBER}⚠${C_RESET} $*"; }
+error() { echo -e "  ${C_RED}✖${C_RESET} $*"; }
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -102,9 +107,7 @@ validate_domain() {
 }
 
 collect_parameters() {
-    echo -e "\n${C_GRAY}╭──────────────────────────────────────────────────────────╮${C_RESET}"
-    echo -e "${C_GRAY}│${C_RESET}  ${C_BCYAN}buds-hy2${C_RESET}  ·  Hysteria 2 节点配置引导             ${C_GRAY}│${C_RESET}"
-    echo -e "${C_GRAY}╰──────────────────────────────────────────────────────────╯${C_RESET}\n"
+    echo -e "\n  ${C_BAR}  ${C_WHITE}buds-hy2 · Hysteria 2 节点配置引导${C_RESET}\n"
 
     while true; do
         read -rp "$(echo -e "${C_BOLD}请输入已解析到本机 IP 的域名 (例如 your.domain.com): ${C_RESET}")" DOMAIN
@@ -371,18 +374,24 @@ CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
 
+# 优雅终端色彩 · MiMo Code 极客调色盘
 C_RESET="\033[0m"
 C_BOLD="\033[1m"
 C_DIM="\033[2m"
-C_CYAN="\033[36m"
-C_BCYAN="\033[1;36m"
-C_GREEN="\033[32m"
-C_BGREEN="\033[1;32m"
-C_YELLOW="\033[33m"
-C_BYELLOW="\033[1;33m"
-C_RED="\033[31m"
-C_BRED="\033[1;31m"
-C_GRAY="\033[90m"
+C_ORANGE="\033[38;5;208m"       # MiMo 标志性暖橙
+C_ORANGE_BOLD="\033[1;38;5;208m"
+C_AMBER="\033[38;5;214m"        # 琥珀黄
+C_SPARK="\033[38;5;222m"        # 星芒粉金
+C_WHITE="\033[1;37m"            # 纯白强调
+C_GRAY_LIGHT="\033[38;5;252m"   # 亮灰文本
+C_GRAY_MID="\033[38;5;244m"     # 哑光灰注释
+C_GRAY_DARK="\033[38;5;238m"    # 极暗分界
+C_GREEN="\033[1;38;5;48m"       # 霓虹翡翠绿 (运行中)
+C_RED="\033[1;38;5;196m"        # 警戒红 (已停止)
+C_CYAN="\033[38;5;51m"          # 赛博青 (端口/参数)
+C_YELLOW="\033[1;38;5;221m"     # 高亮链接黄
+C_BAR="${C_ORANGE_BOLD}▌${C_RESET}"
+C_SUBBAR="${C_GRAY_MID}▎${C_RESET}"
 
 if [[ "$1" == "hy2" ]]; then
     shift
@@ -390,7 +399,7 @@ fi
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        echo -e "${C_BRED}✖ 请以 root 权限运行此命令 (例如: sudo buds hy2)${C_RESET}"
+        echo -e "\n  ${C_RED}✖ 请以 root 权限运行此命令 (例如: sudo buds hy2)${C_RESET}\n"
         exit 1
     fi
 }
@@ -474,38 +483,36 @@ get_listen() {
 }
 
 status() {
-    echo -e "\n${C_GRAY}╭──────────────────────────────────────────────────────────╮${C_RESET}"
-    echo -e "${C_GRAY}│${C_RESET}  ${C_BOLD}Hysteria 2 服务运行状态与端口监听${C_RESET}                      ${C_GRAY}│${C_RESET}"
-    echo -e "${C_GRAY}╰──────────────────────────────────────────────────────────╯${C_RESET}\n"
+    echo -e "\n  ${C_BAR}  ${C_WHITE}服务运行状态与 UDP 端口监听 · SERVICE STATUS${C_RESET}\n"
     systemctl status hysteria-server --no-pager || true
-    echo -e "\n${C_BOLD}─── UDP 端口监听详情 ───────────────────────────────────────${C_RESET}"
-    ss -ulpn | grep hysteria || echo "暂无活动 UDP 监听"
+    echo -e "\n  ${C_SUBBAR}  ${C_ORANGE_BOLD}UDP 端口监听详情 · UDP LISTEN DETAILS${C_RESET}"
+    ss -ulpn | grep hysteria || echo -e "     ${C_GRAY_MID}暂无活动 UDP 监听${C_RESET}"
     echo ""
 }
 
 log() {
-    echo -e "${C_CYAN}正在跟踪实时运行日志 (按 Ctrl+C 可退出)...${C_RESET}\n"
+    echo -e "\n  ${C_BAR}  ${C_ORANGE_BOLD}跟踪实时运行日志 · LIVE JOURNAL${C_RESET} ${C_GRAY_MID}(按 Ctrl+C 可退出)...${C_RESET}\n"
     journalctl -u hysteria-server -f -o cat
 }
 
 restart() {
     systemctl restart hysteria-server
-    echo -e "${C_BGREEN}✔ Hysteria 2 服务已成功重启。${C_RESET}"
+    echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已成功重启。${C_RESET}\n"
 }
 
 stop() {
     systemctl stop hysteria-server
-    echo -e "${C_BYELLOW}✔ Hysteria 2 服务已停止。${C_RESET}"
+    echo -e "\n  ${C_BAR}  ${C_AMBER}✔ Hysteria 2 服务已停止。${C_RESET}\n"
 }
 
 start() {
     systemctl start hysteria-server
-    echo -e "${C_BGREEN}✔ Hysteria 2 服务已启动。${C_RESET}"
+    echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已启动。${C_RESET}\n"
 }
 
 link() {
     if [[ ! -f "$CONFIG_FILE" && ! -f "$CLIENT_CONFIG_FILE" ]]; then
-        echo -e "${C_RED}✖ 未检测到 Hysteria 2 配置文件。${C_RESET}"
+        echo -e "\n  ${C_RED}✖ 未检测到 Hysteria 2 配置文件。${C_RESET}\n"
         return 1
     fi
 
@@ -521,42 +528,37 @@ link() {
         obfs_param="&obfs=salamander&obfs-password=${obfs_pwd}"
     fi
 
-    echo -e "\n${C_GRAY}╭──────────────────────────────────────────────────────────╮${C_RESET}"
-    echo -e "${C_GRAY}│${C_RESET}  ${C_BCYAN}buds-hy2${C_RESET}  ·  节点连接凭据与客户端导入                  ${C_GRAY}│${C_RESET}"
-    echo -e "${C_GRAY}╰──────────────────────────────────────────────────────────╯${C_RESET}\n"
-
-    echo -e "  ${C_DIM}域名 (SNI)  :${C_RESET} ${C_BOLD}${domain}${C_RESET}"
-    echo -e "  ${C_DIM}监听端口    :${C_RESET} ${C_CYAN}${listen}${C_RESET} (基准: ${base_port})"
-    echo -e "  ${C_DIM}认证密码    :${C_RESET} ${C_BOLD}${password}${C_RESET}"
-    echo -e "  ${C_DIM}协议混淆    :${C_RESET} salamander"
-    echo -e "  ${C_DIM}混淆密钥    :${C_RESET} ${C_BOLD}${obfs_pwd}${C_RESET}"
-    echo -e "  ${C_DIM}伪装反代    :${C_RESET} https://news.ycombinator.com/\n"
+    echo -e "\n  ${C_BAR}  ${C_WHITE}节点连接凭据 · CONNECTION CREDENTIALS${C_RESET}"
+    echo -e "     ${C_GRAY_MID}域名 (SNI)  :${C_RESET} ${C_WHITE}${domain}${C_RESET}"
+    echo -e "     ${C_GRAY_MID}监听端口    :${C_RESET} ${C_CYAN}${listen}${C_RESET} ${C_GRAY_MID}(基准端口: ${base_port})${C_RESET}"
+    echo -e "     ${C_GRAY_MID}认证密码    :${C_RESET} ${C_WHITE}${password}${C_RESET}"
+    echo -e "     ${C_GRAY_MID}协议混淆    :${C_RESET} ${C_AMBER}salamander${C_RESET}"
+    echo -e "     ${C_GRAY_MID}混淆密钥    :${C_RESET} ${C_WHITE}${obfs_pwd}${C_RESET}"
+    echo -e "     ${C_GRAY_MID}伪装反代    :${C_RESET} ${C_GRAY_LIGHT}https://news.ycombinator.com/${C_RESET}\n"
 
     if [[ "$listen" =~ "-" ]]; then
         local link_hop="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=1&allowInsecure=1${obfs_param}&mport=${listen}#${domain}-Hy2"
         local link_single="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=1&allowInsecure=1${obfs_param}#${domain}-Hy2-Single"
 
-        echo -e "  ${C_GRAY}┌─ 格式 1 · 专属主节点链接 (端口跳跃 · v2rayN 兼容 · 防限速) ──${C_RESET}"
-        echo -e "  ${C_GRAY}│${C_RESET}  ${C_YELLOW}${link_hop}${C_RESET}"
-        echo -e "  ${C_GRAY}└──────────────────────────────────────────────────────────${C_RESET}\n"
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 1 · 专属主节点链接${C_RESET} ${C_GRAY_MID}(端口跳跃 · v2rayN 兼容 · 防限速)${C_RESET}"
+        echo -e "     ${C_YELLOW}${link_hop}${C_RESET}\n"
 
-        echo -e "  ${C_GRAY}┌─ 格式 2 · 基准单端口链接 (固定单端口 · 全客户端兼容备用) ────${C_RESET}"
-        echo -e "  ${C_GRAY}│${C_RESET}  ${C_YELLOW}${link_single}${C_RESET}"
-        echo -e "  ${C_GRAY}└──────────────────────────────────────────────────────────${C_RESET}\n"
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 2 · 基准单端口链接${C_RESET} ${C_GRAY_MID}(固定单端口 · 全客户端兼容备用)${C_RESET}"
+        echo -e "     ${C_YELLOW}${link_single}${C_RESET}\n"
     else
         local link_main="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=1&allowInsecure=1${obfs_param}#${domain}-Hy2"
 
-        echo -e "  ${C_GRAY}┌─ 节点链接 (v2rayN / Clash Verge / 全客户端兼容) ─────────${C_RESET}"
-        echo -e "  ${C_GRAY}│${C_RESET}  ${C_YELLOW}${link_main}${C_RESET}"
-        echo -e "  ${C_GRAY}└──────────────────────────────────────────────────────────${C_RESET}\n"
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}节点连接链接${C_RESET} ${C_GRAY_MID}(v2rayN / Clash Verge / 全客户端通用)${C_RESET}"
+        echo -e "     ${C_YELLOW}${link_main}${C_RESET}\n"
     fi
 
-    echo -e "  ${C_CYAN}提示: 在 v2rayN 或 Clash Verge 中按 Ctrl+V 即可直接导入。${C_RESET}\n"
+    echo -e "  ${C_ORANGE}●${C_RESET} ${C_ORANGE_BOLD}Tip${C_RESET} ${C_GRAY_MID}在 v2rayN 或 Clash Verge 中按 Ctrl+V 即可直接导入链接${C_RESET}"
+    echo -e "  ${C_SPARK}✦${C_RESET}\n"
 }
 
 client() {
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        echo -e "${C_RED}✖ 未检测到服务端配置文件 $CONFIG_FILE。${C_RESET}"
+    if [[ ! -f "$CONFIG_FILE" && ! -f "$CLIENT_CONFIG_FILE" ]]; then
+        echo -e "\n  ${C_RED}✖ 未检测到服务端配置文件 $CONFIG_FILE。${C_RESET}\n"
         return 1
     fi
 
@@ -585,15 +587,13 @@ CLIENT_YAML_EOF
         chmod 600 "$CLIENT_CONFIG_FILE"
     fi
 
-    echo -e "\n${C_GRAY}╭──────────────────────────────────────────────────────────╮${C_RESET}"
-    echo -e "${C_GRAY}│${C_RESET}  ${C_BOLD}客户端 YAML 配置 (${CLIENT_CONFIG_FILE})${C_RESET}             ${C_GRAY}│${C_RESET}"
-    echo -e "${C_GRAY}╰──────────────────────────────────────────────────────────╯${C_RESET}\n"
+    echo -e "\n  ${C_BAR}  ${C_WHITE}客户端 YAML 配置 (${CLIENT_CONFIG_FILE})${C_RESET}\n"
     cat "$CLIENT_CONFIG_FILE"
     echo ""
 }
 
 renew_test() {
-    echo -e "\n${C_CYAN}正在模拟执行 Let's Encrypt 证书自动续签与挂钩同步...${C_RESET}\n"
+    echo -e "\n  ${C_BAR}  ${C_ORANGE_BOLD}模拟执行 Let's Encrypt 证书自动续签与挂钩同步...${C_RESET}\n"
     certbot renew --dry-run --run-deploy-hooks
 }
 
@@ -637,8 +637,8 @@ cleanup_firewall() {
 }
 
 uninstall() {
-    echo -e "\n${C_BRED}⚠ 警告: 即将卸载 Hysteria 2 服务！${C_RESET}"
-    read -rp "确认彻底卸载吗？(y/N): " confirm
+    echo -e "\n  ${C_RED}⚠ 警告: 即将卸载 Hysteria 2 服务！${C_RESET}"
+    read -rp "  确认彻底卸载吗？(y/N): " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         systemctl disable --now hysteria-server 2>/dev/null || true
         cleanup_firewall
@@ -648,9 +648,9 @@ uninstall() {
         rm -f /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh
         rm -f /etc/sysctl.d/99-hysteria-performance.conf
         systemctl daemon-reload
-        echo -e "${C_BGREEN}✔ Hysteria 2 服务及防火墙规则已安全卸载，原有 Nginx 及网站保持原样。${C_RESET}"
+        echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务及防火墙规则已安全卸载，原有 Nginx 及网站保持原样。${C_RESET}\n"
     else
-        echo "已取消卸载。"
+        echo -e "\n  已取消卸载。\n"
     fi
 }
 
@@ -658,9 +658,9 @@ show_menu() {
     while true; do
         local status_badge domain listen
         if systemctl is-active --quiet hysteria-server 2>/dev/null; then
-            status_badge="${C_BGREEN}● 运行中 (Running)${C_RESET}"
+            status_badge="${C_GREEN}● 运行中 (Running)${C_RESET}"
         else
-            status_badge="${C_BRED}● 已停止 (Stopped)${C_RESET}"
+            status_badge="${C_RED}● 已停止 (Stopped)${C_RESET}"
         fi
 
         domain=$(get_domain)
@@ -668,33 +668,30 @@ show_menu() {
         [[ -z "$listen" ]] && listen="未配置"
 
         clear 2>/dev/null || true
-        echo -e "${C_GRAY}╭──────────────────────────────────────────────────────────╮${C_RESET}"
-        echo -e "${C_GRAY}│${C_RESET}  ${C_BCYAN}buds-hy2${C_RESET}  ·  Hysteria 2 管理面板                       ${C_GRAY}│${C_RESET}"
-        echo -e "${C_GRAY}│${C_RESET}  状态: ${status_badge}      端口: ${C_CYAN}${listen}${C_RESET}           ${C_GRAY}│${C_RESET}"
-        echo -e "${C_GRAY}╰──────────────────────────────────────────────────────────╯${C_RESET}"
-        echo -e "  ${C_DIM}域名: ${domain}  ·  核心: Hysteria 2 (Official)${C_RESET}\n"
+        echo -e "       ${C_SPARK}✧${C_RESET}                                      ${C_SPARK}✦${C_RESET}"
+        echo -e "  ${C_ORANGE_BOLD}█▀▀█ █  █ █▀▀▄ █▀▀▀${C_RESET}   ${C_GRAY_LIGHT}█  █ █  █ █▀▀█${C_RESET}"
+        echo -e "  ${C_ORANGE_BOLD}█▀▀▄ █  █ █  █ ▀▀▀█${C_RESET}   ${C_GRAY_LIGHT}█▀▀█ ▀██▀   ▄▀${C_RESET}"
+        echo -e "  ${C_ORANGE_BOLD}█  █ █  █ █  █    █${C_RESET}   ${C_GRAY_LIGHT}█  █   █   █  ${C_RESET}"
+        echo -e "  ${C_ORANGE_BOLD}▀▀▀▀ ▀▀▀▀ ▀▀▀  ▀▀▀▀${C_RESET}   ${C_GRAY_LIGHT}▀  ▀   ▀  █▄▄█${C_RESET}"
+        echo -e "  ${C_GRAY_MID}Hysteria 2 High-Performance Protocol Suite${C_RESET}\n"
 
-        echo -e "  ${C_BOLD}核心操作${C_RESET}"
-        echo -e "  ${C_GRAY}──────────────────────────────────────────────────────────${C_RESET}"
-        echo -e "  ${C_CYAN}1.${C_RESET} 查看运行状态 (Status & SS)"
-        echo -e "  ${C_CYAN}2.${C_RESET} 查看节点链接 (Connection URIs)"
-        echo -e "  ${C_CYAN}3.${C_RESET} 查看客户端配置 (Client YAML)"
-        echo -e "  ${C_CYAN}4.${C_RESET} 查看实时日志 (Live Journal)"
+        echo -e "  ${C_BAR}  ${C_WHITE}节点状态${C_RESET}  ${status_badge}    ${C_WHITE}监听端口${C_RESET}  ${C_CYAN}${listen}${C_RESET}"
+        echo -e "  ${C_BAR}  ${C_GRAY_MID}解析域名${C_RESET}  ${C_GRAY_LIGHT}${domain}${C_RESET}    ${C_GRAY_MID}协议混淆${C_RESET}  ${C_AMBER}Salamander${C_RESET}\n"
 
-        echo -e "\n  ${C_BOLD}服务控制${C_RESET}"
-        echo -e "  ${C_GRAY}──────────────────────────────────────────────────────────${C_RESET}"
-        echo -e "  ${C_CYAN}5.${C_RESET} 重启服务 (Restart)"
-        echo -e "  ${C_CYAN}6.${C_RESET} 启动服务 (Start)"
-        echo -e "  ${C_CYAN}7.${C_RESET} 停止服务 (Stop)"
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}核心操作${C_RESET} ${C_GRAY_MID}· CORE ACTIONS${C_RESET}"
+        echo -e "     ${C_ORANGE_BOLD}1${C_RESET} ${C_WHITE}运行状态${C_RESET} ${C_GRAY_MID}Status${C_RESET}     ${C_ORANGE_BOLD}2${C_RESET} ${C_WHITE}节点链接${C_RESET} ${C_GRAY_MID}Connection URIs${C_RESET}"
+        echo -e "     ${C_ORANGE_BOLD}3${C_RESET} ${C_WHITE}客户端配置${C_RESET} ${C_GRAY_MID}YAML${C_RESET}     ${C_ORANGE_BOLD}4${C_RESET} ${C_WHITE}实时日志${C_RESET} ${C_GRAY_MID}Live Journal${C_RESET}\n"
 
-        echo -e "\n  ${C_BOLD}维护与安全${C_RESET}"
-        echo -e "  ${C_GRAY}──────────────────────────────────────────────────────────${C_RESET}"
-        echo -e "  ${C_CYAN}8.${C_RESET} 模拟测试证书自动续签 (Dry-Run)"
-        echo -e "  ${C_CYAN}9.${C_RESET} 卸载 Hysteria 2 (Uninstall)"
-        echo -e "  ${C_GRAY}0.${C_RESET} 退出管理面板 (Exit)"
-        echo -e "  ${C_GRAY}──────────────────────────────────────────────────────────${C_RESET}"
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}服务控制${C_RESET} ${C_GRAY_MID}· SERVICE CONTROL${C_RESET}"
+        echo -e "     ${C_ORANGE_BOLD}5${C_RESET} ${C_WHITE}重启服务${C_RESET} ${C_GRAY_MID}Restart${C_RESET}    ${C_ORANGE_BOLD}6${C_RESET} ${C_WHITE}启动服务${C_RESET} ${C_GRAY_MID}Start${C_RESET}       ${C_ORANGE_BOLD}7${C_RESET} ${C_WHITE}停止服务${C_RESET} ${C_GRAY_MID}Stop${C_RESET}\n"
 
-        read -rp "$(echo -e "  ${C_BCYAN}❯${C_RESET} ${C_BOLD}请选择操作 [0-9]: ${C_RESET}")" choice
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}维护与安全${C_RESET} ${C_GRAY_MID}· MAINTENANCE${C_RESET}"
+        echo -e "     ${C_ORANGE_BOLD}8${C_RESET} ${C_WHITE}模拟自动续签${C_RESET} ${C_GRAY_MID}Dry-Run${C_RESET}  ${C_ORANGE_BOLD}9${C_RESET} ${C_WHITE}卸载节点${C_RESET} ${C_GRAY_MID}Uninstall${C_RESET}   ${C_ORANGE_BOLD}0${C_RESET} ${C_GRAY_MID}退出 Exit${C_RESET}\n"
+
+        echo -e "  ${C_ORANGE}●${C_RESET} ${C_ORANGE_BOLD}Tip${C_RESET} ${C_GRAY_MID}在 v2rayN 中按 Ctrl+V 导入格式 1 链接，支持自动 UDP 端口跳跃防限速${C_RESET}"
+        echo -e "  ${C_SPARK}✦${C_RESET}"
+
+        read -rp "$(echo -e "  ${C_ORANGE_BOLD}❯${C_RESET} ${C_WHITE}请选择操作编号 [0-9]: ${C_RESET}")" choice
         case "$choice" in
             1) status; read -rp "按回车键返回主菜单..." ;;
             2) link; read -rp "按回车键返回主菜单..." ;;
@@ -733,17 +730,14 @@ EOF
 }
 
 display_summary() {
-    echo -e "\n${C_GRAY}╭──────────────────────────────────────────────────────────╮${C_RESET}"
-    echo -e "${C_GRAY}│${C_RESET}  ${C_BGREEN}✔ Hysteria 2 节点部署完成${C_RESET}                               ${C_GRAY}│${C_RESET}"
-    echo -e "${C_GRAY}╰──────────────────────────────────────────────────────────╯${C_RESET}"
+    echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 节点部署完成 · DEPLOYMENT SUCCESSFUL${C_RESET}"
     /usr/local/bin/buds hy2 link
-    echo -e "  ${C_BOLD}管理命令说明：${C_RESET}"
-    echo -e "  - 输入 ${C_BGREEN}buds hy2${C_RESET} 即可随时打开极客交互式管理面板"
-    echo -e "  - 支持直接执行常用命令："
-    echo -e "      ${C_CYAN}buds hy2 status${C_RESET}      (查看状态)"
-    echo -e "      ${C_CYAN}buds hy2 link${C_RESET}        (查看导入链接)"
-    echo -e "      ${C_CYAN}buds hy2 log${C_RESET}         (查看日志)"
-    echo -e "      ${C_CYAN}buds hy2 restart${C_RESET}     (重启服务)\n"
+    echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}常用管理命令${C_RESET} ${C_GRAY_MID}· CLI COMMANDS${C_RESET}"
+    echo -e "     ${C_ORANGE_BOLD}buds hy2${C_RESET}          ${C_GRAY_MID}随时打开 MiMo 极客交互式管理面板${C_RESET}"
+    echo -e "     ${C_ORANGE_BOLD}buds hy2 status${C_RESET}   ${C_GRAY_MID}查看服务运行状态与监听端口${C_RESET}"
+    echo -e "     ${C_ORANGE_BOLD}buds hy2 link${C_RESET}     ${C_GRAY_MID}查看节点连接链接与导入凭据${C_RESET}"
+    echo -e "     ${C_ORANGE_BOLD}buds hy2 log${C_RESET}      ${C_GRAY_MID}查看实时日志 (Ctrl+C 退出)${C_RESET}"
+    echo -e "     ${C_ORANGE_BOLD}buds hy2 restart${C_RESET}  ${C_GRAY_MID}重启服务${C_RESET}\n"
 }
 
 main() {
