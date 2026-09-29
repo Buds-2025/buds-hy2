@@ -196,9 +196,9 @@ if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
     cp -L "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${CONFIG_DIR}/server.crt"
     cp -L "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "${CONFIG_DIR}/server.key"
     if id hysteria >/dev/null 2>&1; then
-        chown hysteria:hysteria "${CONFIG_DIR}/server.crt" "${CONFIG_DIR}/server.key"
+        chown root:hysteria "${CONFIG_DIR}/server.crt" "${CONFIG_DIR}/server.key"
     fi
-    chmod 600 "${CONFIG_DIR}/server.crt" "${CONFIG_DIR}/server.key"
+    chmod 640 "${CONFIG_DIR}/server.crt" "${CONFIG_DIR}/server.key"
     if systemctl is-active --quiet hysteria-server; then
         systemctl restart hysteria-server
     fi
@@ -246,9 +246,11 @@ masquerade:
     rewriteHost: true
 EOF
 
-    chown -R hysteria:hysteria "$CONFIG_DIR"
-    chmod 600 "$CONFIG_FILE"
-    success "服务端配置文件写入完毕 (权限 600，归属 hysteria 独立账户)。"
+    chown root:hysteria "$CONFIG_DIR"
+    chmod 750 "$CONFIG_DIR"
+    chown root:hysteria "$CONFIG_FILE"
+    chmod 640 "$CONFIG_FILE"
+    success "服务端配置文件写入完毕 (权限 640，归属 root:hysteria)。"
 }
 
 tune_kernel_network() {
@@ -296,20 +298,27 @@ EOF
 configure_firewall() {
     info "配置防火墙端口规则: ${UFW_PORT_RULE}..."
     
+    # 记录防火墙规则，以便在卸载时精准撤销，避免破坏系统原有配置
+    echo "${UFW_PORT_RULE}" > "${CONFIG_DIR}/.firewall_rule" 2>/dev/null || true
+    chmod 600 "${CONFIG_DIR}/.firewall_rule" 2>/dev/null || true
+
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "${UFW_PORT_RULE}" comment 'hysteria2' >/dev/null 2>&1 || true
+        ufw allow "${UFW_PORT_RULE}" comment 'buds-hy2' >/dev/null 2>&1 || true
     fi
 
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd --permanent --add-port="${UFW_PORT_RULE}" >/dev/null 2>&1 || true
+        local fw_port="${UFW_PORT_RULE%/*}"
+        local fw_proto="${UFW_PORT_RULE#*/}"
+        fw_port="${fw_port//:/-}"
+        firewall-cmd --permanent --add-port="${fw_port}/${fw_proto}" >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
     fi
 
     if command -v iptables >/dev/null 2>&1; then
         if [[ "$IS_PORT_HOPPING" == "true" ]]; then
-            iptables -I INPUT -p udp --dport "${HOP_START}:${HOP_END}" -j ACCEPT >/dev/null 2>&1 || true
+            iptables -I INPUT -p udp --dport "${HOP_START}:${HOP_END}" -m comment --comment "buds-hy2" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p udp --dport "${HOP_START}:${HOP_END}" -j ACCEPT >/dev/null 2>&1 || true
         else
-            iptables -I INPUT -p udp --dport "${SINGLE_PORT}" -j ACCEPT >/dev/null 2>&1 || true
+            iptables -I INPUT -p udp --dport "${SINGLE_PORT}" -m comment --comment "buds-hy2" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p udp --dport "${SINGLE_PORT}" -j ACCEPT >/dev/null 2>&1 || true
         fi
     fi
 
@@ -345,10 +354,16 @@ bandwidth:
   up: 100 mbps
   down: 300 mbps
 EOF
-    chmod 644 "$CLIENT_CONFIG_FILE"
+    chown root:root "$CLIENT_CONFIG_FILE" 2>/dev/null || true
+    chmod 600 "$CLIENT_CONFIG_FILE"
 
     # 生成极客优雅的全局管理命令 /usr/local/bin/buds
-    cat <<'EOF' > "$BUDS_CLI"
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+    if [[ -f "${script_dir}/buds" ]]; then
+        cp -f "${script_dir}/buds" "$BUDS_CLI"
+    else
+        cat <<'EOF' > "$BUDS_CLI"
 #!/usr/bin/env bash
 set -e
 
@@ -372,6 +387,13 @@ C_GRAY="\033[90m"
 if [[ "$1" == "hy2" ]]; then
     shift
 fi
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${C_BRED}✖ 请以 root 权限运行此命令 (例如: sudo buds hy2)${C_RESET}"
+        exit 1
+    fi
+}
 
 get_domain() {
     local domain
@@ -485,7 +507,8 @@ bandwidth:
   up: 100 mbps
   down: 300 mbps
 CLIENT_YAML_EOF
-        chmod 644 "$CLIENT_CONFIG_FILE"
+        chown root:root "$CLIENT_CONFIG_FILE" 2>/dev/null || true
+        chmod 600 "$CLIENT_CONFIG_FILE"
     fi
 
     echo -e "\n${C_GRAY}╭──────────────────────────────────────────────────────────╮${C_RESET}"
@@ -497,7 +520,46 @@ CLIENT_YAML_EOF
 
 renew_test() {
     echo -e "\n${C_CYAN}正在模拟执行 Let's Encrypt 证书自动续签与挂钩同步...${C_RESET}\n"
-    certbot renew --dry-run
+    certbot renew --dry-run --run-deploy-hooks
+}
+
+cleanup_firewall() {
+    local rule_file="${CONFIG_DIR}/.firewall_rule"
+    local rule=""
+    if [[ -f "$rule_file" ]]; then
+        rule=$(tr -d '[:space:]' < "$rule_file" 2>/dev/null)
+    fi
+    if [[ -z "$rule" ]]; then
+        local listen
+        listen=$(get_listen)
+        if [[ "$listen" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            rule="${BASH_REMATCH[1]}:${BASH_REMATCH[2]}/udp"
+        elif [[ "$listen" =~ ^[0-9]+$ ]]; then
+            rule="${listen}/udp"
+        fi
+    fi
+
+    if [[ -n "$rule" ]]; then
+        # 1. 精准清理 UFW 规则
+        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+            ufw delete allow "$rule" comment 'buds-hy2' >/dev/null 2>&1 || ufw delete allow "$rule" >/dev/null 2>&1 || true
+        fi
+
+        # 2. 精准清理 firewalld 规则
+        if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+            local fw_port="${rule%/*}"
+            local fw_proto="${rule#*/}"
+            fw_port="${fw_port//:/-}"
+            firewall-cmd --permanent --remove-port="${fw_port}/${fw_proto}" >/dev/null 2>&1 || true
+            firewall-cmd --reload >/dev/null 2>&1 || true
+        fi
+
+        # 3. 精准清理 iptables 规则
+        if command -v iptables >/dev/null 2>&1; then
+            local port_spec="${rule%/*}"
+            iptables -D INPUT -p udp --dport "$port_spec" -m comment --comment "buds-hy2" -j ACCEPT >/dev/null 2>&1 || iptables -D INPUT -p udp --dport "$port_spec" -j ACCEPT >/dev/null 2>&1 || true
+        fi
+    fi
 }
 
 uninstall() {
@@ -505,13 +567,14 @@ uninstall() {
     read -rp "确认彻底卸载吗？(y/N): " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         systemctl disable --now hysteria-server 2>/dev/null || true
+        cleanup_firewall
         rm -f /usr/local/bin/hysteria /usr/local/bin/buds /usr/local/bin/hy2
         rm -rf /etc/hysteria /etc/systemd/system/hysteria-server.service.d
         rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service
         rm -f /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh
         rm -f /etc/sysctl.d/99-hysteria-performance.conf
         systemctl daemon-reload
-        echo -e "${C_BGREEN}✔ Hysteria 2 已经安全卸载，原有 Nginx 及网站保持原样。${C_RESET}"
+        echo -e "${C_BGREEN}✔ Hysteria 2 服务及防火墙规则已安全卸载，原有 Nginx 及网站保持原样。${C_RESET}"
     else
         echo "已取消卸载。"
     fi
@@ -574,6 +637,8 @@ show_menu() {
     done
 }
 
+check_root
+
 case "$1" in
     status) status ;;
     log) log ;;
@@ -587,7 +652,8 @@ case "$1" in
     *) show_menu ;;
 esac
 EOF
-    chmod +x "$BUDS_CLI"
+    fi
+    chmod 755 "$BUDS_CLI"
     ln -sf "$BUDS_CLI" "$HY2_CLI"
     success "已配置快捷管理命令：'buds hy2' 或 'hy2'。"
 }
