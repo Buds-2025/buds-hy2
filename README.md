@@ -1,23 +1,27 @@
 # buds-hy2
 
-适用于 Ubuntu / Debian 系统的 Hysteria 2 自动化部署与运维脚本。
+全平台通用、高鲁棒性的 Hysteria 2 自动化部署与运维管理脚本。
 
-针对已托管个人网站的服务器设计，部署过程中避开 80/443 端口与现有网站配置，通过 Certbot 进行证书申请与自动续期同步。
+原生适配主流 Linux 发行版（Debian / Ubuntu / Alpine / CentOS / Rocky / Alma / Fedora / Arch），全面支持标准 VPS、NAT VPS 及 LXD / LXC / Docker 等虚拟化容器环境。支持与现有网站零停机共存，兼备 Let's Encrypt 权威证书与免 80 端口的极速 ECC 自签名证书。
 
 ---
 
 ## 快速安装
 
-在服务器终端（root 权限）执行以下命令：
+在服务器终端（root 权限）执行以下一键安装命令（自带防 CDN 缓存参数）：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Buds-2025/buds-hy2/main/install.sh)
+bash <(curl -fsSL "https://raw.githubusercontent.com/Buds-2025/buds-hy2/main/install.sh?v=$(date +%s)")
 ```
 
-脚本将引导完成：
-1. 域名设置（输入已解析到本机的域名，如 your.domain.com）；
-2. 端口设置（支持回车使用随机高位端口、指定单端口或输入端口范围开启端口跳跃）；
-3. 证书申请、服务端配置、内核参数调优及服务启动。
+脚本将智能引导完成：
+1. **环境与网络检测**：自动识别容器虚拟化（LXD/LXC/Docker）与 NAT 内网环境；
+2. **域名解析校验**：多源比对本机公网 IP 与域名解析记录；
+3. **灵活端口配置**：支持随机高位单端口、指定单端口或端口跳跃范围（如 `20000-40000`）；
+4. **智能双模证书**：
+   - **Let's Encrypt 权威证书**：适合独立公网 IP 机器，支持 Nginx 零停机平滑签发；
+   - **极速 ECC 自签名证书**：免除 80 端口依赖，专为 NAT VPS / LXD 容器定制，客户端免维护无缝直连；
+5. **内核与服务自愈**：内核 UDP 缓冲区智能调优，守护进程崩溃自愈与全局管理工具安装。
 
 ---
 

@@ -113,22 +113,73 @@ get_listen() {
     echo "$listen"
 }
 
+is_cert_self_signed() {
+    if [[ -f "${CONFIG_DIR}/server.crt" ]]; then
+        local issuer subject
+        issuer=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -issuer 2>/dev/null | tr -d ' ' || echo "1")
+        subject=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -subject 2>/dev/null | tr -d ' ' || echo "2")
+        if [[ -n "$issuer" && "$issuer" == "$subject" ]]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
 status() {
     echo -e "\n  ${C_BAR}  ${C_WHITE}服务运行状态与 UDP 端口监听 · SERVICE STATUS${C_RESET}\n"
+    local is_running=false
     if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
         systemctl status hysteria-server --no-pager || true
+        systemctl is-active --quiet hysteria-server 2>/dev/null && is_running=true
     elif command -v rc-service >/dev/null 2>&1; then
         rc-service hysteria-server status || true
+        rc-service hysteria-server status 2>/dev/null | grep -q "started" && is_running=true
+    elif [[ -x /usr/local/bin/hysteria-service ]]; then
+        /usr/local/bin/hysteria-service status || true
+        pgrep -f "hysteria (server|-c)" >/dev/null 2>&1 && is_running=true
     else
-        ps aux 2>/dev/null | grep -E "hysteria (server|-c)" | grep -v grep || echo -e "     ${C_GRAY_MID}未检测到活动进程${C_RESET}"
+        local pids
+        pids=$(pgrep -f "hysteria (server|-c)" 2>/dev/null || true)
+        if [[ -n "$pids" ]]; then
+            is_running=true
+            echo -e "     ${C_GREEN}● 运行中 (Running)${C_RESET} - PID: ${C_CYAN}${pids}${C_RESET}"
+            ps aux 2>/dev/null | grep -E "hysteria (server|-c)" | grep -v grep || true
+        else
+            echo -e "     ${C_RED}● 已停止 (Stopped)${C_RESET}"
+        fi
     fi
-    echo -e "\n  ${C_SUBBAR}  ${C_ORANGE_BOLD}UDP 端口监听详情 · UDP LISTEN DETAILS${C_RESET}"
-    if command -v ss >/dev/null 2>&1; then
-        ss -ulpn 2>/dev/null | grep hysteria || echo -e "     ${C_GRAY_MID}暂无活动 UDP 监听${C_RESET}"
-    elif command -v netstat >/dev/null 2>&1; then
-        netstat -ulpn 2>/dev/null | grep hysteria || echo -e "     ${C_GRAY_MID}暂无活动 UDP 监听${C_RESET}"
+
+    echo -e "\n  ${C_SUBBAR}  ${C_ORANGE_BOLD}证书信息与有效期 · CERTIFICATE INFO${C_RESET}"
+    if [[ -f "${CONFIG_DIR}/server.crt" ]]; then
+        local cert_subject cert_enddate
+        cert_subject=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -subject 2>/dev/null | sed 's/subject=//' || echo "未知")
+        cert_enddate=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -enddate 2>/dev/null | sed 's/notAfter=//' || echo "未知")
+        if is_cert_self_signed; then
+            echo -e "     ${C_GRAY_MID}证书类型:${C_RESET} ${C_CYAN}极速自签名 ECC 证书 (全客户端通用免维护)${C_RESET}"
+        else
+            echo -e "     ${C_GRAY_MID}证书类型:${C_RESET} ${C_GREEN}Let's Encrypt 官方权威证书${C_RESET}"
+        fi
+        echo -e "     ${C_GRAY_MID}证书主题:${C_RESET} ${cert_subject}"
+        echo -e "     ${C_GRAY_MID}有效期限:${C_RESET} ${cert_enddate}"
     else
-        echo -e "     ${C_GRAY_MID}暂无活动 UDP 监听${C_RESET}"
+        echo -e "     ${C_GRAY_MID}未检测到活动证书文件${C_RESET}"
+    fi
+
+    echo -e "\n  ${C_SUBBAR}  ${C_ORANGE_BOLD}UDP 端口监听详情 · UDP LISTEN DETAILS${C_RESET}"
+    local udp_found=false
+    if command -v ss >/dev/null 2>&1; then
+        if ss -ulpn 2>/dev/null | grep -q hysteria; then
+            ss -ulpn 2>/dev/null | grep hysteria
+            udp_found=true
+        fi
+    elif command -v netstat >/dev/null 2>&1; then
+        if netstat -ulpn 2>/dev/null | grep -q hysteria; then
+            netstat -ulpn 2>/dev/null | grep hysteria
+            udp_found=true
+        fi
+    fi
+    if [[ "$udp_found" != "true" ]]; then
+        echo -e "     ${C_GRAY_MID}暂无活动 UDP 监听 (若刚启动请稍候 1-2 秒刷新)${C_RESET}"
     fi
     echo ""
 }
@@ -149,8 +200,11 @@ restart() {
         systemctl restart hysteria-server
     elif command -v rc-service >/dev/null 2>&1; then
         rc-service hysteria-server restart
+    elif [[ -x /usr/local/bin/hysteria-service ]]; then
+        /usr/local/bin/hysteria-service restart
     else
         pkill -f "hysteria server" 2>/dev/null || true
+        sleep 1
         nohup /usr/local/bin/hysteria server -c "${CONFIG_FILE}" >/var/log/hysteria.log 2>&1 &
     fi
     echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已成功重启。${C_RESET}\n"
@@ -161,6 +215,8 @@ stop() {
         systemctl stop hysteria-server
     elif command -v rc-service >/dev/null 2>&1; then
         rc-service hysteria-server stop
+    elif [[ -x /usr/local/bin/hysteria-service ]]; then
+        /usr/local/bin/hysteria-service stop
     else
         pkill -f "hysteria server" 2>/dev/null || true
     fi
@@ -172,6 +228,8 @@ start() {
         systemctl start hysteria-server
     elif command -v rc-service >/dev/null 2>&1; then
         rc-service hysteria-server start
+    elif [[ -x /usr/local/bin/hysteria-service ]]; then
+        /usr/local/bin/hysteria-service start
     else
         nohup /usr/local/bin/hysteria server -c "${CONFIG_FILE}" >/var/log/hysteria.log 2>&1 &
     fi
@@ -196,8 +254,14 @@ link() {
         obfs_param="&obfs=salamander&obfs-password=${obfs_pwd}"
     fi
 
+    local cert_badge="${C_GREEN}Let's Encrypt 官方权威证书${C_RESET}"
+    if is_cert_self_signed; then
+        cert_badge="${C_CYAN}极速自签名 ECC 证书 (全客户端通用免维护)${C_RESET}"
+    fi
+
     echo -e "\n  ${C_BAR}  ${C_WHITE}节点连接凭据 · CONNECTION CREDENTIALS${C_RESET}"
     echo -e "     ${C_GRAY_MID}域名 (SNI)  :${C_RESET} ${C_WHITE}${domain}${C_RESET}"
+    echo -e "     ${C_GRAY_MID}证书类型    :${C_RESET} ${cert_badge}"
     echo -e "     ${C_GRAY_MID}监听端口    :${C_RESET} ${C_CYAN}${listen}${C_RESET} ${C_GRAY_MID}(基准端口: ${base_port})${C_RESET}"
     echo -e "     ${C_GRAY_MID}认证密码    :${C_RESET} ${C_WHITE}${password}${C_RESET}"
     echo -e "     ${C_GRAY_MID}协议混淆    :${C_RESET} ${C_AMBER}salamander${C_RESET}"
@@ -229,6 +293,11 @@ client() {
         return 1
     fi
 
+    local client_insecure="false"
+    if is_cert_self_signed; then
+        client_insecure="true"
+    fi
+
     if [[ ! -f "$CLIENT_CONFIG_FILE" ]]; then
         local domain password obfs_pwd listen
         domain=$(get_domain)
@@ -241,7 +310,7 @@ server: ${domain}:${listen}
 auth: "${password}"
 tls:
   sni: ${domain}
-  insecure: false
+  insecure: ${client_insecure}
 obfs:
   type: salamander
   salamander:
@@ -252,6 +321,8 @@ bandwidth:
 CLIENT_YAML_EOF
         chown root:root "$CLIENT_CONFIG_FILE" 2>/dev/null || true
         chmod 600 "$CLIENT_CONFIG_FILE"
+    else
+        sed -i "s/^[[:space:]]*insecure:[[:space:]]*.*/  insecure: ${client_insecure}/" "$CLIENT_CONFIG_FILE" 2>/dev/null || true
     fi
 
     echo -e "\n  ${C_BAR}  ${C_WHITE}客户端 YAML 配置 (${CLIENT_CONFIG_FILE})${C_RESET}\n"
@@ -260,11 +331,13 @@ CLIENT_YAML_EOF
 }
 
 renew_test() {
-    if [[ -f "/etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh" ]] && command -v certbot >/dev/null 2>&1; then
+    if is_cert_self_signed; then
+        echo -e "\n  ${C_BAR}  ${C_GREEN}✔ 当前节点使用极速自签名 ECC 证书 (100 年超长有效)，无需执行续签。${C_RESET}\n"
+    elif [[ -f "/etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh" ]] && command -v certbot >/dev/null 2>&1; then
         echo -e "\n  ${C_BAR}  ${C_ORANGE_BOLD}模拟执行 Let's Encrypt 证书自动续签与挂钩同步...${C_RESET}\n"
         certbot renew --dry-run --run-deploy-hooks
     else
-        echo -e "\n  ${C_BAR}  ${C_GREEN}✔ 当前节点使用极速自签名 ECC 证书 (100 年超长有效)，无需执行续签。${C_RESET}\n"
+        echo -e "\n  ${C_BAR}  ${C_AMBER}未检测到 Let's Encrypt 自动续签配置。${C_RESET}\n"
     fi
 }
 
@@ -325,7 +398,7 @@ uninstall() {
         pkill -f "hysteria server" 2>/dev/null || true
 
         cleanup_firewall
-        rm -f /usr/local/bin/hysteria /usr/local/bin/buds /usr/local/bin/hy2
+        rm -f /usr/local/bin/hysteria /usr/local/bin/buds /usr/local/bin/hy2 /usr/local/bin/hysteria-service
         rm -rf /etc/hysteria /var/log/hysteria.log
         rm -f /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh
         rm -f /etc/periodic/daily/certbot-renew
@@ -349,7 +422,7 @@ show_menu() {
                 is_running=true
             fi
         else
-            if pgrep -f "hysteria server" >/dev/null 2>&1; then
+            if pgrep -f "hysteria (server|-c)" >/dev/null 2>&1; then
                 is_running=true
             fi
         fi
