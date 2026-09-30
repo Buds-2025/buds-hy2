@@ -276,8 +276,41 @@ start_nginx_service() {
     fi
 }
 
+generate_self_signed_cert() {
+    local domain="$1"
+    info "正在为域名 ${C_CYAN}${domain}${C_RESET} 生成高性能 ECC 自签名证书..."
+    mkdir -p "$CONFIG_DIR"
+    
+    openssl ecparam -name prime256v1 -genkey -noout -out "${CONFIG_DIR}/server.key" 2>/dev/null || \
+    openssl genrsa -out "${CONFIG_DIR}/server.key" 2048 2>/dev/null
+
+    openssl req -new -x509 -days 36500 \
+        -key "${CONFIG_DIR}/server.key" \
+        -out "${CONFIG_DIR}/server.crt" \
+        -subj "/CN=${domain}" >/dev/null 2>&1
+
+    if id hysteria >/dev/null 2>&1; then
+        chown root:hysteria "${CONFIG_DIR}/server.crt" "${CONFIG_DIR}/server.key" 2>/dev/null || true
+    fi
+    chmod 640 "${CONFIG_DIR}/server.crt" "${CONFIG_DIR}/server.key"
+    success "自签名证书生成完毕 (ECC-P256 算法，有效期 100 年，全客户端通用免维护)。"
+}
+
 setup_certificates() {
     info "配置 SSL 证书..."
+
+    mkdir -p "$CONFIG_DIR" "$HOOK_DIR"
+
+    echo -e "\n  ${C_SUBBAR}  ${C_WHITE}请选择 SSL 证书申请模式:${C_RESET}"
+    echo -e "     ${C_ORANGE_BOLD}1.${C_RESET} ${C_WHITE}Let's Encrypt 官方证书${C_RESET} ${C_GRAY_MID}[默认] (需要本机 80 端口可用，支持现有网站零停机)${C_RESET}"
+    echo -e "     ${C_ORANGE_BOLD}2.${C_RESET} ${C_WHITE}极速自签名证书${C_RESET}         ${C_GRAY_MID}(无需 80 端口，专为 NAT VPS / LXD 容器 / 端口受限环境定制)${C_RESET}"
+    read -rp "$(echo -e "  ${C_ORANGE_BOLD}❯${C_RESET} ${C_WHITE}请选择证书模式 [默认: 1]: ${C_RESET}")" CERT_MODE
+    CERT_MODE="${CERT_MODE:-1}"
+
+    if [[ "$CERT_MODE" == "2" ]]; then
+        generate_self_signed_cert "$DOMAIN"
+        return 0
+    fi
 
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw allow 80/tcp comment 'certbot-http' >/dev/null 2>&1 || true
@@ -353,8 +386,17 @@ setup_certificates() {
     fi
 
     if [[ "$cert_success" != "true" && ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
-        error "SSL 证书申领失败！请检查：1. 域名解析是否已生效；2. 80 端口是否对公网开放。"
-        exit 1
+        warn "Let's Encrypt 证书申请未成功 (常见于 NAT VPS、共享 IP、端口受限或 80 端口被外部拦截)。"
+        echo -e "  ${C_ORANGE}●${C_RESET} ${C_WHITE}是否自动切换为自签名证书继续完成部署？(全客户端通用)${C_RESET}"
+        read -rp "  直接回车将使用自签名证书继续 (Y/n) [默认 Y]: " fallback_choice
+        fallback_choice="${fallback_choice:-Y}"
+        if [[ "$fallback_choice" =~ ^[Yy]$ ]]; then
+            generate_self_signed_cert "$DOMAIN"
+            return 0
+        else
+            error "SSL 证书申领失败且用户取消自签名回退，部署已终止。"
+            exit 1
+        fi
     fi
 
     mkdir -p "$CONFIG_DIR" "$HOOK_DIR"
@@ -938,8 +980,12 @@ CLIENT_YAML_EOF
 }
 
 renew_test() {
-    echo -e "\n  ${C_BAR}  ${C_ORANGE_BOLD}模拟执行 Let's Encrypt 证书自动续签与挂钩同步...${C_RESET}\n"
-    certbot renew --dry-run --run-deploy-hooks
+    if [[ -f "/etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh" ]] && command -v certbot >/dev/null 2>&1; then
+        echo -e "\n  ${C_BAR}  ${C_ORANGE_BOLD}模拟执行 Let's Encrypt 证书自动续签与挂钩同步...${C_RESET}\n"
+        certbot renew --dry-run --run-deploy-hooks
+    else
+        echo -e "\n  ${C_BAR}  ${C_GREEN}✔ 当前节点使用极速自签名 ECC 证书 (100 年超长有效)，无需执行续签。${C_RESET}\n"
+    fi
 }
 
 cleanup_firewall() {

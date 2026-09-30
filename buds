@@ -260,8 +260,12 @@ CLIENT_YAML_EOF
 }
 
 renew_test() {
-    echo -e "\n  ${C_BAR}  ${C_ORANGE_BOLD}模拟执行 Let's Encrypt 证书自动续签与挂钩同步...${C_RESET}\n"
-    certbot renew --dry-run --run-deploy-hooks
+    if [[ -f "/etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh" ]] && command -v certbot >/dev/null 2>&1; then
+        echo -e "\n  ${C_BAR}  ${C_ORANGE_BOLD}模拟执行 Let's Encrypt 证书自动续签与挂钩同步...${C_RESET}\n"
+        certbot renew --dry-run --run-deploy-hooks
+    else
+        echo -e "\n  ${C_BAR}  ${C_GREEN}✔ 当前节点使用极速自签名 ECC 证书 (100 年超长有效)，无需执行续签。${C_RESET}\n"
+    fi
 }
 
 cleanup_firewall() {
