@@ -32,3 +32,7 @@ Thumbs.db
 desktop.ini
 .vscode/
 .idea/
+
+# 本地开发档案与交接手册（本地专属，严禁提交推送）
+PROJECT_DEVELOPMENT_RECORD.md
+DEV_NOTES.md
