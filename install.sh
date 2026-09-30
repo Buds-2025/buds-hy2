@@ -209,6 +209,73 @@ collect_parameters() {
     OBFS_PASSWORD="Obfs_$(generate_random_string 12)"
 }
 
+is_nginx_running() {
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx 2>/dev/null; then
+        return 0
+    elif command -v rc-service >/dev/null 2>&1 && rc-service nginx status 2>/dev/null | grep -q "started"; then
+        return 0
+    elif command -v pidof >/dev/null 2>&1 && pidof nginx >/dev/null 2>&1; then
+        return 0
+    elif pgrep -f "nginx" >/dev/null 2>&1; then
+        return 0
+    elif ps aux 2>/dev/null | grep -E "nginx(:| )" | grep -v grep >/dev/null 2>&1; then
+        return 0
+    elif (command -v ss >/dev/null 2>&1 && ss -tlpn 2>/dev/null | grep -E ':(80|http)\b' | grep -q nginx) || \
+         (command -v netstat >/dev/null 2>&1 && netstat -tlpn 2>/dev/null | grep -E ':(80|http)\b' | grep -q nginx); then
+        return 0
+    fi
+    return 1
+}
+
+is_port_80_listening() {
+    if command -v ss >/dev/null 2>&1 && ss -tlpn 2>/dev/null | grep -qE ':(80|http)\b'; then
+        return 0
+    elif command -v netstat >/dev/null 2>&1 && netstat -tlpn 2>/dev/null | grep -qE ':(80|http)\b'; then
+        return 0
+    elif command -v fuser >/dev/null 2>&1 && fuser 80/tcp >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+find_nginx_webroot() {
+    local root_dir=""
+    root_dir=$(grep -h -E '^[[:space:]]*root[[:space:]]+' /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/http.d/*.conf 2>/dev/null | head -1 | awk '{print $2}' | tr -d ';')
+    if [[ -n "$root_dir" && -d "$root_dir" ]]; then
+        echo "$root_dir"
+        return
+    fi
+    for candidate in "/var/lib/nginx/html" "/usr/share/nginx/html" "/var/www/localhost/htdocs" "/var/www/html" "/var/www"; do
+        if [[ -d "$candidate" ]]; then
+            echo "$candidate"
+            return
+        fi
+    done
+    echo ""
+}
+
+stop_nginx_service() {
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx 2>/dev/null; then
+        systemctl stop nginx 2>/dev/null || true
+    elif command -v rc-service >/dev/null 2>&1 && rc-service nginx status 2>/dev/null | grep -q "started"; then
+        rc-service nginx stop 2>/dev/null || true
+    elif command -v nginx >/dev/null 2>&1; then
+        nginx -s stop 2>/dev/null || killall nginx 2>/dev/null || true
+    else
+        killall nginx 2>/dev/null || pkill -f nginx 2>/dev/null || true
+    fi
+}
+
+start_nginx_service() {
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl start nginx 2>/dev/null || true
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service nginx start 2>/dev/null || true
+    elif command -v nginx >/dev/null 2>&1; then
+        nginx 2>/dev/null || true
+    fi
+}
+
 setup_certificates() {
     info "配置 SSL 证书..."
 
@@ -216,31 +283,78 @@ setup_certificates() {
         ufw allow 80/tcp comment 'certbot-http' >/dev/null 2>&1 || true
     fi
 
-    local nginx_running=false
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx 2>/dev/null; then
-        nginx_running=true
-    elif command -v rc-service >/dev/null 2>&1 && rc-service nginx status >/dev/null 2>&1; then
-        nginx_running=true
-    elif pgrep -x nginx >/dev/null 2>&1; then
-        nginx_running=true
+    local cert_success=false
+    local has_nginx=false
+    if is_nginx_running; then
+        has_nginx=true
     fi
 
-    if [[ "$nginx_running" == "true" ]]; then
-        info "检测到运行中的 Nginx，使用 --nginx 插件进行零停机证书申领..."
-        certbot certonly --nginx \
+    # 方案 1: 若检测到 Nginx，优先尝试 --nginx 插件 (零停机)
+    if [[ "$has_nginx" == "true" ]]; then
+        info "检测到运行中的 Nginx，尝试使用 --nginx 插件进行零停机证书申领..."
+        if certbot certonly --nginx \
             -d "$DOMAIN" \
             --agree-tos \
             --register-unsafely-without-email \
             --keep-until-expiring \
-            --non-interactive
+            --non-interactive; then
+            cert_success=true
+        fi
+
+        # 方案 2: 若 --nginx 插件未成功，尝试通过 --webroot 模式验证
+        if [[ "$cert_success" != "true" ]]; then
+            local webroot
+            webroot=$(find_nginx_webroot)
+            if [[ -n "$webroot" ]]; then
+                info "尝试使用 Nginx 网站根目录 (${webroot}) 进行 --webroot 验证..."
+                if certbot certonly --webroot -w "$webroot" \
+                    -d "$DOMAIN" \
+                    --agree-tos \
+                    --register-unsafely-without-email \
+                    --keep-until-expiring \
+                    --non-interactive; then
+                    cert_success=true
+                fi
+            fi
+        fi
+
+        # 方案 3: 若前两者均未成功，临时暂停 Nginx 5 秒，使用 --standalone 极速申领，然后立即恢复 Nginx
+        if [[ "$cert_success" != "true" ]]; then
+            warn "Nginx 插件与 Webroot 验证未成功，临时暂停 Nginx 5 秒以通过独立模式验证..."
+            stop_nginx_service
+            sleep 1
+            if certbot certonly --standalone \
+                -d "$DOMAIN" \
+                --agree-tos \
+                --register-unsafely-without-email \
+                --keep-until-expiring \
+                --non-interactive; then
+                cert_success=true
+            fi
+            start_nginx_service
+        fi
     else
+        # 方案 4: 未检测到 Nginx，但若 80 端口被占用，尝试暂停占用程序
+        if is_port_80_listening; then
+            warn "检测到 80 端口已被监听，正在尝试暂停占用服务..."
+            stop_nginx_service
+            sleep 1
+        fi
+
         info "使用 --standalone 独立模式申请证书..."
-        certbot certonly --standalone \
+        if certbot certonly --standalone \
             -d "$DOMAIN" \
             --agree-tos \
             --register-unsafely-without-email \
             --keep-until-expiring \
-            --non-interactive
+            --non-interactive; then
+            cert_success=true
+        fi
+    fi
+
+    if [[ "$cert_success" != "true" && ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
+        error "SSL 证书申领失败！请检查：1. 域名解析是否已生效；2. 80 端口是否对公网开放。"
+        exit 1
     fi
 
     mkdir -p "$CONFIG_DIR" "$HOOK_DIR"
@@ -269,7 +383,7 @@ EOF
     if [[ "$INIT_SYSTEM" == "openrc" ]]; then
         mkdir -p /etc/periodic/daily
         cat <<'CRON_EOF' > /etc/periodic/daily/certbot-renew
-#!/sh
+#!/bin/sh
 certbot renew --quiet --run-deploy-hooks
 CRON_EOF
         chmod +x /etc/periodic/daily/certbot-renew
