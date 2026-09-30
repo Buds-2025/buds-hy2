@@ -43,9 +43,23 @@ warn() { echo -e "  ${C_AMBER}⚠${C_RESET} $*"; }
 error() { echo -e "  ${C_RED}✖${C_RESET} $*"; }
 
 check_root() {
-    if [[ $EUID -ne 0 ]]; then
+    if [[ $(id -u) -ne 0 ]]; then
         error "请以 root 权限运行此脚本。"
         exit 1
+    fi
+}
+
+detect_init_system() {
+    if command -v systemctl >/dev/null 2>&1 && (systemctl is-system-running >/dev/null 2>&1 || [[ -d /run/systemd/system ]]); then
+        INIT_SYSTEM="systemd"
+    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+        INIT_SYSTEM="openrc"
+    elif [[ -d /run/systemd/system ]]; then
+        INIT_SYSTEM="systemd"
+    elif [[ -f /sbin/openrc-run || -d /etc/init.d ]]; then
+        INIT_SYSTEM="openrc"
+    else
+        INIT_SYSTEM="other"
     fi
 }
 
@@ -68,15 +82,46 @@ install_dependencies() {
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq || true
         apt-get install -y -qq curl wget openssl ufw certbot python3-certbot-nginx ca-certificates iptables iproute2 dnsutils libcap2-bin >/dev/null 2>&1
+    elif command -v apk >/dev/null 2>&1; then
+        # Alpine Linux 适配
+        if [[ -f /etc/apk/repositories ]]; then
+            sed -i 's/^#\(.*\/community\)/\1/' /etc/apk/repositories
+        fi
+        apk update >/dev/null 2>&1 || true
+        apk add --no-cache curl wget openssl ca-certificates iptables iproute2 bind-tools certbot libcap shadow tzdata >/dev/null 2>&1 || true
+        if ! apk add --no-cache certbot-nginx >/dev/null 2>&1; then
+            apk add --no-cache py3-pip >/dev/null 2>&1 || true
+            pip install certbot-nginx --break-system-packages >/dev/null 2>&1 || true
+        fi
+        if command -v rc-update >/dev/null 2>&1; then
+            rc-update add crond default >/dev/null 2>&1 || true
+            rc-service crond start >/dev/null 2>&1 || true
+        fi
     elif command -v dnf >/dev/null 2>&1; then
         dnf install -y -q epel-release || true
         dnf install -y -q curl wget openssl certbot python3-certbot-nginx ca-certificates iptables iproute bind-utils libcap >/dev/null 2>&1
     elif command -v yum >/dev/null 2>&1; then
         yum install -y -q epel-release || true
         yum install -y -q curl wget openssl certbot python3-certbot-nginx ca-certificates iptables iproute bind-utils libcap >/dev/null 2>&1
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -Sy --noconfirm curl wget openssl certbot certbot-nginx ca-certificates iptables iproute2 bind-tools libcap >/dev/null 2>&1
     else
         warn "未识别到主流包管理器，尝试继续使用现有系统环境。"
     fi
+
+    # 兜底检测: 确保 certbot 可用
+    if ! command -v certbot >/dev/null 2>&1; then
+        if command -v pip3 >/dev/null 2>&1 || command -v pip >/dev/null 2>&1; then
+            info "尝试通过 Python pip 安装 Certbot..."
+            pip install certbot certbot-nginx --break-system-packages >/dev/null 2>&1 || pip3 install certbot certbot-nginx >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if ! command -v certbot >/dev/null 2>&1; then
+        error "未检测到 certbot，且自动安装未成功。请先在系统中安装 certbot (如: apk add certbot 或 apt install certbot) 后再重新运行。"
+        exit 1
+    fi
+
     success "基础依赖环境准备完毕。"
 }
 
@@ -171,7 +216,16 @@ setup_certificates() {
         ufw allow 80/tcp comment 'certbot-http' >/dev/null 2>&1 || true
     fi
 
-    if systemctl is-active --quiet nginx 2>/dev/null; then
+    local nginx_running=false
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx 2>/dev/null; then
+        nginx_running=true
+    elif command -v rc-service >/dev/null 2>&1 && rc-service nginx status >/dev/null 2>&1; then
+        nginx_running=true
+    elif pgrep -x nginx >/dev/null 2>&1; then
+        nginx_running=true
+    fi
+
+    if [[ "$nginx_running" == "true" ]]; then
         info "检测到运行中的 Nginx，使用 --nginx 插件进行零停机证书申领..."
         certbot certonly --nginx \
             -d "$DOMAIN" \
@@ -199,23 +253,79 @@ if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
     cp -L "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${CONFIG_DIR}/server.crt"
     cp -L "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "${CONFIG_DIR}/server.key"
     if id hysteria >/dev/null 2>&1; then
-        chown root:hysteria "${CONFIG_DIR}/server.crt" "${CONFIG_DIR}/server.key"
+        chown root:hysteria "${CONFIG_DIR}/server.crt" "${CONFIG_DIR}/server.key" 2>/dev/null || true
     fi
     chmod 640 "${CONFIG_DIR}/server.crt" "${CONFIG_DIR}/server.key"
-    if systemctl is-active --quiet hysteria-server; then
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet hysteria-server 2>/dev/null; then
         systemctl restart hysteria-server
+    elif command -v rc-service >/dev/null 2>&1 && rc-service hysteria-server status >/dev/null 2>&1; then
+        rc-service hysteria-server restart
     fi
 fi
 EOF
     chmod +x "$HOOK_FILE"
     "$HOOK_FILE"
+
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        mkdir -p /etc/periodic/daily
+        cat <<'CRON_EOF' > /etc/periodic/daily/certbot-renew
+#!/sh
+certbot renew --quiet --run-deploy-hooks
+CRON_EOF
+        chmod +x /etc/periodic/daily/certbot-renew
+    fi
+
     success "SSL 证书部署完成，已挂载自动续期同步钩子。"
 }
 
 install_official_core() {
     info "安装官方 Hysteria 2 主程序..."
-    bash <(curl -fsSL https://get.hy2.sh/)
-    success "Hysteria 2 安装完成。"
+    local installed=false
+
+    if [[ "$INIT_SYSTEM" == "systemd" && ! -f /etc/alpine-release ]]; then
+        if bash <(curl -fsSL https://get.hy2.sh/) >/dev/null 2>&1; then
+            installed=true
+        fi
+    fi
+
+    if [[ "$installed" != "true" || ! -x /usr/local/bin/hysteria ]]; then
+        info "正在直接拉取官方最新静态编译内核 (兼容 glibc 与 musl)..."
+        local arch
+        arch=$(uname -m)
+        local binary_name=""
+        case "$arch" in
+            x86_64|amd64) binary_name="hysteria-linux-amd64" ;;
+            aarch64|arm64) binary_name="hysteria-linux-arm64" ;;
+            armv7*|armhf) binary_name="hysteria-linux-arm" ;;
+            i386|i686) binary_name="hysteria-linux-386" ;;
+            s390x) binary_name="hysteria-linux-s390x" ;;
+            *) binary_name="hysteria-linux-amd64" ;;
+        esac
+
+        mkdir -p /usr/local/bin
+        local download_urls=(
+            "https://github.com/apernet/hysteria/releases/latest/download/${binary_name}"
+            "https://download.hysteria.network/app/latest/${binary_name}"
+        )
+        for url in "${download_urls[@]}"; do
+            info "尝试从 ${url} 下载..."
+            if curl -fsSL --retry 3 --retry-delay 2 "$url" -o /usr/local/bin/hysteria; then
+                installed=true
+                break
+            fi
+        done
+        chmod 755 /usr/local/bin/hysteria
+    fi
+
+    if [[ ! -x /usr/local/bin/hysteria ]]; then
+        error "Hysteria 2 主程序下载失败，请检查网络连接。"
+        exit 1
+    fi
+
+    if command -v setcap >/dev/null 2>&1; then
+        setcap 'cap_net_bind_service,cap_net_admin,cap_net_raw=+ep' /usr/local/bin/hysteria >/dev/null 2>&1 || true
+    fi
+    success "Hysteria 2 安装完成 ($(/usr/local/bin/hysteria version 2>/dev/null | head -1 || echo '已就绪'))。"
 }
 
 generate_server_config() {
@@ -249,11 +359,26 @@ masquerade:
     rewriteHost: true
 EOF
 
-    chown root:hysteria "$CONFIG_DIR"
-    chmod 750 "$CONFIG_DIR"
-    chown root:hysteria "$CONFIG_FILE"
-    chmod 640 "$CONFIG_FILE"
-    success "服务端配置文件写入完毕 (权限 640，归属 root:hysteria)。"
+    # 确保 hysteria 服务专属用户存在
+    if ! id hysteria >/dev/null 2>&1; then
+        if command -v useradd >/dev/null 2>&1; then
+            useradd -r -s /sbin/nologin hysteria >/dev/null 2>&1 || true
+        elif command -v adduser >/dev/null 2>&1; then
+            adduser -S -D -H -s /sbin/nologin hysteria >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if id hysteria >/dev/null 2>&1; then
+        chown -R root:hysteria "$CONFIG_DIR" 2>/dev/null || true
+        chmod 750 "$CONFIG_DIR"
+        chmod 640 "$CONFIG_FILE"
+        success "服务端配置文件写入完毕 (权限 640，归属 root:hysteria)。"
+    else
+        chown -R root:root "$CONFIG_DIR" 2>/dev/null || true
+        chmod 700 "$CONFIG_DIR"
+        chmod 600 "$CONFIG_FILE"
+        success "服务端配置文件写入完毕 (权限 600，归属 root:root)。"
+    fi
 }
 
 tune_kernel_network() {
@@ -261,6 +386,14 @@ tune_kernel_network() {
     modprobe tcp_bbr >/dev/null 2>&1 || true
     modprobe sch_fq >/dev/null 2>&1 || true
 
+    if [[ -f /etc/modules ]] && ! grep -q "^tcp_bbr" /etc/modules 2>/dev/null; then
+        echo "tcp_bbr" >> /etc/modules 2>/dev/null || true
+    fi
+    if [[ -f /etc/modules ]] && ! grep -q "^sch_fq" /etc/modules 2>/dev/null; then
+        echo "sch_fq" >> /etc/modules 2>/dev/null || true
+    fi
+
+    mkdir -p /etc/sysctl.d
     cat <<EOF > "$SYSCTL_FILE"
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
@@ -279,23 +412,58 @@ EOF
     success "内核网络栈调优已生效 (64MB UDP 缓冲区 + BBR 拥塞控制)。"
 }
 
-configure_systemd_override() {
-    info "设置 systemd 高可用守护与特权补偿..."
+configure_service() {
+    info "设置服务守护进程与高可用自愈..."
     
     if command -v setcap >/dev/null 2>&1 && [[ -f /usr/local/bin/hysteria ]]; then
         setcap cap_net_bind_service,cap_net_admin,cap_net_raw=+ep /usr/local/bin/hysteria >/dev/null 2>&1 || true
     fi
 
-    mkdir -p "$OVERRIDE_DIR"
-    cat <<EOF > "$OVERRIDE_FILE"
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        mkdir -p "$OVERRIDE_DIR"
+        cat <<EOF > "$OVERRIDE_FILE"
 [Service]
 Restart=on-failure
 RestartSec=3s
 LimitNOFILE=1048576
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EOF
-    systemctl daemon-reload
-    success "自动重启与并发限制配置生效 (崩溃 3 秒自愈 + 104 万描述符)。"
+        systemctl daemon-reload
+        success "systemd 自动重启与并发限制配置生效 (崩溃 3 秒自愈 + 104 万描述符)。"
+    elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        cat <<'INIT_EOF' > /etc/init.d/hysteria-server
+#!/sbin/openrc-run
+supervisor="supervise-daemon"
+name="hysteria-server"
+description="Hysteria 2 Server Service"
+command="/usr/local/bin/hysteria"
+command_args="server -c /etc/hysteria/config.yaml"
+command_background="yes"
+output_log="/var/log/hysteria.log"
+error_log="/var/log/hysteria.log"
+capabilities="^cap_net_bind_service,^cap_net_admin"
+respawn_delay=2
+respawn_max=0
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath -d -m 0750 /etc/hysteria
+    if [ ! -f /etc/hysteria/config.yaml ]; then
+        eerror "Config file /etc/hysteria/config.yaml not found!"
+        return 1
+    fi
+    touch /var/log/hysteria.log
+    chmod 640 /var/log/hysteria.log
+}
+INIT_EOF
+        chmod 755 /etc/init.d/hysteria-server
+        rc-update add hysteria-server default >/dev/null 2>&1 || true
+        success "OpenRC 守护服务已配置并设为开机自启 (崩溃自动重启)。"
+    fi
 }
 
 configure_firewall() {
@@ -323,6 +491,10 @@ configure_firewall() {
         else
             iptables -I INPUT -p udp --dport "${SINGLE_PORT}" -m comment --comment "buds-hy2" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p udp --dport "${SINGLE_PORT}" -j ACCEPT >/dev/null 2>&1 || true
         fi
+        if [[ -x /etc/init.d/iptables ]]; then
+            /etc/init.d/iptables save >/dev/null 2>&1 || rc-service iptables save >/dev/null 2>&1 || true
+            rc-update add iptables default >/dev/null 2>&1 || true
+        fi
     fi
 
     success "防火墙规则配置完成。"
@@ -330,15 +502,38 @@ configure_firewall() {
 
 start_service() {
     info "启动 Hysteria 2 服务..."
-    systemctl enable --now hysteria-server
-    sleep 2
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable --now hysteria-server
+        sleep 2
 
-    if systemctl is-active --quiet hysteria-server; then
-        success "Hysteria 2 服务已正常运行。"
+        if systemctl is-active --quiet hysteria-server; then
+            success "Hysteria 2 服务已正常运行。"
+        else
+            error "服务未能正常启动，请查看日志："
+            journalctl -u hysteria-server -n 20 --no-pager
+            exit 1
+        fi
+    elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        rc-service hysteria-server restart
+        sleep 2
+        if rc-service hysteria-server status | grep -q "started"; then
+            success "Hysteria 2 服务已正常运行 (OpenRC)。"
+        else
+            error "服务未能正常启动，请查看日志："
+            tail -n 20 /var/log/hysteria.log 2>/dev/null || true
+            exit 1
+        fi
     else
-        error "服务未能正常启动，请查看日志："
-        journalctl -u hysteria-server -n 20 --no-pager
-        exit 1
+        pkill -f "hysteria server" >/dev/null 2>&1 || true
+        nohup /usr/local/bin/hysteria server -c "$CONFIG_FILE" >/var/log/hysteria.log 2>&1 &
+        sleep 2
+        if pgrep -f "hysteria server" >/dev/null 2>&1; then
+            success "Hysteria 2 服务已正常运行。"
+        else
+            error "服务未能正常启动，请查看日志: cat /var/log/hysteria.log"
+            exit 1
+        fi
     fi
 }
 
@@ -484,29 +679,66 @@ get_listen() {
 
 status() {
     echo -e "\n  ${C_BAR}  ${C_WHITE}服务运行状态与 UDP 端口监听 · SERVICE STATUS${C_RESET}\n"
-    systemctl status hysteria-server --no-pager || true
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl status hysteria-server --no-pager || true
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service hysteria-server status || true
+    else
+        ps aux 2>/dev/null | grep -E "hysteria (server|-c)" | grep -v grep || echo -e "     ${C_GRAY_MID}未检测到活动进程${C_RESET}"
+    fi
     echo -e "\n  ${C_SUBBAR}  ${C_ORANGE_BOLD}UDP 端口监听详情 · UDP LISTEN DETAILS${C_RESET}"
-    ss -ulpn | grep hysteria || echo -e "     ${C_GRAY_MID}暂无活动 UDP 监听${C_RESET}"
+    if command -v ss >/dev/null 2>&1; then
+        ss -ulpn 2>/dev/null | grep hysteria || echo -e "     ${C_GRAY_MID}暂无活动 UDP 监听${C_RESET}"
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -ulpn 2>/dev/null | grep hysteria || echo -e "     ${C_GRAY_MID}暂无活动 UDP 监听${C_RESET}"
+    else
+        echo -e "     ${C_GRAY_MID}暂无活动 UDP 监听${C_RESET}"
+    fi
     echo ""
 }
 
 log() {
-    echo -e "\n  ${C_BAR}  ${C_ORANGE_BOLD}跟踪实时运行日志 · LIVE JOURNAL${C_RESET} ${C_GRAY_MID}(按 Ctrl+C 可退出)...${C_RESET}\n"
-    journalctl -u hysteria-server -f -o cat
+    echo -e "\n  ${C_BAR}  ${C_ORANGE_BOLD}跟踪实时运行日志 · LIVE LOG${C_RESET} ${C_GRAY_MID}(按 Ctrl+C 可退出)...${C_RESET}\n"
+    if command -v journalctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        journalctl -u hysteria-server -f -o cat
+    elif [[ -f "/var/log/hysteria.log" ]]; then
+        tail -f -n 50 /var/log/hysteria.log
+    else
+        echo -e "  ${C_GRAY_MID}未检测到活动日志 (journalctl 或 /var/log/hysteria.log)${C_RESET}\n"
+    fi
 }
 
 restart() {
-    systemctl restart hysteria-server
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl restart hysteria-server
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service hysteria-server restart
+    else
+        pkill -f "hysteria server" 2>/dev/null || true
+        nohup /usr/local/bin/hysteria server -c "${CONFIG_FILE}" >/var/log/hysteria.log 2>&1 &
+    fi
     echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已成功重启。${C_RESET}\n"
 }
 
 stop() {
-    systemctl stop hysteria-server
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl stop hysteria-server
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service hysteria-server stop
+    else
+        pkill -f "hysteria server" 2>/dev/null || true
+    fi
     echo -e "\n  ${C_BAR}  ${C_AMBER}✔ Hysteria 2 服务已停止。${C_RESET}\n"
 }
 
 start() {
-    systemctl start hysteria-server
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl start hysteria-server
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service hysteria-server start
+    else
+        nohup /usr/local/bin/hysteria server -c "${CONFIG_FILE}" >/var/log/hysteria.log 2>&1 &
+    fi
     echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已启动。${C_RESET}\n"
 }
 
@@ -639,14 +871,25 @@ uninstall() {
     echo -e "\n  ${C_RED}⚠ 警告: 即将卸载 Hysteria 2 服务！${C_RESET}"
     read -rp "  确认彻底卸载吗？(y/N): " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        systemctl disable --now hysteria-server 2>/dev/null || true
+        if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+            systemctl disable --now hysteria-server 2>/dev/null || true
+            rm -rf /etc/systemd/system/hysteria-server.service.d
+            rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+        if command -v rc-service >/dev/null 2>&1; then
+            rc-service hysteria-server stop 2>/dev/null || true
+            rc-update del hysteria-server default 2>/dev/null || true
+            rm -f /etc/init.d/hysteria-server
+        fi
+        pkill -f "hysteria server" 2>/dev/null || true
+
         cleanup_firewall
         rm -f /usr/local/bin/hysteria /usr/local/bin/buds /usr/local/bin/hy2
-        rm -rf /etc/hysteria /etc/systemd/system/hysteria-server.service.d
-        rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service
+        rm -rf /etc/hysteria /var/log/hysteria.log
         rm -f /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh
+        rm -f /etc/periodic/daily/certbot-renew
         rm -f /etc/sysctl.d/99-hysteria-performance.conf
-        systemctl daemon-reload
         echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务及防火墙规则已安全卸载，原有 Nginx 及网站保持原样。${C_RESET}\n"
     else
         echo -e "\n  已取消卸载。\n"
@@ -656,7 +899,22 @@ uninstall() {
 show_menu() {
     while true; do
         local status_badge domain listen
-        if systemctl is-active --quiet hysteria-server 2>/dev/null; then
+        local is_running=false
+        if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+            if systemctl is-active --quiet hysteria-server 2>/dev/null; then
+                is_running=true
+            fi
+        elif command -v rc-service >/dev/null 2>&1; then
+            if rc-service hysteria-server status 2>/dev/null | grep -q "started"; then
+                is_running=true
+            fi
+        else
+            if pgrep -f "hysteria server" >/dev/null 2>&1; then
+                is_running=true
+            fi
+        fi
+
+        if [[ "$is_running" == "true" ]]; then
             status_badge="${C_GREEN}● 运行中 (Running)${C_RESET}"
         else
             status_badge="${C_RED}● 已停止 (Stopped)${C_RESET}"
@@ -744,13 +1002,14 @@ display_summary() {
 
 main() {
     check_root
+    detect_init_system
     install_dependencies
     collect_parameters
     setup_certificates
     install_official_core
     generate_server_config
     tune_kernel_network
-    configure_systemd_override
+    configure_service
     configure_firewall
     start_service
     setup_cli

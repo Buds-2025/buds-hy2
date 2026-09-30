@@ -115,29 +115,66 @@ get_listen() {
 
 status() {
     echo -e "\n  ${C_BAR}  ${C_WHITE}服务运行状态与 UDP 端口监听 · SERVICE STATUS${C_RESET}\n"
-    systemctl status hysteria-server --no-pager || true
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl status hysteria-server --no-pager || true
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service hysteria-server status || true
+    else
+        ps aux 2>/dev/null | grep -E "hysteria (server|-c)" | grep -v grep || echo -e "     ${C_GRAY_MID}未检测到活动进程${C_RESET}"
+    fi
     echo -e "\n  ${C_SUBBAR}  ${C_ORANGE_BOLD}UDP 端口监听详情 · UDP LISTEN DETAILS${C_RESET}"
-    ss -ulpn | grep hysteria || echo -e "     ${C_GRAY_MID}暂无活动 UDP 监听${C_RESET}"
+    if command -v ss >/dev/null 2>&1; then
+        ss -ulpn 2>/dev/null | grep hysteria || echo -e "     ${C_GRAY_MID}暂无活动 UDP 监听${C_RESET}"
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -ulpn 2>/dev/null | grep hysteria || echo -e "     ${C_GRAY_MID}暂无活动 UDP 监听${C_RESET}"
+    else
+        echo -e "     ${C_GRAY_MID}暂无活动 UDP 监听${C_RESET}"
+    fi
     echo ""
 }
 
 log() {
-    echo -e "\n  ${C_BAR}  ${C_ORANGE_BOLD}跟踪实时运行日志 · LIVE JOURNAL${C_RESET} ${C_GRAY_MID}(按 Ctrl+C 可退出)...${C_RESET}\n"
-    journalctl -u hysteria-server -f -o cat
+    echo -e "\n  ${C_BAR}  ${C_ORANGE_BOLD}跟踪实时运行日志 · LIVE LOG${C_RESET} ${C_GRAY_MID}(按 Ctrl+C 可退出)...${C_RESET}\n"
+    if command -v journalctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        journalctl -u hysteria-server -f -o cat
+    elif [[ -f "/var/log/hysteria.log" ]]; then
+        tail -f -n 50 /var/log/hysteria.log
+    else
+        echo -e "  ${C_GRAY_MID}未检测到活动日志 (journalctl 或 /var/log/hysteria.log)${C_RESET}\n"
+    fi
 }
 
 restart() {
-    systemctl restart hysteria-server
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl restart hysteria-server
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service hysteria-server restart
+    else
+        pkill -f "hysteria server" 2>/dev/null || true
+        nohup /usr/local/bin/hysteria server -c "${CONFIG_FILE}" >/var/log/hysteria.log 2>&1 &
+    fi
     echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已成功重启。${C_RESET}\n"
 }
 
 stop() {
-    systemctl stop hysteria-server
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl stop hysteria-server
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service hysteria-server stop
+    else
+        pkill -f "hysteria server" 2>/dev/null || true
+    fi
     echo -e "\n  ${C_BAR}  ${C_AMBER}✔ Hysteria 2 服务已停止。${C_RESET}\n"
 }
 
 start() {
-    systemctl start hysteria-server
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl start hysteria-server
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service hysteria-server start
+    else
+        nohup /usr/local/bin/hysteria server -c "${CONFIG_FILE}" >/var/log/hysteria.log 2>&1 &
+    fi
     echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已启动。${C_RESET}\n"
 }
 
@@ -270,14 +307,25 @@ uninstall() {
     echo -e "\n  ${C_RED}⚠ 警告: 即将卸载 Hysteria 2 服务！${C_RESET}"
     read -rp "  确认彻底卸载吗？(y/N): " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        systemctl disable --now hysteria-server 2>/dev/null || true
+        if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+            systemctl disable --now hysteria-server 2>/dev/null || true
+            rm -rf /etc/systemd/system/hysteria-server.service.d
+            rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+        if command -v rc-service >/dev/null 2>&1; then
+            rc-service hysteria-server stop 2>/dev/null || true
+            rc-update del hysteria-server default 2>/dev/null || true
+            rm -f /etc/init.d/hysteria-server
+        fi
+        pkill -f "hysteria server" 2>/dev/null || true
+
         cleanup_firewall
         rm -f /usr/local/bin/hysteria /usr/local/bin/buds /usr/local/bin/hy2
-        rm -rf /etc/hysteria /etc/systemd/system/hysteria-server.service.d
-        rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service
+        rm -rf /etc/hysteria /var/log/hysteria.log
         rm -f /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh
+        rm -f /etc/periodic/daily/certbot-renew
         rm -f /etc/sysctl.d/99-hysteria-performance.conf
-        systemctl daemon-reload
         echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务及防火墙规则已安全卸载，原有 Nginx 及网站保持原样。${C_RESET}\n"
     else
         echo -e "\n  已取消卸载。\n"
@@ -287,7 +335,22 @@ uninstall() {
 show_menu() {
     while true; do
         local status_badge domain listen
-        if systemctl is-active --quiet hysteria-server 2>/dev/null; then
+        local is_running=false
+        if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+            if systemctl is-active --quiet hysteria-server 2>/dev/null; then
+                is_running=true
+            fi
+        elif command -v rc-service >/dev/null 2>&1; then
+            if rc-service hysteria-server status 2>/dev/null | grep -q "started"; then
+                is_running=true
+            fi
+        else
+            if pgrep -f "hysteria server" >/dev/null 2>&1; then
+                is_running=true
+            fi
+        fi
+
+        if [[ "$is_running" == "true" ]]; then
             status_badge="${C_GREEN}● 运行中 (Running)${C_RESET}"
         else
             status_badge="${C_RED}● 已停止 (Stopped)${C_RESET}"
