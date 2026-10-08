@@ -14,6 +14,7 @@ HOOK_DIR="/etc/letsencrypt/renewal-hooks/deploy"
 HOOK_FILE="${HOOK_DIR}/hysteria-sync.sh"
 OVERRIDE_DIR="/etc/systemd/system/hysteria-server.service.d"
 OVERRIDE_FILE="${OVERRIDE_DIR}/override.conf"
+SERVICE_FILE="/etc/systemd/system/hysteria-server.service"
 SYSCTL_FILE="/etc/sysctl.d/99-hysteria-performance.conf"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
@@ -89,14 +90,19 @@ detect_virtualization() {
     fi
 }
 
+has_systemd() {
+    command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
+}
+
+has_openrc() {
+    command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1 &&
+        command -v openrc-run >/dev/null 2>&1 && [[ -f /run/openrc/softlevel ]]
+}
+
 detect_init_system() {
-    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    if has_systemd; then
         INIT_SYSTEM="systemd"
-    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
-        INIT_SYSTEM="openrc"
-    elif [[ -d /run/systemd/system ]]; then
-        INIT_SYSTEM="systemd"
-    elif [[ -f /sbin/openrc-run || -d /etc/init.d ]]; then
+    elif has_openrc; then
         INIT_SYSTEM="openrc"
     else
         INIT_SYSTEM="other"
@@ -237,6 +243,25 @@ validate_domain() {
     fi
 }
 
+normalize_ports() {
+    local input="$1" minimum="${2:-1}" first last
+    if [[ "$input" =~ ^([0-9]{1,5})([:\-]([0-9]{1,5}))?$ ]]; then
+        first=$((10#${BASH_REMATCH[1]}))
+        last="$first"
+        [[ -z "${BASH_REMATCH[3]}" ]] || last=$((10#${BASH_REMATCH[3]}))
+        if (( first >= minimum && last <= 65535 && first <= last )); then
+            if [[ -n "${BASH_REMATCH[3]}" ]]; then
+                (( first < last )) || return 1
+                echo "${first}-${last}"
+            else
+                echo "$first"
+            fi
+            return 0
+        fi
+    fi
+    return 1
+}
+
 collect_parameters() {
     echo -e "\n  ${C_BAR}  ${C_WHITE}buds-hy2 · Hysteria 2 节点配置引导${C_RESET}\n"
 
@@ -262,14 +287,14 @@ collect_parameters() {
         read -rp "$(echo -e "${C_BOLD}请输入监听端口 [默认: ${DEFAULT_RANDOM_PORT}]: ${C_RESET}")" INPUT_PORT
         INPUT_PORT="${INPUT_PORT:-$DEFAULT_RANDOM_PORT}"
         INPUT_PORT=$(echo "$INPUT_PORT" | tr -d '[:space:]')
+        if ! INPUT_PORT=$(normalize_ports "$INPUT_PORT" 1024); then
+            error "端口应为 1024~65535 的单端口或递增范围，请重新输入！"
+            continue
+        fi
 
         if [[ "$INPUT_PORT" =~ ^([0-9]+)[:\-]([0-9]+)$ ]]; then
             local hop_start="${BASH_REMATCH[1]}"
             local hop_end="${BASH_REMATCH[2]}"
-            if (( hop_start >= hop_end || hop_start < 1024 || hop_end > 65535 )); then
-                error "端口范围无效 (${hop_start}-${hop_end})，范围应在 1024~65535 之间且起始小于结束，请重新输入！"
-                continue
-            fi
             IS_PORT_HOPPING=true
             HOP_START="$hop_start"
             HOP_END="$hop_end"
@@ -279,12 +304,8 @@ collect_parameters() {
             CLIENT_PORT_STR="${HOP_START}-${HOP_END}"
             info "已选择端口跳跃: ${C_CYAN}${HOP_START} 至 ${HOP_END}${C_RESET} (基准监听端口: ${BASE_PORT})"
             break
-        elif [[ "$INPUT_PORT" =~ ^[0-9]+$ ]]; then
+        else
             local single_port="$INPUT_PORT"
-            if (( single_port < 1024 || single_port > 65535 )); then
-                error "单端口应在 1024~65535 之间，请重新输入！"
-                continue
-            fi
             if ! check_port_available "$single_port"; then
                 warn "UDP 端口 ${single_port} 目前已被其他进程占用！"
                 read -rp "是否仍然强制使用该端口？(y/N) [默认 N]: " force_use
@@ -300,10 +321,21 @@ collect_parameters() {
             CLIENT_PORT_STR="${SINGLE_PORT}"
             info "已选择单端口: ${C_CYAN}${SINGLE_PORT}${C_RESET}"
             break
-        else
-            error "无法识别输入的端口格式: ${INPUT_PORT}，请重新输入！"
         fi
     done
+
+    if [[ "$IS_NAT" == "true" || "$IS_CONTAINER" == "true" ]]; then
+        local public_input public_default="$CLIENT_PORT_STR"
+        while true; do
+            read -rp "公网 UDP 连接端口/范围 [默认: ${public_default}，与监听相同直接回车]: " public_input
+            public_input=$(echo "${public_input:-$public_default}" | tr -d '[:space:]')
+            if CLIENT_PORT_STR=$(normalize_ports "$public_input"); then
+                break
+            fi
+            error "公网端口应为 1~65535 的单端口或递增范围，请重新输入！"
+        done
+        info "请在服务商面板将公网 UDP ${CLIENT_PORT_STR} 映射到本机监听 ${LISTEN_STR#:}。"
+    fi
 
     AUTH_PASSWORD="Hy2Pass_$(generate_random_string 12)"
     OBFS_PASSWORD="Obfs_$(generate_random_string 12)"
@@ -312,7 +344,7 @@ collect_parameters() {
 is_nginx_running() {
     if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] && systemctl is-active --quiet nginx 2>/dev/null; then
         return 0
-    elif command -v rc-service >/dev/null 2>&1 && rc-service nginx status 2>/dev/null | grep -q "started"; then
+    elif has_openrc && rc-service nginx status 2>/dev/null | grep -q "started"; then
         return 0
     elif command -v pidof >/dev/null 2>&1 && pidof nginx >/dev/null 2>&1; then
         return 0
@@ -354,26 +386,16 @@ find_nginx_webroot() {
     echo ""
 }
 
-stop_nginx_service() {
-    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] && systemctl is-active --quiet nginx 2>/dev/null; then
-        systemctl stop nginx 2>/dev/null || true
-    elif command -v rc-service >/dev/null 2>&1 && rc-service nginx status 2>/dev/null | grep -q "started"; then
-        rc-service nginx stop 2>/dev/null || true
-    elif command -v nginx >/dev/null 2>&1; then
-        nginx -s stop 2>/dev/null || killall nginx 2>/dev/null || true
-    else
-        killall nginx 2>/dev/null || pkill -f nginx 2>/dev/null || true
+is_cert_self_signed() {
+    if [[ -f "${CONFIG_DIR}/server.crt" ]]; then
+        local issuer subject
+        issuer=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -issuer -nameopt RFC2253 2>/dev/null | sed 's/^issuer=[[:space:]]*//' || true)
+        subject=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -subject -nameopt RFC2253 2>/dev/null | sed 's/^subject=[[:space:]]*//' || true)
+        if [[ -n "$issuer" && "$issuer" == "$subject" ]]; then
+            return 0
+        fi
     fi
-}
-
-start_nginx_service() {
-    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
-        systemctl start nginx 2>/dev/null || true
-    elif command -v rc-service >/dev/null 2>&1; then
-        rc-service nginx start 2>/dev/null || true
-    elif command -v nginx >/dev/null 2>&1; then
-        nginx 2>/dev/null || true
-    fi
+    return 1
 }
 
 generate_self_signed_cert() {
@@ -437,8 +459,8 @@ setup_certificates() {
         return 0
     fi
 
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow 80/tcp comment 'certbot-http' >/dev/null 2>&1 || true
+    if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
+        add_ufw_rule 80/tcp
     fi
 
     local cert_success=false
@@ -476,29 +498,7 @@ setup_certificates() {
             fi
         fi
 
-        # 方案 3: 若前两者均未成功，临时暂停 Nginx，使用 --standalone 极速申领，然后立即恢复 Nginx
-        if [[ "$cert_success" != "true" ]]; then
-            warn "Nginx 插件与 Webroot 验证未成功，临时暂停 Nginx 以通过独立模式验证..."
-            stop_nginx_service
-            sleep 1
-            if certbot certonly --standalone \
-                -d "$DOMAIN" \
-                --agree-tos \
-                --register-unsafely-without-email \
-                --keep-until-expiring \
-                --non-interactive; then
-                cert_success=true
-            fi
-            start_nginx_service
-        fi
-    else
-        # 方案 4: 未检测到 Nginx，但若 80 端口被占用，尝试暂停占用程序
-        if is_port_80_listening; then
-            warn "检测到 80 端口已被监听，正在尝试暂停占用服务..."
-            stop_nginx_service
-            sleep 1
-        fi
-
+    elif ! is_port_80_listening; then
         info "使用 --standalone 独立模式申请证书..."
         if certbot certonly --standalone \
             -d "$DOMAIN" \
@@ -508,11 +508,11 @@ setup_certificates() {
             --non-interactive; then
             cert_success=true
         fi
+    else
+        warn "80 端口已被其他服务占用，保留现有服务，改用自签名证书。"
     fi
 
-    if [[ "$cert_success" != "true" && ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
-        start_nginx_service 2>/dev/null || true
-        pkill -9 -f "certbot" 2>/dev/null || true
+    if [[ "$cert_success" != "true" ]]; then
         warn "Let's Encrypt 证书验证未通过 (常见于 NAT VPS、容器网络受限、80 端口被拦截或未映射)。"
         info "自动切换为自签名 ECC 证书继续完成节点部署 (全客户端通用免维护)..."
         generate_self_signed_cert "$DOMAIN"
@@ -534,7 +534,7 @@ if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
     chmod 640 "${CONFIG_DIR}/server.crt" "${CONFIG_DIR}/server.key"
     if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] && systemctl is-active --quiet hysteria-server 2>/dev/null; then
         systemctl restart hysteria-server
-    elif command -v rc-service >/dev/null 2>&1 && rc-service hysteria-server status >/dev/null 2>&1; then
+    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1 && command -v openrc-run >/dev/null 2>&1 && [[ -f /run/openrc/softlevel ]] && rc-service hysteria-server status >/dev/null 2>&1; then
         rc-service hysteria-server restart
     elif [[ -x /usr/local/bin/hysteria-service ]]; then
         /usr/local/bin/hysteria-service restart
@@ -729,7 +729,29 @@ configure_service() {
     fi
 
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        mkdir -p "$OVERRIDE_DIR"
+        mkdir -p "$(dirname "$SERVICE_FILE")" "$OVERRIDE_DIR"
+        local service_user="root"
+        if id hysteria >/dev/null 2>&1; then
+            service_user="hysteria"
+        fi
+        cat <<EOF > "$SERVICE_FILE"
+[Unit]
+Description=Hysteria 2 Server Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hysteria server --config ${CONFIG_FILE}
+WorkingDirectory=${CONFIG_DIR}
+User=${service_user}
+Group=${service_user}
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
         cat <<EOF > "$OVERRIDE_FILE"
 [Service]
 Restart=on-failure
@@ -820,42 +842,70 @@ RUNNER_EOF
     fi
 }
 
+record_firewall_rule() {
+    # 仅记录本次成功新增的规则：后端|区域/链|运行时/永久|端口协议。
+    (umask 077; printf '%s|%s|%s|%s\n' "$@" >> "${CONFIG_DIR}/.firewall_rule")
+    chmod 600 "${CONFIG_DIR}/.firewall_rule"
+}
+
+add_ufw_rule() {
+    local rule="$1" rules
+    if ! rules=$(LC_ALL=C ufw status 2>/dev/null); then
+        warn "无法读取 UFW 规则，未自动修改 ${rule}。"
+        return 0
+    fi
+    if echo "$rules" | awk -v rule="$rule" '$1==rule && $2=="ALLOW" {found=1} END {exit !found}'; then
+        return 0
+    fi
+    if ufw allow "$rule" comment 'buds-hy2' >/dev/null 2>&1; then
+        record_firewall_rule ufw - runtime "$rule"
+    else
+        warn "UFW 放行 ${rule} 失败，请在服务器或服务商面板检查。"
+    fi
+}
+
 configure_firewall() {
     info "配置防火墙端口规则: ${UFW_PORT_RULE}..."
-    
-    # 记录防火墙规则，以便在卸载时精准撤销，避免破坏系统原有配置
-    echo "${UFW_PORT_RULE}" > "${CONFIG_DIR}/.firewall_rule" 2>/dev/null || true
-    chmod 600 "${CONFIG_DIR}/.firewall_rule" 2>/dev/null || true
-
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "${UFW_PORT_RULE}" comment 'buds-hy2' >/dev/null 2>&1 || true
-    fi
-
-    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-        local fw_port="${UFW_PORT_RULE%/*}"
-        local fw_proto="${UFW_PORT_RULE#*/}"
-        fw_port="${fw_port//:/-}"
-        firewall-cmd --permanent --add-port="${fw_port}/${fw_proto}" >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-    fi
-
-    if command -v iptables >/dev/null 2>&1; then
-        if iptables -L -n >/dev/null 2>&1; then
-            if [[ "$IS_PORT_HOPPING" == "true" ]]; then
-                iptables -I INPUT -p udp --dport "${HOP_START}:${HOP_END}" -m comment --comment "buds-hy2" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p udp --dport "${HOP_START}:${HOP_END}" -j ACCEPT >/dev/null 2>&1 || true
+    if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
+        add_ufw_rule "$UFW_PORT_RULE"
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        local zone rule mode result
+        zone=$(firewall-cmd --get-default-zone) || return 1
+        rule="${UFW_PORT_RULE//:/-}"
+        for mode in runtime permanent; do
+            local options=(--zone="$zone")
+            [[ "$mode" != permanent ]] || options+=(--permanent)
+            if firewall-cmd "${options[@]}" --query-port="$rule" >/dev/null 2>&1; then
+                continue
             else
-                iptables -I INPUT -p udp --dport "${SINGLE_PORT}" -m comment --comment "buds-hy2" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p udp --dport "${SINGLE_PORT}" -j ACCEPT >/dev/null 2>&1 || true
+                result=$?
             fi
+            if [[ "$result" == 1 ]] && firewall-cmd "${options[@]}" --add-port="$rule" >/dev/null 2>&1; then
+                record_firewall_rule firewalld "$zone" "$mode" "$rule"
+            else
+                warn "firewalld ${mode} 放行 ${rule} 失败，请检查防火墙权限。"
+            fi
+        done
+    elif command -v iptables >/dev/null 2>&1; then
+        local port="${UFW_PORT_RULE%/*}" result
+        if iptables -C INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1 ||
+           iptables -C INPUT -p udp --dport "$port" -m comment --comment buds-hy2 -j ACCEPT >/dev/null 2>&1; then
+            return 0
+        else
+            result=$?
+        fi
+        if [[ "$result" == 1 ]] && iptables -I INPUT -p udp --dport "$port" -m comment --comment buds-hy2 -j ACCEPT >/dev/null 2>&1; then
+            record_firewall_rule iptables INPUT runtime "$UFW_PORT_RULE"
             if [[ -x /etc/init.d/iptables ]]; then
-                /etc/init.d/iptables save >/dev/null 2>&1 || rc-service iptables save >/dev/null 2>&1 || true
+                /etc/init.d/iptables save >/dev/null 2>&1 || true
                 rc-update add iptables default >/dev/null 2>&1 || true
             fi
         else
-            warn "当前环境不支持直接修改 iptables，若外部存在端口限制请在宿主机放行 UDP: ${UFW_PORT_RULE}。"
+            warn "当前环境无法自动放行 UDP ${UFW_PORT_RULE}，请在服务器或服务商面板检查。"
         fi
+    else
+        info "未检测到可管理的防火墙，请确保服务商已放行 UDP ${UFW_PORT_RULE}。"
     fi
-
-    success "防火墙规则配置完成。"
 }
 
 start_service() {
@@ -906,14 +956,12 @@ start_service() {
 
 setup_cli() {
     local client_insecure="false"
-    if [[ -f "${CONFIG_DIR}/server.crt" ]]; then
-        local issuer subject
-        issuer=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -issuer 2>/dev/null | tr -d ' ' || echo "1")
-        subject=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -subject 2>/dev/null | tr -d ' ' || echo "2")
-        if [[ -n "$issuer" && "$issuer" == "$subject" ]]; then
-            client_insecure="true"
-        fi
+    if is_cert_self_signed; then
+        client_insecure="true"
     fi
+
+    printf '%s\n' "$CLIENT_PORT_STR" > "${CONFIG_DIR}/.public_port"
+    chmod 600 "${CONFIG_DIR}/.public_port"
 
     cat <<EOF > "$CLIENT_CONFIG_FILE"
 server: ${DOMAIN}:${CLIENT_PORT_STR}
@@ -983,6 +1031,10 @@ get_domain() {
     fi
     if [[ -z "$domain" ]]; then
         domain=$(grep -o 'live/[^/]*' /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh 2>/dev/null | cut -d'/' -f2 | head -1)
+    fi
+    if [[ -z "$domain" && -f "${CONFIG_DIR}/server.crt" ]]; then
+        domain=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -subject -nameopt RFC2253 2>/dev/null |
+            sed -n 's/^subject=.*CN=\([^,]*\).*$/\1/p' || true)
     fi
     [[ -z "$domain" ]] && domain="your.domain.com"
     echo "$domain"
@@ -1054,11 +1106,32 @@ get_listen() {
     echo "$listen"
 }
 
+get_public_ports() {
+    local ports=""
+    if [[ -f "$CLIENT_CONFIG_FILE" ]]; then
+        ports=$(sed -n 's/^[[:space:]]*server:[[:space:]]*[^:]*:\(.*\)/\1/p' "$CLIENT_CONFIG_FILE" | tr -d ' "\r' | head -1)
+    fi
+    if [[ -z "$ports" && -f "${CONFIG_DIR}/.public_port" ]]; then
+        ports=$(cat "${CONFIG_DIR}/.public_port")
+    fi
+    [[ -n "$ports" ]] || ports=$(get_listen)
+    echo "$ports"
+}
+
+has_systemd() {
+    command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
+}
+
+has_openrc() {
+    command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1 &&
+        command -v openrc-run >/dev/null 2>&1 && [[ -f /run/openrc/softlevel ]]
+}
+
 is_cert_self_signed() {
     if [[ -f "${CONFIG_DIR}/server.crt" ]]; then
         local issuer subject
-        issuer=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -issuer 2>/dev/null | tr -d ' ' || echo "1")
-        subject=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -subject 2>/dev/null | tr -d ' ' || echo "2")
+        issuer=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -issuer -nameopt RFC2253 2>/dev/null | sed 's/^issuer=[[:space:]]*//' || true)
+        subject=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -subject -nameopt RFC2253 2>/dev/null | sed 's/^subject=[[:space:]]*//' || true)
         if [[ -n "$issuer" && "$issuer" == "$subject" ]]; then
             return 0
         fi
@@ -1069,10 +1142,10 @@ is_cert_self_signed() {
 status() {
     echo -e "\n  ${C_BAR}  ${C_WHITE}服务运行状态与 UDP 端口监听 · SERVICE STATUS${C_RESET}\n"
     local is_running=false
-    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    if has_systemd; then
         systemctl status hysteria-server --no-pager || true
         systemctl is-active --quiet hysteria-server 2>/dev/null && is_running=true
-    elif command -v rc-service >/dev/null 2>&1; then
+    elif has_openrc; then
         rc-service hysteria-server status || true
         rc-service hysteria-server status 2>/dev/null | grep -q "started" && is_running=true
     elif [[ -x /usr/local/bin/hysteria-service ]]; then
@@ -1098,7 +1171,7 @@ status() {
         if is_cert_self_signed; then
             echo -e "     ${C_GRAY_MID}证书类型:${C_RESET} ${C_CYAN}极速自签名 ECC 证书 (全客户端通用免维护)${C_RESET}"
         else
-            echo -e "     ${C_GRAY_MID}证书类型:${C_RESET} ${C_GREEN}Let's Encrypt 官方权威证书${C_RESET}"
+            echo -e "     ${C_GRAY_MID}证书类型:${C_RESET} ${C_GREEN}CA 签发证书${C_RESET}"
         fi
         echo -e "     ${C_GRAY_MID}证书主题:${C_RESET} ${cert_subject}"
         echo -e "     ${C_GRAY_MID}有效期限:${C_RESET} ${cert_enddate}"
@@ -1137,9 +1210,9 @@ log() {
 }
 
 restart() {
-    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    if has_systemd; then
         systemctl restart hysteria-server
-    elif command -v rc-service >/dev/null 2>&1; then
+    elif has_openrc; then
         rc-service hysteria-server restart
     elif [[ -x /usr/local/bin/hysteria-service ]]; then
         /usr/local/bin/hysteria-service restart
@@ -1152,9 +1225,9 @@ restart() {
 }
 
 stop() {
-    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    if has_systemd; then
         systemctl stop hysteria-server
-    elif command -v rc-service >/dev/null 2>&1; then
+    elif has_openrc; then
         rc-service hysteria-server stop
     elif [[ -x /usr/local/bin/hysteria-service ]]; then
         /usr/local/bin/hysteria-service stop
@@ -1165,9 +1238,9 @@ stop() {
 }
 
 start() {
-    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    if has_systemd; then
         systemctl start hysteria-server
-    elif command -v rc-service >/dev/null 2>&1; then
+    elif has_openrc; then
         rc-service hysteria-server start
     elif [[ -x /usr/local/bin/hysteria-service ]]; then
         /usr/local/bin/hysteria-service start
@@ -1183,35 +1256,39 @@ link() {
         return 1
     fi
 
-    local domain password obfs_pwd listen base_port
+    local domain password obfs_pwd listen public_ports base_port
     domain=$(get_domain)
     password=$(get_password)
     obfs_pwd=$(get_obfs_pwd)
     listen=$(get_listen)
-    base_port=$(echo "$listen" | cut -d '-' -f 1)
+    public_ports=$(get_public_ports)
+    base_port=${public_ports%%-*}
 
     local obfs_param=""
     if [[ -n "$obfs_pwd" ]]; then
         obfs_param="&obfs=salamander&obfs-password=${obfs_pwd}"
     fi
 
-    local cert_badge="${C_GREEN}Let's Encrypt 官方权威证书${C_RESET}"
+    local insecure=0
+    local cert_badge="${C_GREEN}CA 签发证书${C_RESET}"
     if is_cert_self_signed; then
+        insecure=1
         cert_badge="${C_CYAN}极速自签名 ECC 证书 (全客户端通用免维护)${C_RESET}"
     fi
 
     echo -e "\n  ${C_BAR}  ${C_WHITE}节点连接凭据 · CONNECTION CREDENTIALS${C_RESET}"
     echo -e "     ${C_GRAY_MID}域名 (SNI)  :${C_RESET} ${C_WHITE}${domain}${C_RESET}"
     echo -e "     ${C_GRAY_MID}证书类型    :${C_RESET} ${cert_badge}"
-    echo -e "     ${C_GRAY_MID}监听端口    :${C_RESET} ${C_CYAN}${listen}${C_RESET} ${C_GRAY_MID}(基准端口: ${base_port})${C_RESET}"
+    echo -e "     ${C_GRAY_MID}监听端口    :${C_RESET} ${C_CYAN}${listen}${C_RESET}"
+    echo -e "     ${C_GRAY_MID}公网端口    :${C_RESET} ${C_CYAN}${public_ports}${C_RESET} ${C_GRAY_MID}(连接基准端口: ${base_port})${C_RESET}"
     echo -e "     ${C_GRAY_MID}认证密码    :${C_RESET} ${C_WHITE}${password}${C_RESET}"
     echo -e "     ${C_GRAY_MID}协议混淆    :${C_RESET} ${C_AMBER}salamander${C_RESET}"
     echo -e "     ${C_GRAY_MID}混淆密钥    :${C_RESET} ${C_WHITE}${obfs_pwd}${C_RESET}"
     echo -e "     ${C_GRAY_MID}伪装反代    :${C_RESET} ${C_GRAY_LIGHT}https://news.ycombinator.com/${C_RESET}\n"
 
-    if [[ "$listen" =~ "-" ]]; then
-        local link_hop="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=1&allowInsecure=1${obfs_param}&mport=${listen}#${domain}-Hy2"
-        local link_single="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=1&allowInsecure=1${obfs_param}#${domain}-Hy2-Single"
+    if [[ "$public_ports" == *-* ]]; then
+        local link_hop="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${obfs_param}&mport=${public_ports}#${domain}-Hy2"
+        local link_single="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${obfs_param}#${domain}-Hy2-Single"
 
         echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 1 · 专属主节点链接${C_RESET} ${C_GRAY_MID}(端口跳跃 · v2rayN 兼容 · 防限速)${C_RESET}"
         echo -e "     ${C_YELLOW}${link_hop}${C_RESET}\n"
@@ -1219,7 +1296,7 @@ link() {
         echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 2 · 基准单端口链接${C_RESET} ${C_GRAY_MID}(固定单端口 · 全客户端兼容备用)${C_RESET}"
         echo -e "     ${C_YELLOW}${link_single}${C_RESET}\n"
     else
-        local link_main="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=1&allowInsecure=1${obfs_param}#${domain}-Hy2"
+        local link_main="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${obfs_param}#${domain}-Hy2"
 
         echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}节点连接链接${C_RESET} ${C_GRAY_MID}(v2rayN / Clash Verge / 全客户端通用)${C_RESET}"
         echo -e "     ${C_YELLOW}${link_main}${C_RESET}\n"
@@ -1244,7 +1321,7 @@ client() {
         domain=$(get_domain)
         password=$(get_password)
         obfs_pwd=$(get_obfs_pwd)
-        listen=$(get_listen)
+        listen=$(get_public_ports)
 
         cat <<CLIENT_YAML_EOF > "$CLIENT_CONFIG_FILE"
 server: ${domain}:${listen}
@@ -1282,56 +1359,110 @@ renew_test() {
     fi
 }
 
+remove_ufw_rule() {
+    local rule="$1" rules numbers number
+    rules=$(LC_ALL=C ufw status numbered 2>/dev/null) || return 1
+    if [[ "$rules" == *"Status: active"* ]]; then
+        # 按编号倒序删除带本项目注释的条目，分别保护 IPv4/IPv6 的其他规则。
+        numbers=$(echo "$rules" | awk -v rule="$rule" '
+          /# buds-hy2[[:space:]]*$/ {
+            line=$0; sub(/^\[[[:space:]]*[0-9]+\][[:space:]]*/, "", line)
+            split(line, fields, /[[:space:]]+/)
+            if (fields[1]==rule) {sub(/^\[[[:space:]]*/, ""); sub(/\].*$/, ""); print}
+          }' | sort -rn)
+        for number in $numbers; do
+            ufw --force delete "$number" >/dev/null 2>&1 || return 1
+        done
+    else
+        # UFW 停用时，show added 仍可读取持久规则；仅接受本项目原样新增的条目。
+        rules=$(LC_ALL=C ufw show added 2>/dev/null) || return 1
+        local owned="ufw allow ${rule} comment 'buds-hy2'"
+        if echo "$rules" | grep -Fxq "$owned"; then
+            if echo "$rules" | awk -v prefix="ufw allow ${rule}" -v owned="$owned" '
+                index($0,prefix)==1 && $0!=owned {found=1} END {exit !found}'; then
+                return 1
+            fi
+            ufw --force delete allow "$rule" comment buds-hy2 >/dev/null 2>&1 || return 1
+        fi
+    fi
+}
+
 cleanup_firewall() {
     local rule_file="${CONFIG_DIR}/.firewall_rule"
-    local rule=""
-    if [[ -f "$rule_file" ]]; then
-        rule=$(tr -d '[:space:]' < "$rule_file" 2>/dev/null)
-    fi
-    if [[ -z "$rule" ]]; then
-        local listen
-        listen=$(get_listen)
-        if [[ "$listen" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            rule="${BASH_REMATCH[1]}:${BASH_REMATCH[2]}/udp"
-        elif [[ "$listen" =~ ^[0-9]+$ ]]; then
-            rule="${listen}/udp"
+    [[ -f "$rule_file" ]] || return 0
+    local remaining backend zone mode rule result failed=false changed_iptables=false
+    remaining=$(mktemp "${rule_file}.XXXXXX") || return 1
+    while IFS='|' read -r backend zone mode rule; do
+        result=0
+        case "$backend" in
+            ufw)
+                remove_ufw_rule "$rule" || result=1
+                ;;
+            firewalld)
+                local options=(--zone="$zone")
+                [[ "$mode" != permanent ]] || options+=(--permanent)
+                if firewall-cmd "${options[@]}" --query-port="$rule" >/dev/null 2>&1; then
+                    firewall-cmd "${options[@]}" --remove-port="$rule" >/dev/null 2>&1 || result=1
+                else
+                    [[ "$?" == 1 ]] || result=1
+                fi
+                ;;
+            iptables)
+                changed_iptables=true
+                if iptables -C "$zone" -p udp --dport "${rule%/*}" -m comment --comment buds-hy2 -j ACCEPT >/dev/null 2>&1; then
+                    iptables -D "$zone" -p udp --dport "${rule%/*}" -m comment --comment buds-hy2 -j ACCEPT >/dev/null 2>&1 || result=1
+                else
+                    [[ "$?" == 1 ]] || result=1
+                fi
+                ;;
+            *)
+                # 旧版本只记端口，无法证明未带注释的规则归属，保留这些规则。
+                if [[ "$backend" =~ ^[0-9]+(:[0-9]+)?/udp$ ]]; then
+                    if command -v ufw >/dev/null 2>&1; then
+                        remove_ufw_rule "$backend" || result=1
+                    fi
+                    if command -v iptables >/dev/null 2>&1 &&
+                       iptables -C INPUT -p udp --dport "${backend%/*}" -m comment --comment buds-hy2 -j ACCEPT >/dev/null 2>&1; then
+                        iptables -D INPUT -p udp --dport "${backend%/*}" -m comment --comment buds-hy2 -j ACCEPT >/dev/null 2>&1 || result=1
+                        changed_iptables=true
+                    fi
+                    echo "  旧版本防火墙记录缺少归属信息，仅清理带 buds-hy2 标记的规则。"
+                else
+                    result=1
+                fi
+                ;;
+        esac
+        if [[ "$result" != 0 ]]; then
+            printf '%s|%s|%s|%s\n' "$backend" "$zone" "$mode" "$rule" >> "$remaining"
+            failed=true
+        fi
+    done < "$rule_file"
+    if [[ "$changed_iptables" == true && -x /etc/init.d/iptables ]]; then
+        if ! /etc/init.d/iptables save >/dev/null 2>&1; then
+            rm -f "$remaining"
+            echo "  保存 iptables 清理结果失败，已保留规则记录，请重试卸载。"
+            return 1
         fi
     fi
-
-    if [[ -n "$rule" ]]; then
-        # 1. 精准清理 UFW 规则
-        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-            ufw delete allow "$rule" comment 'buds-hy2' >/dev/null 2>&1 || ufw delete allow "$rule" >/dev/null 2>&1 || true
-        fi
-
-        # 2. 精准清理 firewalld 规则
-        if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-            local fw_port="${rule%/*}"
-            local fw_proto="${rule#*/}"
-            fw_port="${fw_port//:/-}"
-            firewall-cmd --permanent --remove-port="${fw_port}/${fw_proto}" >/dev/null 2>&1 || true
-            firewall-cmd --reload >/dev/null 2>&1 || true
-        fi
-
-        # 3. 精准清理 iptables 规则
-        if command -v iptables >/dev/null 2>&1; then
-            local port_spec="${rule%/*}"
-            iptables -D INPUT -p udp --dport "$port_spec" -m comment --comment "buds-hy2" -j ACCEPT >/dev/null 2>&1 || iptables -D INPUT -p udp --dport "$port_spec" -j ACCEPT >/dev/null 2>&1 || true
-        fi
+    mv -f "$remaining" "$rule_file"
+    if [[ "$failed" == true ]]; then
+        echo "  部分防火墙规则未能安全清理，已保留配置和规则记录，请检查权限后重试卸载。"
+        return 1
     fi
+    rm -f "$rule_file"
 }
 
 uninstall() {
     echo -e "\n  ${C_RED}⚠ 警告: 即将卸载 Hysteria 2 服务！${C_RESET}"
     read -rp "  确认彻底卸载吗？(y/N): " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        if has_systemd; then
             systemctl disable --now hysteria-server 2>/dev/null || true
             rm -rf /etc/systemd/system/hysteria-server.service.d
             rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service
             systemctl daemon-reload 2>/dev/null || true
         fi
-        if command -v rc-service >/dev/null 2>&1; then
+        if has_openrc; then
             rc-service hysteria-server stop 2>/dev/null || true
             rc-update del hysteria-server default 2>/dev/null || true
             rm -f /etc/init.d/hysteria-server
@@ -1354,11 +1485,11 @@ show_menu() {
     while true; do
         local status_badge domain listen
         local is_running=false
-        if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        if has_systemd; then
             if systemctl is-active --quiet hysteria-server 2>/dev/null; then
                 is_running=true
             fi
-        elif command -v rc-service >/dev/null 2>&1; then
+        elif has_openrc; then
             if rc-service hysteria-server status 2>/dev/null | grep -q "started"; then
                 is_running=true
             fi
@@ -1456,6 +1587,14 @@ display_summary() {
 
 main() {
     check_root
+    if [[ -f "$CONFIG_FILE" ]]; then
+        if [[ -x "$BUDS_CLI" ]]; then
+            info "检测到已有节点，打开管理菜单。"
+            exec "$BUDS_CLI" hy2
+        fi
+        error "已有 Hysteria 配置，但管理命令缺失；为避免覆盖现有节点，停止安装。"
+        exit 1
+    fi
     detect_virtualization
     detect_init_system
     install_dependencies
