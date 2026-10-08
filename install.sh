@@ -73,10 +73,10 @@ detect_virtualization() {
     fi
 
     # 获取公网出口 IPv4
-    PUBLIC_IP=$(curl -s4 --connect-timeout 2 https://api.ipify.org 2>/dev/null || \
-                curl -s4 --connect-timeout 2 https://ip.sb 2>/dev/null || \
-                curl -s4 --connect-timeout 2 https://icanhazip.com 2>/dev/null || \
-                curl -s4 --connect-timeout 2 https://ifconfig.me 2>/dev/null || echo "")
+    PUBLIC_IP=$(curl -fsS4 --connect-timeout 2 --max-time 5 https://api.ipify.org 2>/dev/null || \
+                curl -fsS4 --connect-timeout 2 --max-time 5 https://ip.sb 2>/dev/null || \
+                curl -fsS4 --connect-timeout 2 --max-time 5 https://icanhazip.com 2>/dev/null || \
+                curl -fsS4 --connect-timeout 2 --max-time 5 https://ifconfig.me 2>/dev/null || echo "")
 
     # 检测是否为 NAT 环境 (通过对比本机网络接口 IP 与公网出口 IP)
     if [[ -n "$PUBLIC_IP" ]]; then
@@ -147,7 +147,7 @@ generate_random_port() {
             echo "$port"
             return 0
         fi
-        (( attempts++ ))
+        attempts=$((attempts + 1))
     done
     echo "38443"
 }
@@ -157,89 +157,89 @@ install_dependencies() {
     if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq || true
-        apt-get install -y -qq curl wget openssl ufw certbot python3-certbot-nginx ca-certificates iptables iproute2 dnsutils libcap2-bin >/dev/null 2>&1 || \
-        apt-get install -y -qq curl wget openssl ca-certificates iptables iproute2 dnsutils >/dev/null 2>&1 || true
+        apt-get install -y -qq curl openssl ca-certificates procps >/dev/null 2>&1 || true
+        apt-get install -y -qq wget ufw iptables iproute2 dnsutils libcap2-bin >/dev/null 2>&1 || true
+        apt-get install -y -qq certbot python3-certbot-nginx >/dev/null 2>&1 || true
     elif command -v apk >/dev/null 2>&1; then
-        # Alpine Linux 适配
-        if [[ -f /etc/apk/repositories ]]; then
-            sed -i 's/^#\(.*\/community\)/\1/' /etc/apk/repositories
-        fi
         apk update >/dev/null 2>&1 || true
-        apk add --no-cache curl wget openssl ca-certificates iptables iproute2 bind-tools certbot libcap shadow tzdata >/dev/null 2>&1 || \
-        apk add --no-cache curl wget openssl ca-certificates >/dev/null 2>&1 || true
-        if ! apk add --no-cache certbot-nginx >/dev/null 2>&1; then
-            apk add --no-cache py3-pip >/dev/null 2>&1 || true
-            pip install certbot-nginx --break-system-packages >/dev/null 2>&1 || true
-        fi
-        if command -v rc-update >/dev/null 2>&1; then
-            rc-update add crond default >/dev/null 2>&1 || true
-            rc-service crond start >/dev/null 2>&1 || true
-        fi
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y -q epel-release || true
-        dnf install -y -q curl wget openssl certbot python3-certbot-nginx ca-certificates iptables iproute bind-utils libcap >/dev/null 2>&1 || true
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y -q epel-release || true
-        yum install -y -q curl wget openssl certbot python3-certbot-nginx ca-certificates iptables iproute bind-utils libcap >/dev/null 2>&1 || true
+        apk add --no-cache curl openssl ca-certificates procps >/dev/null 2>&1 || true
+        apk add --no-cache wget iptables iproute2 bind-tools libcap shadow tzdata >/dev/null 2>&1 || true
+        apk add --no-cache certbot >/dev/null 2>&1 || true
+        apk add --no-cache certbot-nginx >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+        local manager
+        manager=$(command -v dnf || command -v yum)
+        "$manager" install -y -q curl openssl ca-certificates procps-ng >/dev/null 2>&1 || true
+        "$manager" install -y -q wget iptables iproute bind-utils libcap >/dev/null 2>&1 || true
+        "$manager" install -y -q epel-release >/dev/null 2>&1 || true
+        "$manager" install -y -q certbot python3-certbot-nginx >/dev/null 2>&1 || true
     elif command -v pacman >/dev/null 2>&1; then
-        pacman -Sy --noconfirm curl wget openssl certbot certbot-nginx ca-certificates iptables iproute2 bind-tools libcap >/dev/null 2>&1 || true
+        # 不刷新索引后仅升级部分软件，也不自动升级整机。
+        pacman -S --needed --noconfirm curl openssl ca-certificates procps-ng >/dev/null 2>&1 || true
+        pacman -S --needed --noconfirm wget iptables iproute2 bind libcap >/dev/null 2>&1 || true
+        pacman -S --needed --noconfirm certbot certbot-nginx >/dev/null 2>&1 || true
     else
-        warn "未识别到主流包管理器，尝试继续使用现有系统环境。"
+        warn "未识别到主流包管理器，检查现有系统工具。"
     fi
 
-    # 兜底检测: 确保 certbot 可用
-    HAVE_CERTBOT=true
-    if ! command -v certbot >/dev/null 2>&1; then
-        if command -v pip3 >/dev/null 2>&1 || command -v pip >/dev/null 2>&1; then
-            info "尝试通过 Python pip 安装 Certbot..."
-            pip install certbot certbot-nginx --break-system-packages >/dev/null 2>&1 || pip3 install certbot certbot-nginx >/dev/null 2>&1 || true
-        fi
+    local tool missing=()
+    for tool in curl openssl pgrep pkill nohup mktemp; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    if (( ${#missing[@]} )); then
+        error "缺少必需工具：${missing[*]}。请检查软件源和网络后重新安装。"
+        return 1
     fi
-
-    if ! command -v certbot >/dev/null 2>&1; then
-        HAVE_CERTBOT=false
-        warn "系统未安装 certbot 工具 (若申请 Let's Encrypt 官方证书需此工具；若使用自签名证书则不受影响)。"
+    HAVE_CERTBOT=false
+    if command -v certbot >/dev/null 2>&1; then
+        HAVE_CERTBOT=true
+    else
+        warn "未安装 Certbot，仍可正常使用自签名证书。"
     fi
-
-    success "基础依赖环境准备完毕。"
+    success "必需工具检查通过。"
 }
 
 validate_domain() {
     info "正在校验域名解析..."
-    local server_ip="${PUBLIC_IP}"
+    local server_ip="${PUBLIC_IP}" resolved_ip="" answer=""
     if [[ -z "$server_ip" ]]; then
-        server_ip=$(curl -s4 --connect-timeout 3 https://api.ipify.org 2>/dev/null || \
-                    curl -s4 --connect-timeout 3 https://ip.sb 2>/dev/null || \
-                    curl -s4 --connect-timeout 3 https://icanhazip.com 2>/dev/null || \
-                    curl -s4 --connect-timeout 3 https://ifconfig.me 2>/dev/null || echo "")
+        server_ip=$(curl -fsS4 --connect-timeout 3 --max-time 6 https://api.ipify.org 2>/dev/null ||
+                    curl -fsS4 --connect-timeout 3 --max-time 6 https://ip.sb 2>/dev/null || true)
     fi
-    
-    local resolved_ip=""
     if command -v getent >/dev/null 2>&1; then
-        resolved_ip=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | head -n1 | awk '{print $1}')
-    elif command -v nslookup >/dev/null 2>&1; then
-        resolved_ip=$(nslookup "$DOMAIN" 2>/dev/null | awk '/^Address: / { print $2 }' | tail -n1)
-    elif command -v dig >/dev/null 2>&1; then
-        resolved_ip=$(dig +short "$DOMAIN" 2>/dev/null | head -n1)
-    elif command -v host >/dev/null 2>&1; then
-        resolved_ip=$(host "$DOMAIN" 2>/dev/null | awk '/has address/ { print $4 }' | head -n1)
+        answer=$(getent ahostsv4 "$DOMAIN" 2>/dev/null || true)
+        resolved_ip=$(printf '%s\n' "$answer" | awk 'NR==1 {print $1}')
     fi
-
-    if [[ -n "$server_ip" && -n "$resolved_ip" ]]; then
-        if [[ "$server_ip" != "$resolved_ip" ]]; then
-            warn "域名解析 IP (${resolved_ip}) 与本机公网 IP (${server_ip}) 不一致！"
-            warn "提示: 若申请 Let's Encrypt 证书可能会失败；若使用自签名证书则不受影响。"
-            read -rp "是否仍然继续？(y/N) [默认 y]: " force_continue
-            force_continue="${force_continue:-y}"
-            if [[ ! "$force_continue" =~ ^[Yy]$ ]]; then
-                error "已取消安装，请待 DNS 解析生效后再运行。"
-                exit 1
-            fi
-        else
-            success "域名解析校验正常 (${DOMAIN} -> ${server_ip})。"
+    if [[ -z "$resolved_ip" ]] && command -v dig >/dev/null 2>&1; then
+        answer=$(dig +time=2 +tries=1 +short A "$DOMAIN" 2>/dev/null || true)
+        resolved_ip=$(printf '%s\n' "$answer" | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print; exit}')
+    fi
+    if [[ -z "$resolved_ip" ]] && command -v host >/dev/null 2>&1; then
+        answer=$(host -W 2 -t A "$DOMAIN" 2>/dev/null || true)
+        resolved_ip=$(printf '%s\n' "$answer" | awk '/has address/ {print $4; exit}')
+    fi
+    if [[ -z "$resolved_ip" ]] && command -v nslookup >/dev/null 2>&1; then
+        answer=$(nslookup "$DOMAIN" 2>/dev/null || true)
+        # 排除输出前半部分的 DNS 服务器地址。
+        resolved_ip=$(printf '%s\n' "$answer" | awk '
+            /^Name:[[:space:]]/ {found=1}
+            found && /^Address([[:space:]][0-9]+)?:[[:space:]]/ {
+                sub(/^Address([[:space:]][0-9]+)?:[[:space:]]*/, "")
+                if ($1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {print $1; exit}
+            }')
+    fi
+    if [[ -z "$resolved_ip" ]]; then
+        warn "暂未查询到 ${DOMAIN} 的 IPv4 解析。继续安装，连接前请确认域名解析正确。"
+    elif [[ -n "$server_ip" && "$server_ip" != "$resolved_ip" ]]; then
+        warn "域名解析 IP (${resolved_ip}) 与公网出口 IP (${server_ip}) 不一致。"
+        warn "连接前请确认域名指向正确的公网入口；自签名证书不能代替正确的 DNS 解析。"
+        read -rp "是否仍然继续？(Y/n) [默认 y]: " force_continue
+        if [[ ! "${force_continue:-y}" =~ ^[Yy]$ ]]; then
+            error "已取消安装，请待 DNS 解析生效后再运行。"
+            return 1
         fi
     else
-        info "已配置域名: ${C_CYAN}${DOMAIN}${C_RESET}。"
+        success "域名解析: ${DOMAIN} -> ${resolved_ip}。"
     fi
 }
 
@@ -398,6 +398,14 @@ is_cert_self_signed() {
     return 1
 }
 
+get_cert_pin() {
+    local pin
+    pin=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -fingerprint -sha256 2>/dev/null |
+        sed 's/^[^=]*=//' | tr -d ':\r\n' | tr 'A-F' 'a-f') || return 1
+    [[ "$pin" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$pin"
+}
+
 generate_self_signed_cert() {
     local domain="$1"
     info "正在为域名 ${C_CYAN}${domain}${C_RESET} 生成高性能 ECC 自签名证书..."
@@ -420,7 +428,118 @@ generate_self_signed_cert() {
         chown root:hysteria "${CONFIG_DIR}/server.crt" "${CONFIG_DIR}/server.key" 2>/dev/null || true
     fi
     chmod 640 "${CONFIG_DIR}/server.crt" "${CONFIG_DIR}/server.key"
-    success "自签名证书生成完毕 (ECC-P256 算法，有效期 100 年，全客户端通用免维护)。"
+    success "自签名证书生成完毕 (ECC-P256 算法，有效期 100 年，客户端使用 SHA-256 指纹验证)。"
+}
+
+read_root_crontab() {
+    local contents
+    if contents=$(LC_ALL=C crontab -l 2>&1); then
+        printf '%s\n' "$contents"
+    elif [[ "$contents" == *"no crontab"* || "$contents" == *"No such file"* ]]; then
+        return 0
+    else
+        echo "无法读取 root 定时任务，未覆盖已有任务。" >&2
+        return 1
+    fi
+}
+
+ensure_cron_running() {
+    local daemon
+    if has_systemd; then
+        for daemon in cron crond; do
+            if systemctl cat "$daemon.service" >/dev/null 2>&1 &&
+               systemctl enable --now "$daemon.service" >/dev/null 2>&1; then
+                return 0
+            fi
+        done
+    elif has_openrc; then
+        for daemon in crond cron; do
+            if [[ -f "/etc/init.d/$daemon" ]] &&
+               rc-update add "$daemon" default >/dev/null 2>&1 &&
+               rc-service "$daemon" start >/dev/null 2>&1; then
+                return 0
+            fi
+        done
+    else
+        if pgrep -x 'cron|crond' >/dev/null 2>&1; then return 0; fi
+        if command -v crond >/dev/null 2>&1; then
+            crond && pgrep -x crond >/dev/null 2>&1 && return 0
+        elif command -v cron >/dev/null 2>&1; then
+            cron && pgrep -x cron >/dev/null 2>&1 && return 0
+        fi
+    fi
+    return 1
+}
+
+configure_renewal() {
+    local timer cron_contents="" certbot_bin
+    certbot_bin=$(command -v certbot) || return 1
+    if has_systemd; then
+        for timer in certbot.timer certbot-renew.timer snap.certbot.renew.timer; do
+            if systemctl cat "$timer" >/dev/null 2>&1 &&
+               systemctl enable --now "$timer" >/dev/null 2>&1; then
+                success "已启用现有证书续签定时器：$timer。"
+                return 0
+            fi
+        done
+    fi
+    if command -v crontab >/dev/null 2>&1; then
+        cron_contents=$(read_root_crontab) || return 1
+    fi
+    if printf '%s\n' "$cron_contents" | grep -Eq '^[^#]*certbot[[:space:]]+renew' ||
+       grep -ERq '^[^#]*certbot[[:space:]]+renew' /etc/crontab /etc/cron.d /etc/cron.daily /etc/periodic 2>/dev/null; then
+        if ! ensure_cron_running; then
+            error "已有续签任务，但无法启动 cron 服务，请检查当前容器或系统的服务管理。"
+            return 1
+        fi
+        success "已使用现有 cron 续签任务。"
+        return 0
+    fi
+    if has_systemd; then
+        cat > /etc/systemd/system/buds-hy2-renew.service <<EOF
+[Unit]
+Description=Buds HY2 certificate renewal
+[Service]
+Type=oneshot
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=$certbot_bin renew --quiet --run-deploy-hooks
+EOF
+        cat > /etc/systemd/system/buds-hy2-renew.timer <<'TIMER_EOF'
+[Unit]
+Description=Buds HY2 certificate renewal timer
+[Timer]
+OnCalendar=*-*-* 03,15:00:00
+RandomizedDelaySec=1h
+Persistent=true
+[Install]
+WantedBy=timers.target
+TIMER_EOF
+        systemctl daemon-reload
+        systemctl enable --now buds-hy2-renew.timer
+    else
+        if ! command -v crontab >/dev/null 2>&1; then
+            if command -v apt-get >/dev/null 2>&1; then
+                apt-get install -y -qq cron >/dev/null 2>&1 || true
+            elif command -v apk >/dev/null 2>&1; then
+                apk add --no-cache dcron >/dev/null 2>&1 || true
+            elif command -v dnf >/dev/null 2>&1; then
+                dnf install -y -q cronie >/dev/null 2>&1 || true
+            elif command -v yum >/dev/null 2>&1; then
+                yum install -y -q cronie >/dev/null 2>&1 || true
+            elif command -v pacman >/dev/null 2>&1; then
+                pacman -S --needed --noconfirm cronie >/dev/null 2>&1 || true
+            fi
+        fi
+        if ! command -v crontab >/dev/null 2>&1 || ! ensure_cron_running; then
+            error "无法配置证书定期续签，请检查 cron 服务；可重新选择自签名模式。"
+            return 1
+        fi
+        cron_contents=$(read_root_crontab) || return 1
+        { printf '%s\n' "$cron_contents"
+          printf '0 3,15 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin %s renew --quiet --run-deploy-hooks # buds-hy2-renew\n' "$certbot_bin"
+        } | crontab -
+    fi
+    success "证书自动续签任务已启用。"
 }
 
 setup_certificates() {
@@ -514,7 +633,7 @@ setup_certificates() {
 
     if [[ "$cert_success" != "true" ]]; then
         warn "Let's Encrypt 证书验证未通过 (常见于 NAT VPS、容器网络受限、80 端口被拦截或未映射)。"
-        info "自动切换为自签名 ECC 证书继续完成节点部署 (全客户端通用免维护)..."
+        info "自动切换为自签名 ECC 证书继续完成节点部署 (自动导出证书指纹)..."
         generate_self_signed_cert "$DOMAIN"
         return 0
     fi
@@ -538,8 +657,8 @@ if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
         rc-service hysteria-server restart
     elif [[ -x /usr/local/bin/hysteria-service ]]; then
         /usr/local/bin/hysteria-service restart
-    elif pgrep -f "hysteria (server|-c)" >/dev/null 2>&1; then
-        pkill -f "hysteria server" 2>/dev/null || true
+    elif pgrep -fx "/usr/local/bin/hysteria server (-c|--config) /etc/hysteria/config[.]yaml" >/dev/null 2>&1; then
+        pkill -fx "/usr/local/bin/hysteria server (-c|--config) /etc/hysteria/config[.]yaml" 2>/dev/null || true
         nohup /usr/local/bin/hysteria server -c "${CONFIG_FILE}" >/var/log/hysteria.log 2>&1 &
     fi
 fi
@@ -547,88 +666,86 @@ EOF
     chmod +x "$HOOK_FILE"
     "$HOOK_FILE"
 
-    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
-        mkdir -p /etc/periodic/daily
-        cat <<'CRON_EOF' > /etc/periodic/daily/certbot-renew
-#!/bin/sh
-certbot renew --quiet --run-deploy-hooks
-CRON_EOF
-        chmod +x /etc/periodic/daily/certbot-renew
-    fi
+    configure_renewal
 
     success "SSL 证书部署完成，已挂载自动续期同步钩子。"
 }
 
-install_official_core() {
-    info "安装官方 Hysteria 2 主程序..."
-    local installed=false
-
-    if [[ "$INIT_SYSTEM" == "systemd" && ! -f /etc/alpine-release && "$IS_CONTAINER" != "true" ]]; then
-        if bash <(curl -fsSL https://get.hy2.sh/) >/dev/null 2>&1; then
-            if [[ -x /usr/local/bin/hysteria ]] && /usr/local/bin/hysteria version >/dev/null 2>&1; then
-                installed=true
-            fi
-        fi
-    fi
-
-    if [[ "$installed" != "true" || ! -x /usr/local/bin/hysteria ]]; then
-        info "正在直接拉取官方静态编译内核 (兼容各发行版 glibc 与 musl)..."
-        local arch
-        arch=$(uname -m)
-        local binary_name=""
-        case "$arch" in
-            x86_64|amd64) binary_name="hysteria-linux-amd64" ;;
-            aarch64|arm64) binary_name="hysteria-linux-arm64" ;;
-            armv7*|armhf) binary_name="hysteria-linux-arm" ;;
-            i386|i686) binary_name="hysteria-linux-386" ;;
-            s390x) binary_name="hysteria-linux-s390x" ;;
-            mipsle) binary_name="hysteria-linux-mipsle" ;;
-            *) binary_name="hysteria-linux-amd64" ;;
-        esac
-
-        mkdir -p /usr/local/bin
-        local download_urls=(
-            "https://github.com/apernet/hysteria/releases/latest/download/${binary_name}"
-            "https://ghproxy.net/https://github.com/apernet/hysteria/releases/latest/download/${binary_name}"
-            "https://download.hysteria.network/app/latest/${binary_name}"
-        )
-        local temp_bin="/tmp/hysteria_bin_${RANDOM}"
-        for url in "${download_urls[@]}"; do
-            info "尝试从 ${url} 下载内核..."
-            rm -f "$temp_bin"
-            if curl -fsSL --connect-timeout 8 --max-time 120 --retry 2 "$url" -o "$temp_bin"; then
-                # 校验是否为合法 ELF 二进制文件 (ELF 文件头 4 字节为 \x7fELF)
-                local magic
-                magic=$(head -c 4 "$temp_bin" 2>/dev/null || true)
-                if [[ "$magic" == $'\x7fELF' ]]; then
-                    mv -f "$temp_bin" /usr/local/bin/hysteria
-                    chmod 755 /usr/local/bin/hysteria
-                    installed=true
-                    break
-                else
-                    warn "从 ${url} 获取的文件非有效 ELF 二进制 (可能为拦截页面或网络限制)，尝试下一个镜像源..."
-                    rm -f "$temp_bin"
-                fi
-            fi
-        done
-        rm -f "$temp_bin"
-    fi
-
-    if [[ ! -x /usr/local/bin/hysteria ]]; then
-        error "Hysteria 2 主程序下载失败，请检查服务器网络连接。"
-        exit 1
-    fi
-
-    if ! /usr/local/bin/hysteria version >/dev/null 2>&1; then
-        error "Hysteria 2 二进制文件在当前系统架构下无法执行，请确认系统环境。"
-        exit 1
-    fi
-
-    if command -v setcap >/dev/null 2>&1; then
-        setcap 'cap_net_bind_service,cap_net_admin,cap_net_raw=+ep' /usr/local/bin/hysteria >/dev/null 2>&1 || true
-    fi
-    success "Hysteria 2 内核安装完成 ($(/usr/local/bin/hysteria version 2>/dev/null | head -1 || echo '已就绪'))。"
+validate_core_binary() {
+    local magic
+    magic=$(head -c 4 "$1" 2>/dev/null || true)
+    [[ "$magic" == $'\x7fELF' ]] && "$1" version >/dev/null 2>&1
 }
+
+install_official_core() (
+    # 子 Shell 将临时目录的退出清理限制在本次下载，不改变安装器的其他 trap。
+    info "下载并校验官方 Hysteria 2 内核..."
+    local arch binary_name headers release_url version base_url download_dir expected actual
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) binary_name="hysteria-linux-amd64" ;;
+        aarch64|arm64) binary_name="hysteria-linux-arm64" ;;
+        armv7*|armhf|armv6*) binary_name="hysteria-linux-arm" ;;
+        armv5*) binary_name="hysteria-linux-armv5" ;;
+        i386|i686) binary_name="hysteria-linux-386" ;;
+        s390x) binary_name="hysteria-linux-s390x" ;;
+        mipsle) binary_name="hysteria-linux-mipsle" ;;
+        riscv64) binary_name="hysteria-linux-riscv64" ;;
+        loongarch64) binary_name="hysteria-linux-loong64" ;;
+        *) error "不支持的 CPU 架构：$arch，停止安装。"; return 1 ;;
+    esac
+    mkdir -p /usr/local/bin
+    local target_parent
+    target_parent=$(cd /usr/local/bin && pwd -P)
+    download_dir=$(mktemp -d "$target_parent/.buds-hy2-download.XXXXXXXX") || return 1
+    [[ "$download_dir" == "$target_parent"/.buds-hy2-download.* && -d "$download_dir" ]] || return 1
+    trap 'rm -rf -- "$download_dir"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    # 只解析官方 HTTPS 重定向的版本；摘要和内核随后使用同一个固定版本。
+    if ! headers=$(curl -fsSI --connect-timeout 8 --max-time 20 --retry 1 \
+        --proto '=https' https://github.com/HyNetworks/hysteria/releases/latest); then
+        error "无法获取官方内核版本，请检查服务器网络。"
+        return 1
+    fi
+    release_url=$(printf '%s\n' "$headers" | tr -d '\r' | awk 'tolower($1)=="location:" {print $2; exit}')
+    version="${release_url#https://github.com/HyNetworks/hysteria/releases/tag/}"
+    if [[ ! "$version" =~ ^app/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        error "官方版本信息无效，未执行任何下载文件。"
+        return 1
+    fi
+    base_url="https://github.com/HyNetworks/hysteria/releases/download/${version}"
+    if ! curl -fsSL --connect-timeout 8 --max-time 30 --retry 1 \
+        --proto '=https' --proto-redir '=https' "$base_url/hashes.txt" -o "$download_dir/hashes.txt"; then
+        error "无法获取官方 SHA-256 摘要，停止安装。"
+        return 1
+    fi
+    expected=$(awk -v name="$binary_name" '
+        {file=$2; sub(/^\*/, "", file); sub(/^.*\//, "", file)}
+        file==name {print tolower($1); exit}' "$download_dir/hashes.txt")
+    if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+        error "官方摘要中未找到当前架构的内核，停止安装。"
+        return 1
+    fi
+    if ! curl -fSL --connect-timeout 8 --max-time 120 --retry 2 \
+        --proto '=https' --proto-redir '=https' "$base_url/$binary_name" -o "$download_dir/hysteria"; then
+        error "官方内核下载失败，请检查服务器网络。"
+        return 1
+    fi
+    actual=$(openssl dgst -sha256 "$download_dir/hysteria" | awk '{print tolower($NF)}')
+    if [[ "$actual" != "$expected" ]]; then
+        error "内核 SHA-256 校验失败，已拒绝执行和安装。"
+        return 1
+    fi
+    chmod 755 "$download_dir/hysteria"
+    if ! validate_core_binary "$download_dir/hysteria"; then
+        error "已校验的内核无法在当前系统运行，原有二进制保持不变。"
+        return 1
+    fi
+    mv -f "$download_dir/hysteria" /usr/local/bin/hysteria
+    success "官方内核 ${version#app/} 安装完成，SHA-256 校验通过。"
+)
 
 generate_server_config() {
     info "写入服务端安全加固与极致性能配置..."
@@ -798,40 +915,51 @@ INIT_EOF
         # 容器 / 极简环境轻量服务管理包装器
         cat <<'RUNNER_EOF' > /usr/local/bin/hysteria-service
 #!/usr/bin/env bash
-case "$1" in
-    start)
-        if pgrep -f "hysteria (server|-c)" >/dev/null 2>&1; then
-            echo "hysteria-server 正在运行。"
-        else
-            nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml >/var/log/hysteria.log 2>&1 &
+pattern='/usr/local/bin/hysteria server -c /etc/hysteria/config[.]yaml'
+running() { pgrep -fx "$pattern" >/dev/null 2>&1; }
+start_server() {
+    if running; then
+        echo "hysteria-server 正在运行。"
+        return 0
+    fi
+    nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml >/var/log/hysteria.log 2>&1 &
+    sleep 1
+    if running; then
+        echo "hysteria-server 启动成功。"
+    else
+        echo "hysteria-server 启动失败，请检查配置及日志。" >&2
+        tail -n 20 /var/log/hysteria.log >&2
+        return 1
+    fi
+}
+stop_server() {
+    local attempt
+    if running; then
+        pkill -fx "$pattern" || return 1
+        for attempt in 1 2 3 4 5; do
+            running || break
             sleep 1
-            if pgrep -f "hysteria (server|-c)" >/dev/null 2>&1; then
-                echo "hysteria-server 启动成功。"
-            fi
+        done
+        if running; then
+            echo "hysteria-server 尚未停止。" >&2
+            return 1
         fi
-        ;;
-    stop)
-        pkill -f "hysteria server" 2>/dev/null || true
-        echo "hysteria-server 已停止。"
-        ;;
-    restart)
-        pkill -f "hysteria server" 2>/dev/null || true
-        sleep 1
-        nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml >/var/log/hysteria.log 2>&1 &
-        sleep 1
-        echo "hysteria-server 重启完成。"
-        ;;
+    fi
+    echo "hysteria-server 已停止。"
+}
+case "$1" in
+    start) start_server ;;
+    stop) stop_server ;;
+    restart) stop_server && start_server ;;
     status)
-        if pgrep -f "hysteria (server|-c)" >/dev/null 2>&1; then
+        if running; then
             echo "hysteria-server 正在运行。"
         else
             echo "hysteria-server 已停止。"
+            exit 1
         fi
         ;;
-    *)
-        echo "用法: $0 {start|stop|restart|status}"
-        exit 1
-        ;;
+    *) echo "用法: $0 {start|stop|restart|status}"; exit 1 ;;
 esac
 RUNNER_EOF
         chmod 755 /usr/local/bin/hysteria-service
@@ -849,19 +977,31 @@ record_firewall_rule() {
 }
 
 add_ufw_rule() {
-    local rule="$1" rules
+    local rule="$1" rules family source
     if ! rules=$(LC_ALL=C ufw status 2>/dev/null); then
         warn "无法读取 UFW 规则，未自动修改 ${rule}。"
         return 0
     fi
-    if echo "$rules" | awk -v rule="$rule" '$1==rule && $2=="ALLOW" {found=1} END {exit !found}'; then
-        return 0
+    local families=(4)
+    if grep -Eq "^[[:space:]]*IPV6=[\"']?yes" /etc/default/ufw 2>/dev/null; then
+        families+=(6)
     fi
-    if ufw allow "$rule" comment 'buds-hy2' >/dev/null 2>&1; then
-        record_firewall_rule ufw - runtime "$rule"
-    else
-        warn "UFW 放行 ${rule} 失败，请在服务器或服务商面板检查。"
-    fi
+    for family in "${families[@]}"; do
+        if echo "$rules" | awk -v rule="$rule" -v family="$family" '
+            {is6=($0 ~ /\(v6\)/); gsub(/ \(v6\)/, "")}
+            is6==(family==6) && $1==rule && $2=="ALLOW" &&
+                ($3=="Anywhere" || ($3=="IN" && $4=="Anywhere")) {found=1}
+            END {exit !found}'; then
+            continue
+        fi
+        source=0.0.0.0/0
+        [[ "$family" != 6 ]] || source=::/0
+        if ufw allow in proto "${rule#*/}" from "$source" to any port "${rule%/*}" comment buds-hy2 >/dev/null 2>&1; then
+            record_firewall_rule ufw "$family" runtime "$rule"
+        else
+            warn "UFW IPv${family} 放行 ${rule} 失败，请检查服务器或服务商端口规则。"
+        fi
+    done
 }
 
 configure_firewall() {
@@ -935,17 +1075,17 @@ start_service() {
     elif [[ -x /usr/local/bin/hysteria-service ]]; then
         /usr/local/bin/hysteria-service restart
         sleep 2
-        if pgrep -f "hysteria (server|-c)" >/dev/null 2>&1; then
+        if pgrep -fx "/usr/local/bin/hysteria server (-c|--config) /etc/hysteria/config[.]yaml" >/dev/null 2>&1; then
             success "Hysteria 2 服务已正常运行。"
         else
             error "服务未能正常启动，请查看日志: cat /var/log/hysteria.log"
             exit 1
         fi
     else
-        pkill -f "hysteria server" >/dev/null 2>&1 || true
+        pkill -fx "/usr/local/bin/hysteria server (-c|--config) /etc/hysteria/config[.]yaml" >/dev/null 2>&1 || true
         nohup /usr/local/bin/hysteria server -c "$CONFIG_FILE" >/var/log/hysteria.log 2>&1 &
         sleep 2
-        if pgrep -f "hysteria (server|-c)" >/dev/null 2>&1; then
+        if pgrep -fx "/usr/local/bin/hysteria server (-c|--config) /etc/hysteria/config[.]yaml" >/dev/null 2>&1; then
             success "Hysteria 2 服务已正常运行。"
         else
             error "服务未能正常启动，请查看日志: cat /var/log/hysteria.log"
@@ -955,9 +1095,11 @@ start_service() {
 }
 
 setup_cli() {
-    local client_insecure="false"
+    local client_insecure="false" client_pin="" pin_line=""
     if is_cert_self_signed; then
         client_insecure="true"
+        client_pin=$(get_cert_pin) || { error "无法计算证书指纹，停止导出。"; return 1; }
+        pin_line="  pinSHA256: ${client_pin}"
     fi
 
     printf '%s\n' "$CLIENT_PORT_STR" > "${CONFIG_DIR}/.public_port"
@@ -969,6 +1111,7 @@ auth: "${AUTH_PASSWORD}"
 tls:
   sni: ${DOMAIN}
   insecure: ${client_insecure}
+${pin_line}
 obfs:
   type: salamander
   salamander:
@@ -993,6 +1136,7 @@ set -e
 CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
+PROCESS_PATTERN='/usr/local/bin/hysteria server (-c|--config) /etc/hysteria/config[.]yaml'
 
 # 优雅终端色彩 · MiMo Code 极客调色盘
 C_RESET="\033[0m"
@@ -1139,6 +1283,14 @@ is_cert_self_signed() {
     return 1
 }
 
+get_cert_pin() {
+    local pin
+    pin=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -fingerprint -sha256 2>/dev/null |
+        sed 's/^[^=]*=//' | tr -d ':\r\n' | tr 'A-F' 'a-f') || return 1
+    [[ "$pin" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$pin"
+}
+
 status() {
     echo -e "\n  ${C_BAR}  ${C_WHITE}服务运行状态与 UDP 端口监听 · SERVICE STATUS${C_RESET}\n"
     local is_running=false
@@ -1150,10 +1302,10 @@ status() {
         rc-service hysteria-server status 2>/dev/null | grep -q "started" && is_running=true
     elif [[ -x /usr/local/bin/hysteria-service ]]; then
         /usr/local/bin/hysteria-service status || true
-        pgrep -f "hysteria (server|-c)" >/dev/null 2>&1 && is_running=true
+        pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1 && is_running=true
     else
         local pids
-        pids=$(pgrep -f "hysteria (server|-c)" 2>/dev/null || true)
+        pids=$(pgrep -fx "$PROCESS_PATTERN" 2>/dev/null || true)
         if [[ -n "$pids" ]]; then
             is_running=true
             echo -e "     ${C_GREEN}● 运行中 (Running)${C_RESET} - PID: ${C_CYAN}${pids}${C_RESET}"
@@ -1169,7 +1321,7 @@ status() {
         cert_subject=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -subject 2>/dev/null | sed 's/subject=//' || echo "未知")
         cert_enddate=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -enddate 2>/dev/null | sed 's/notAfter=//' || echo "未知")
         if is_cert_self_signed; then
-            echo -e "     ${C_GRAY_MID}证书类型:${C_RESET} ${C_CYAN}极速自签名 ECC 证书 (全客户端通用免维护)${C_RESET}"
+            echo -e "     ${C_GRAY_MID}证书类型:${C_RESET} ${C_CYAN}自签名 ECC 证书 (SHA-256 指纹固定)${C_RESET}"
         else
             echo -e "     ${C_GRAY_MID}证书类型:${C_RESET} ${C_GREEN}CA 签发证书${C_RESET}"
         fi
@@ -1211,41 +1363,54 @@ log() {
 
 restart() {
     if has_systemd; then
-        systemctl restart hysteria-server
+        systemctl restart hysteria-server || return 1
     elif has_openrc; then
-        rc-service hysteria-server restart
+        rc-service hysteria-server restart || return 1
     elif [[ -x /usr/local/bin/hysteria-service ]]; then
-        /usr/local/bin/hysteria-service restart
+        /usr/local/bin/hysteria-service restart || return 1
     else
-        pkill -f "hysteria server" 2>/dev/null || true
-        sleep 1
-        nohup /usr/local/bin/hysteria server -c "${CONFIG_FILE}" >/var/log/hysteria.log 2>&1 &
+        stop || return 1
+        start || return 1
     fi
     echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已成功重启。${C_RESET}\n"
 }
 
 stop() {
     if has_systemd; then
-        systemctl stop hysteria-server
+        systemctl stop hysteria-server || return 1
     elif has_openrc; then
-        rc-service hysteria-server stop
+        rc-service hysteria-server stop || return 1
     elif [[ -x /usr/local/bin/hysteria-service ]]; then
-        /usr/local/bin/hysteria-service stop
+        /usr/local/bin/hysteria-service stop || return 1
     else
-        pkill -f "hysteria server" 2>/dev/null || true
+        if pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; then
+            pkill -fx "$PROCESS_PATTERN"
+            sleep 1
+            if pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; then
+                echo "Hysteria 2 尚未停止，请检查进程。" >&2
+                return 1
+            fi
+        fi
     fi
     echo -e "\n  ${C_BAR}  ${C_AMBER}✔ Hysteria 2 服务已停止。${C_RESET}\n"
 }
 
 start() {
     if has_systemd; then
-        systemctl start hysteria-server
+        systemctl start hysteria-server || return 1
     elif has_openrc; then
-        rc-service hysteria-server start
+        rc-service hysteria-server start || return 1
     elif [[ -x /usr/local/bin/hysteria-service ]]; then
-        /usr/local/bin/hysteria-service start
+        /usr/local/bin/hysteria-service start || return 1
     else
-        nohup /usr/local/bin/hysteria server -c "${CONFIG_FILE}" >/var/log/hysteria.log 2>&1 &
+        if ! pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; then
+            nohup /usr/local/bin/hysteria server -c "${CONFIG_FILE}" >/var/log/hysteria.log 2>&1 &
+            sleep 1
+        fi
+        if ! pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; then
+            echo "Hysteria 2 启动失败，请检查 /var/log/hysteria.log。" >&2
+            return 1
+        fi
     fi
     echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已启动。${C_RESET}\n"
 }
@@ -1269,11 +1434,14 @@ link() {
         obfs_param="&obfs=salamander&obfs-password=${obfs_pwd}"
     fi
 
-    local insecure=0
+    local insecure=0 pin_param=""
     local cert_badge="${C_GREEN}CA 签发证书${C_RESET}"
     if is_cert_self_signed; then
         insecure=1
-        cert_badge="${C_CYAN}极速自签名 ECC 证书 (全客户端通用免维护)${C_RESET}"
+        local pin
+        pin=$(get_cert_pin) || { echo "无法计算证书指纹，停止导出。"; return 1; }
+        pin_param="&pinSHA256=${pin}"
+        cert_badge="${C_CYAN}自签名 ECC 证书 (SHA-256 指纹固定)${C_RESET}"
     fi
 
     echo -e "\n  ${C_BAR}  ${C_WHITE}节点连接凭据 · CONNECTION CREDENTIALS${C_RESET}"
@@ -1287,18 +1455,18 @@ link() {
     echo -e "     ${C_GRAY_MID}伪装反代    :${C_RESET} ${C_GRAY_LIGHT}https://news.ycombinator.com/${C_RESET}\n"
 
     if [[ "$public_ports" == *-* ]]; then
-        local link_hop="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${obfs_param}&mport=${public_ports}#${domain}-Hy2"
-        local link_single="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${obfs_param}#${domain}-Hy2-Single"
+        local link_hop="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${pin_param}${obfs_param}&mport=${public_ports}#${domain}-Hy2"
+        local link_single="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${pin_param}${obfs_param}#${domain}-Hy2-Single"
 
         echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 1 · 专属主节点链接${C_RESET} ${C_GRAY_MID}(端口跳跃 · v2rayN 兼容 · 防限速)${C_RESET}"
         echo -e "     ${C_YELLOW}${link_hop}${C_RESET}\n"
 
-        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 2 · 基准单端口链接${C_RESET} ${C_GRAY_MID}(固定单端口 · 全客户端兼容备用)${C_RESET}"
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 2 · 基准单端口链接${C_RESET} ${C_GRAY_MID}(固定单端口 · 固定端口备用)${C_RESET}"
         echo -e "     ${C_YELLOW}${link_single}${C_RESET}\n"
     else
-        local link_main="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${obfs_param}#${domain}-Hy2"
+        local link_main="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${pin_param}${obfs_param}#${domain}-Hy2"
 
-        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}节点连接链接${C_RESET} ${C_GRAY_MID}(v2rayN / Clash Verge / 全客户端通用)${C_RESET}"
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}节点连接链接${C_RESET} ${C_GRAY_MID}(需客户端支持证书指纹验证)${C_RESET}"
         echo -e "     ${C_YELLOW}${link_main}${C_RESET}\n"
     fi
 
@@ -1311,9 +1479,11 @@ client() {
         return 1
     fi
 
-    local client_insecure="false"
+    local client_insecure="false" client_pin="" pin_line=""
     if is_cert_self_signed; then
         client_insecure="true"
+        client_pin=$(get_cert_pin) || { echo "无法计算证书指纹，停止导出。"; return 1; }
+        pin_line="  pinSHA256: ${client_pin}"
     fi
 
     if [[ ! -f "$CLIENT_CONFIG_FILE" ]]; then
@@ -1329,6 +1499,7 @@ auth: "${password}"
 tls:
   sni: ${domain}
   insecure: ${client_insecure}
+${pin_line}
 obfs:
   type: salamander
   salamander:
@@ -1340,8 +1511,26 @@ CLIENT_YAML_EOF
         chown root:root "$CLIENT_CONFIG_FILE" 2>/dev/null || true
         chmod 600 "$CLIENT_CONFIG_FILE"
     else
-        sed -i "s/^[[:space:]]*insecure:[[:space:]]*.*/  insecure: ${client_insecure}/" "$CLIENT_CONFIG_FILE" 2>/dev/null || true
+        local updated
+        updated=$(mktemp "${CLIENT_CONFIG_FILE}.XXXXXX") || return 1
+        if ! awk -v insecure="$client_insecure" -v pin="$client_pin" -v domain="$(get_domain)" '
+            function security() {
+                print "  insecure: " insecure
+                if (pin!="") print "  pinSHA256: " pin
+            }
+            /^tls:[[:space:]]*$/ {found=1; in_tls=1; print; security(); next}
+            /^[^[:space:]#]/ {in_tls=0}
+            in_tls && /^[[:space:]]*(insecure|pinSHA256):/ {next}
+            {print}
+            END {if (!found) {print "tls:"; print "  sni: " domain; security()}}
+        ' "$CLIENT_CONFIG_FILE" > "$updated"; then
+            rm -f "$updated"
+            return 1
+        fi
+        mv -f "$updated" "$CLIENT_CONFIG_FILE"
     fi
+    chown root:root "$CLIENT_CONFIG_FILE" 2>/dev/null || true
+    chmod 600 "$CLIENT_CONFIG_FILE"
 
     echo -e "\n  ${C_BAR}  ${C_WHITE}客户端 YAML 配置 (${CLIENT_CONFIG_FILE})${C_RESET}\n"
     cat "$CLIENT_CONFIG_FILE"
@@ -1360,12 +1549,14 @@ renew_test() {
 }
 
 remove_ufw_rule() {
-    local rule="$1" rules numbers number
+    local rule="$1" family="${2:--}" rules numbers number
     rules=$(LC_ALL=C ufw status numbered 2>/dev/null) || return 1
     if [[ "$rules" == *"Status: active"* ]]; then
         # 按编号倒序删除带本项目注释的条目，分别保护 IPv4/IPv6 的其他规则。
-        numbers=$(echo "$rules" | awk -v rule="$rule" '
+        numbers=$(echo "$rules" | awk -v rule="$rule" -v family="$family" '
           /# buds-hy2[[:space:]]*$/ {
+            is6=($0 ~ /\(v6\)/)
+            if ((family==4 && is6) || (family==6 && !is6)) next
             line=$0; sub(/^\[[[:space:]]*[0-9]+\][[:space:]]*/, "", line)
             split(line, fields, /[[:space:]]+/)
             if (fields[1]==rule) {sub(/^\[[[:space:]]*/, ""); sub(/\].*$/, ""); print}
@@ -1396,7 +1587,7 @@ cleanup_firewall() {
         result=0
         case "$backend" in
             ufw)
-                remove_ufw_rule "$rule" || result=1
+                remove_ufw_rule "$rule" "$zone" || result=1
                 ;;
             firewalld)
                 local options=(--zone="$zone")
@@ -1452,10 +1643,40 @@ cleanup_firewall() {
     rm -f "$rule_file"
 }
 
+read_root_crontab() {
+    local contents
+    if contents=$(LC_ALL=C crontab -l 2>&1); then
+        printf '%s\n' "$contents"
+    elif [[ "$contents" == *"no crontab"* || "$contents" == *"No such file"* ]]; then
+        return 0
+    else
+        echo "无法读取 root 定时任务，未覆盖已有任务。" >&2
+        return 1
+    fi
+}
+
+cleanup_renewal() {
+    if [[ -f /etc/systemd/system/buds-hy2-renew.timer ]]; then
+        if has_systemd; then
+            systemctl disable --now buds-hy2-renew.timer
+        fi
+        rm -f /etc/systemd/system/buds-hy2-renew.timer /etc/systemd/system/buds-hy2-renew.service
+        if has_systemd; then systemctl daemon-reload; fi
+    fi
+    if command -v crontab >/dev/null 2>&1; then
+        local contents
+        contents=$(read_root_crontab) || return 1
+        if printf '%s\n' "$contents" | grep -q '# buds-hy2-renew$'; then
+            printf '%s\n' "$contents" | sed '/# buds-hy2-renew$/d' | crontab -
+        fi
+    fi
+}
+
 uninstall() {
     echo -e "\n  ${C_RED}⚠ 警告: 即将卸载 Hysteria 2 服务！${C_RESET}"
     read -rp "  确认彻底卸载吗？(y/N): " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        cleanup_renewal
         if has_systemd; then
             systemctl disable --now hysteria-server 2>/dev/null || true
             rm -rf /etc/systemd/system/hysteria-server.service.d
@@ -1467,9 +1688,12 @@ uninstall() {
             rc-update del hysteria-server default 2>/dev/null || true
             rm -f /etc/init.d/hysteria-server
         fi
-        pkill -f "hysteria server" 2>/dev/null || true
+        pkill -fx "$PROCESS_PATTERN" 2>/dev/null || true
 
         cleanup_firewall
+        if [[ -f /etc/rc.local ]]; then
+            sed -i '\|^/usr/local/bin/hysteria-service start$|d' /etc/rc.local
+        fi
         rm -f /usr/local/bin/hysteria /usr/local/bin/buds /usr/local/bin/hy2 /usr/local/bin/hysteria-service
         rm -rf /etc/hysteria /var/log/hysteria.log
         rm -f /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh
@@ -1494,7 +1718,7 @@ show_menu() {
                 is_running=true
             fi
         else
-            if pgrep -f "hysteria (server|-c)" >/dev/null 2>&1; then
+            if pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; then
                 is_running=true
             fi
         fi

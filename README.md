@@ -1,8 +1,8 @@
 # buds-hy2
 
-全平台通用、高鲁棒性的 Hysteria 2 自动化部署与运维管理脚本。
+面向主流Linux发行版的Hysteria 2自动化部署与运维管理脚本。
 
-原生适配主流 Linux 发行版（Debian / Ubuntu / Alpine / CentOS / Rocky / Alma / Fedora / Arch），全面支持标准 VPS、NAT VPS 及 LXD / LXC / Docker 等虚拟化容器环境。支持与现有网站零停机共存，兼备 Let's Encrypt 权威证书与免 80 端口的极速 ECC 自签名证书。
+提供Debian、Ubuntu、Alpine、CentOS、Rocky、Alma、Fedora和Arch的依赖安装分支，以及systemd、OpenRC和精简容器的服务管理分支。支持标准VPS与NAT端口映射，提供Let's Encrypt证书和免80端口的ECC自签名证书。实际可用性取决于系统权限、UDP映射及客户端支持；运行脚本需要Bash和root权限。
 
 ---
 
@@ -20,8 +20,8 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/Buds-2025/buds-hy2/main/ins
 3. **灵活端口配置**：支持随机高位单端口、指定单端口或端口跳跃范围（如 `20000-40000`）；NAT/容器环境可另填公网UDP端口，默认与本机监听端口相同；
 4. **智能双模证书**：
    - **Let's Encrypt 权威证书**：适合独立公网 IP 机器，优先使用 Nginx 插件或网站目录验证；失败时自动回退自签名，不停止现有网站；
-   - **极速 ECC 自签名证书**：免除 80 端口依赖，专为 NAT VPS / LXD 容器定制，客户端免维护无缝直连；
-5. **内核与服务自愈**：内核 UDP 缓冲区智能调优，守护进程崩溃自愈与全局管理工具安装。
+   - **ECC自签名证书**：不依赖80端口，自动导出SHA-256证书指纹，适用于支持指纹验证的客户端；
+5. **内核与服务管理**：从官方来源确定版本并校验SHA-256后安装内核；systemd/OpenRC提供进程守护，精简容器提供启动、停止和状态检查。
 
 已安装节点再次执行安装命令时，将直接打开管理菜单，保留现有域名、端口和密码。卸载成功后再次执行则按全新安装处理。
 
@@ -55,10 +55,14 @@ buds hy2 uninstall   # 安全卸载服务
 
 ## 客户端连接
 
-在 v2rayN、Clash Verge 等客户端中复制脚本输出的 `hysteria2://` 链接并导入（快捷键 `Ctrl + V`）。
+在支持Hysteria 2的客户端中导入脚本输出的`hysteria2://`链接。自签名模式要求客户端识别并实际使用`pinSHA256`；当前v2rayN支持该导入字段，其他客户端及转换工具需确认其支持情况。原生Hysteria客户端可直接使用`buds hy2 client`输出的YAML。若客户端不支持指纹验证，请使用可信CA证书。
 
 如需提升传输效率，可在客户端节点设置中填入与本地网络相符的上传与下载带宽数值。
 
-可信CA证书的链接和YAML启用证书验证；自签名证书的两种导出方式统一跳过CA验证。
+可信CA证书的链接和YAML保留正常证书验证；自签名证书跳过CA链验证，同时固定完整证书的SHA-256指纹以核验服务端身份。重新安装会生成新的自签名证书，需要重新导入连接配置。
+
+Let's Encrypt模式会复用并启用已有续签定时器或cron任务，缺失时自动补建。无init容器需要保持cron进程运行；自签名模式不创建续签任务。卸载会清除本项目创建的定时任务和`rc.local`启动行，保留其他服务的任务。
+
+必需依赖缺失会明确停止安装，Certbot缺失仍允许使用自签名模式。Arch分支使用现有软件库索引安装依赖，不刷新索引后进行部分升级，也不自动升级整台服务器。
 
 开发验证：`python scripts/test_regressions.py`执行隔离回归测试（需Python 3和Bash），`python scripts/sync_cli.py --check`检查CLI与安装器内嵌版本的一致性。测试使用临时文件和系统命令替身，不执行真实安装。

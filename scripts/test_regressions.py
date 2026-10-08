@@ -269,8 +269,8 @@ ufw() { [[ "$1" == status ]] && { printf 'Status: active\\n24443/udp ALLOW Anywh
 add_ufw_rule 24443/udp
 add_ufw_rule 80/tcp
 """, "install.sh")
-        self.assertEqual(self.actions().strip(), "ufw allow 80/tcp comment buds-hy2")
-        self.assertEqual((self.config / ".firewall_rule").read_text(), "ufw|-|runtime|80/tcp\n")
+        self.assertEqual(self.actions().strip(), "ufw allow in proto tcp from 0.0.0.0/0 to any port 80 comment buds-hy2")
+        self.assertEqual((self.config / ".firewall_rule").read_text(), "ufw|4|runtime|80/tcp\n")
 
     def test_ufw_cleanup_deletes_only_owned_numbered_rules(self):
         self.journal("ufw|-|runtime|24443/udp\n")
@@ -388,6 +388,287 @@ configure_firewall
                 insertions = [line for line in self.actions().splitlines() if "-I " in line]
                 self.assertEqual(len(insertions), 1)
                 self.assertIn("--comment buds-hy2", insertions[0])
+
+
+
+    def test_dns_failure_falls_back_and_all_failed_is_explicit(self):
+        script = """
+PUBLIC_IP=203.0.113.1; DOMAIN=node.example.com
+getent() { return 2; }
+dig() { echo 203.0.113.1; }
+validate_domain
+echo REACHED_NEXT_STEP
+"""
+        output = self.shell(script, "install.sh")
+        self.assertIn("REACHED_NEXT_STEP", output)
+        self.assertNotIn("WARN:", output)
+        output = self.shell("""
+PUBLIC_IP=203.0.113.1; DOMAIN=missing.example
+getent() { return 2; }; dig() { return 1; }
+host() { return 1; }; nslookup() { return 1; }
+validate_domain
+echo REACHED_NEXT_STEP
+""", "install.sh")
+        self.assertIn("WARN:", output)
+        self.assertIn("REACHED_NEXT_STEP", output)
+
+    def test_nslookup_does_not_use_dns_server_address_as_domain_answer(self):
+        output = self.shell("""
+PUBLIC_IP=203.0.113.1; DOMAIN=missing.example
+command() { if [[ "$1" == -v && "$2" =~ ^(getent|dig|host)$ ]]; then return 1; fi; builtin command "$@"; }
+nslookup() { printf 'Server: 8.8.8.8\\nAddress: 8.8.8.8#53\\n'; return 1; }
+validate_domain
+""", "install.sh")
+        self.assertIn("暂未查询到", output)
+        self.assertNotIn("8.8.8.8", output)
+
+    def test_missing_required_dependencies_fail_before_configuration(self):
+        output = self.shell("""
+command() { if [[ "$1" == -v ]]; then return 1; fi; builtin command "$@"; }
+install_dependencies
+echo SHOULD_NOT_REACH
+""", "install.sh", expected=1)
+        self.assertIn("缺少必需工具", output)
+        self.assertNotIn("SHOULD_NOT_REACH", output)
+
+    def test_certbot_is_optional_and_arch_does_not_refresh_or_upgrade_system(self):
+        self.shell("""
+command() { if [[ "$1" == -v && "$2" =~ ^(apt-get|apk|dnf|yum|certbot)$ ]]; then return 1; fi; builtin command "$@"; }
+pacman() { echo "pacman $*" >> "$ACTION_FILE"; }
+pgrep() { return 1; }
+install_dependencies
+[[ "$HAVE_CERTBOT" == false ]]
+""", "install.sh")
+        self.assertTrue(self.actions())
+        for command in self.actions().splitlines():
+            self.assertIn("pacman -S --needed --noconfirm", command)
+            self.assertNotIn("-Sy", command)
+            self.assertNotIn("-Su", command)
+        self.assertNotIn("openssl certbot", self.actions())
+
+    def test_ufw_restricted_source_and_outbound_rules_do_not_count_as_open(self):
+        for rule in ("24443/udp ALLOW IN 192.0.2.10", "24443/udp ALLOW OUT Anywhere"):
+            self.shell(f"""
+ufw() {{ if [[ "$1" == status ]]; then printf 'Status: active\\n{rule}\\n'; else echo "ufw $*" >> "$ACTION_FILE"; fi; }}
+add_ufw_rule 24443/udp
+""", "install.sh")
+            self.assertIn("from 0.0.0.0/0 to any port 24443", self.actions())
+
+    def test_ufw_ipv4_add_does_not_overwrite_existing_ipv6_rule(self):
+        config = self.directory / "etc/default/ufw"
+        config.parent.mkdir(parents=True)
+        config.write_text("IPV6=yes\n", newline="\n")
+        self.shell("""
+ufw() {
+ if [[ "$1" == status ]]; then printf 'Status: active\\n24443/udp (v6) ALLOW IN Anywhere (v6) # existing\\n'
+ else echo "ufw $*" >> "$ACTION_FILE"; fi
+}
+add_ufw_rule 24443/udp
+""", "install.sh")
+        self.assertIn("from 0.0.0.0/0", self.actions())
+        self.assertNotIn("from ::/0", self.actions())
+        self.assertEqual((self.config / ".firewall_rule").read_text(), "ufw|4|runtime|24443/udp\n")
+
+    def test_lightweight_failed_restart_returns_failure(self):
+        output = self.shell("""
+mkdir -p "$SANDBOX/usr/local/bin" "$SANDBOX/var/log"
+INIT_SYSTEM=other; configure_service
+pgrep() { return 1; }; nohup() { return 1; }
+export -f pgrep nohup sleep
+bash "$SANDBOX/usr/local/bin/hysteria-service" restart
+""", "install.sh", expected=1)
+        self.assertNotIn("重启完成", output)
+
+    def test_lightweight_start_stop_restart_checks_own_process(self):
+        self.shell("""
+mkdir -p "$SANDBOX/usr/local/bin" "$SANDBOX/var/log"
+INIT_SYSTEM=other; configure_service
+pgrep() { [[ -f "$SANDBOX/running" ]]; }
+nohup() { touch "$SANDBOX/running"; }
+pkill() { rm -f "$SANDBOX/running"; }
+sleep() { wait; }
+export SANDBOX
+export -f pgrep nohup pkill sleep
+bash "$SANDBOX/usr/local/bin/hysteria-service" start
+bash "$SANDBOX/usr/local/bin/hysteria-service" restart
+bash "$SANDBOX/usr/local/bin/hysteria-service" stop
+[[ ! -f "$SANDBOX/running" ]]
+""", "install.sh")
+
+    def test_uninstall_removes_only_own_startup_line(self):
+        self.node_config()
+        startup = self.directory / "etc/rc.local"
+        startup.write_text(
+            "#!/bin/sh\necho keep-this\n" + self.sandbox + "/usr/local/bin/hysteria-service start\nexit 0\n",
+            newline="\n",
+        )
+        self.shell("uninstall <<<'y'\n")
+        self.assertEqual(startup.read_text(), "#!/bin/sh\necho keep-this\nexit 0\n")
+
+    def test_self_signed_pin_matches_der_sha256_and_is_exported(self):
+        import hashlib
+        self.certificates()
+        self.node_config()
+        der = subprocess.check_output(
+            [OPENSSL, "x509", "-in", str(self.config / "server.crt"), "-outform", "DER"]
+        )
+        expected = hashlib.sha256(der).hexdigest()
+        for source in ("buds", "install.sh"):
+            self.assertEqual(self.shell("get_cert_pin\n", source).strip(), expected)
+        output = self.shell("link\nclient\nclient\n")
+        self.assertIn("&pinSHA256=" + expected, output)
+        yaml = (self.config / "client.yaml").read_text()
+        self.assertEqual(yaml.count("pinSHA256:"), 1)
+        self.assertIn("pinSHA256: " + expected, yaml)
+        shutil.copyfile(self.directory / "signed.crt", self.config / "server.crt")
+        output = self.shell("link\nclient\n")
+        self.assertNotIn("pinSHA256", output)
+        self.assertIn("insecure: false", output)
+
+    def test_pin_is_added_when_existing_yaml_has_no_tls_block(self):
+        self.certificates()
+        self.node_config()
+        (self.config / "client.yaml").write_text(
+            "server: node.example.com:19957\nauth: keep-me\n", newline="\n"
+        )
+        self.shell("client\n")
+        result = (self.config / "client.yaml").read_text()
+        self.assertIn("auth: keep-me", result)
+        self.assertIn("pinSHA256:", result)
+        self.assertIn("insecure: true", result)
+
+    def test_pin_failure_refuses_unverified_self_signed_export(self):
+        self.certificates()
+        self.node_config()
+        for action in ("link", "client"):
+            output = self.shell("get_cert_pin() { return 1; }\n" + action + "\n", expected=1)
+            self.assertNotIn("hysteria2://", output)
+
+    def download_fixture(self, digest=None, valid_version=True, valid_binary=True):
+        import hashlib
+        payload = "test-core-fixture"
+        digest = digest or hashlib.sha256(payload.encode()).hexdigest()
+        version = "app/v2.13.0" if valid_version else "unexpected"
+        validation = 0 if valid_binary else 1
+        return f"""
+EXPECTED_DIGEST={shlex.quote(digest)}
+PAYLOAD={shlex.quote(payload)}
+uname() {{ echo x86_64; }}
+validate_core_binary() {{ echo VALIDATE >> "$ACTION_FILE"; return {validation}; }}
+curl() {{
+ local url="" output=""
+ while (( $# )); do
+  case "$1" in
+   -o) shift; output="$1";;
+   https://*) url="$1";;
+  esac
+  shift
+ done
+ echo "curl $url" >> "$ACTION_FILE"
+ case "$url" in
+  */releases/latest) printf 'HTTP/2 302\\nlocation: https://github.com/HyNetworks/hysteria/releases/tag/{version}\\n';;
+  */hashes.txt) printf '%s  build/hysteria-linux-amd64\\n' "$EXPECTED_DIGEST" > "$output";;
+  */hysteria-linux-amd64) printf '%s' "$PAYLOAD" > "$output";;
+  *) return 1;;
+ esac
+}}
+"""
+
+    def test_download_hash_mismatch_preserves_old_binary_and_never_executes(self):
+        binary = self.directory / "usr/local/bin/hysteria"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("existing-core")
+        self.shell(self.download_fixture(digest="0" * 64) + "install_official_core\n", "install.sh", expected=1)
+        self.assertEqual(binary.read_text(), "existing-core")
+        self.assertNotIn("VALIDATE", self.actions())
+        self.assertFalse(list(binary.parent.glob(".buds-hy2-download.*")))
+
+    def test_verified_download_is_fixed_version_and_temp_is_removed(self):
+        self.shell(self.download_fixture() + "install_official_core\n", "install.sh")
+        binary = self.directory / "usr/local/bin/hysteria"
+        self.assertEqual(binary.read_text(), "test-core-fixture")
+        self.assertIn("VALIDATE", self.actions())
+        downloads = [line for line in self.actions().splitlines() if "/download/" in line]
+        self.assertEqual(len(downloads), 2)
+        self.assertTrue(all("/download/app/v2.13.0/" in line for line in downloads))
+        self.assertFalse(list(binary.parent.glob(".buds-hy2-download.*")))
+
+    def test_invalid_metadata_or_nonrunning_binary_cannot_replace_core(self):
+        binary = self.directory / "usr/local/bin/hysteria"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("existing-core")
+        for fixture in (self.download_fixture(valid_version=False), self.download_fixture(valid_binary=False)):
+            self.shell(fixture + "install_official_core\n", "install.sh", expected=1)
+            self.assertEqual(binary.read_text(), "existing-core")
+            self.assertFalse(list(binary.parent.glob(".buds-hy2-download.*")))
+
+    def test_non_elf_download_is_not_executed(self):
+        payload = self.directory / "payload"
+        payload.write_text('#!/usr/bin/env bash\necho EXECUTED\n', newline="\n")
+        payload.chmod(0o755)
+        output = self.shell('if validate_core_binary "$SANDBOX/payload"; then exit 9; fi\n', "install.sh")
+        self.assertNotIn("EXECUTED", output)
+
+    def test_existing_renewal_timer_is_enabled_without_duplicate(self):
+        self.shell("""
+has_systemd() { return 0; }
+certbot() { :; }
+systemctl() { echo "systemctl $*" >> "$ACTION_FILE"; }
+configure_renewal
+""", "install.sh")
+        self.assertIn("enable --now certbot.timer", self.actions())
+        self.assertFalse((self.directory / "etc/systemd/system/buds-hy2-renew.timer").exists())
+
+    def test_missing_renewal_timer_gets_owned_service_and_timer(self):
+        self.shell("""
+mkdir -p "$SANDBOX/etc/systemd/system"
+has_systemd() { return 0; }
+certbot() { :; }
+systemctl() { echo "systemctl $*" >> "$ACTION_FILE"; [[ "$1" != cat ]]; }
+configure_renewal
+""", "install.sh")
+        unit = (self.directory / "etc/systemd/system/buds-hy2-renew.service").read_text()
+        self.assertIn("renew --quiet --run-deploy-hooks", unit)
+        self.assertIn("enable --now buds-hy2-renew.timer", self.actions())
+
+    def test_existing_cron_renewal_is_reused(self):
+        path = self.directory / "etc/cron.d/foreign-certbot"
+        path.parent.mkdir(parents=True)
+        contents = "0 1 * * * root /usr/bin/certbot renew\n"
+        path.write_text(contents, newline="\n")
+        self.shell("""
+has_systemd() { return 0; }
+certbot() { :; }; systemctl() { return 1; }
+ensure_cron_running() { echo CRON_READY >> "$ACTION_FILE"; }
+configure_renewal
+""", "install.sh")
+        self.assertIn("CRON_READY", self.actions())
+        self.assertEqual(path.read_text(), contents)
+        self.assertFalse((self.directory / "etc/systemd/system/buds-hy2-renew.timer").exists())
+
+    def test_owned_cron_job_is_idempotent_and_uninstall_preserves_other_jobs(self):
+        root_cron = self.directory / "root-cron"
+        original = "5 1 * * * echo keep-this\n"
+        root_cron.write_text(original, newline="\n")
+        common = """
+crontab() { if [[ "$1" == -l ]]; then cat "$SANDBOX/root-cron"; else cat > "$SANDBOX/root-cron"; fi; }
+"""
+        self.shell(common + """
+certbot() { :; }
+ensure_cron_running() { return 0; }
+configure_renewal
+configure_renewal
+""", "install.sh")
+        self.assertEqual(root_cron.read_text().count("# buds-hy2-renew"), 1)
+        self.shell(common + "cleanup_renewal\n")
+        self.assertEqual(root_cron.read_text(), original)
+
+    def test_crontab_read_failure_never_overwrites_other_jobs(self):
+        self.shell("""
+crontab() { if [[ "$1" == -l ]]; then echo 'permission denied' >&2; return 1; else echo OVERWRITE >> "$ACTION_FILE"; fi; }
+cleanup_renewal
+""", expected=1)
+        self.assertNotIn("OVERWRITE", self.actions())
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ set -e
 CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
+PROCESS_PATTERN='/usr/local/bin/hysteria server (-c|--config) /etc/hysteria/config[.]yaml'
 
 # 优雅终端色彩 · MiMo Code 极客调色盘
 C_RESET="\033[0m"
@@ -150,6 +151,14 @@ is_cert_self_signed() {
     return 1
 }
 
+get_cert_pin() {
+    local pin
+    pin=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -fingerprint -sha256 2>/dev/null |
+        sed 's/^[^=]*=//' | tr -d ':\r\n' | tr 'A-F' 'a-f') || return 1
+    [[ "$pin" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$pin"
+}
+
 status() {
     echo -e "\n  ${C_BAR}  ${C_WHITE}服务运行状态与 UDP 端口监听 · SERVICE STATUS${C_RESET}\n"
     local is_running=false
@@ -161,10 +170,10 @@ status() {
         rc-service hysteria-server status 2>/dev/null | grep -q "started" && is_running=true
     elif [[ -x /usr/local/bin/hysteria-service ]]; then
         /usr/local/bin/hysteria-service status || true
-        pgrep -f "hysteria (server|-c)" >/dev/null 2>&1 && is_running=true
+        pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1 && is_running=true
     else
         local pids
-        pids=$(pgrep -f "hysteria (server|-c)" 2>/dev/null || true)
+        pids=$(pgrep -fx "$PROCESS_PATTERN" 2>/dev/null || true)
         if [[ -n "$pids" ]]; then
             is_running=true
             echo -e "     ${C_GREEN}● 运行中 (Running)${C_RESET} - PID: ${C_CYAN}${pids}${C_RESET}"
@@ -180,7 +189,7 @@ status() {
         cert_subject=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -subject 2>/dev/null | sed 's/subject=//' || echo "未知")
         cert_enddate=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -enddate 2>/dev/null | sed 's/notAfter=//' || echo "未知")
         if is_cert_self_signed; then
-            echo -e "     ${C_GRAY_MID}证书类型:${C_RESET} ${C_CYAN}极速自签名 ECC 证书 (全客户端通用免维护)${C_RESET}"
+            echo -e "     ${C_GRAY_MID}证书类型:${C_RESET} ${C_CYAN}自签名 ECC 证书 (SHA-256 指纹固定)${C_RESET}"
         else
             echo -e "     ${C_GRAY_MID}证书类型:${C_RESET} ${C_GREEN}CA 签发证书${C_RESET}"
         fi
@@ -222,41 +231,54 @@ log() {
 
 restart() {
     if has_systemd; then
-        systemctl restart hysteria-server
+        systemctl restart hysteria-server || return 1
     elif has_openrc; then
-        rc-service hysteria-server restart
+        rc-service hysteria-server restart || return 1
     elif [[ -x /usr/local/bin/hysteria-service ]]; then
-        /usr/local/bin/hysteria-service restart
+        /usr/local/bin/hysteria-service restart || return 1
     else
-        pkill -f "hysteria server" 2>/dev/null || true
-        sleep 1
-        nohup /usr/local/bin/hysteria server -c "${CONFIG_FILE}" >/var/log/hysteria.log 2>&1 &
+        stop || return 1
+        start || return 1
     fi
     echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已成功重启。${C_RESET}\n"
 }
 
 stop() {
     if has_systemd; then
-        systemctl stop hysteria-server
+        systemctl stop hysteria-server || return 1
     elif has_openrc; then
-        rc-service hysteria-server stop
+        rc-service hysteria-server stop || return 1
     elif [[ -x /usr/local/bin/hysteria-service ]]; then
-        /usr/local/bin/hysteria-service stop
+        /usr/local/bin/hysteria-service stop || return 1
     else
-        pkill -f "hysteria server" 2>/dev/null || true
+        if pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; then
+            pkill -fx "$PROCESS_PATTERN"
+            sleep 1
+            if pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; then
+                echo "Hysteria 2 尚未停止，请检查进程。" >&2
+                return 1
+            fi
+        fi
     fi
     echo -e "\n  ${C_BAR}  ${C_AMBER}✔ Hysteria 2 服务已停止。${C_RESET}\n"
 }
 
 start() {
     if has_systemd; then
-        systemctl start hysteria-server
+        systemctl start hysteria-server || return 1
     elif has_openrc; then
-        rc-service hysteria-server start
+        rc-service hysteria-server start || return 1
     elif [[ -x /usr/local/bin/hysteria-service ]]; then
-        /usr/local/bin/hysteria-service start
+        /usr/local/bin/hysteria-service start || return 1
     else
-        nohup /usr/local/bin/hysteria server -c "${CONFIG_FILE}" >/var/log/hysteria.log 2>&1 &
+        if ! pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; then
+            nohup /usr/local/bin/hysteria server -c "${CONFIG_FILE}" >/var/log/hysteria.log 2>&1 &
+            sleep 1
+        fi
+        if ! pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; then
+            echo "Hysteria 2 启动失败，请检查 /var/log/hysteria.log。" >&2
+            return 1
+        fi
     fi
     echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已启动。${C_RESET}\n"
 }
@@ -280,11 +302,14 @@ link() {
         obfs_param="&obfs=salamander&obfs-password=${obfs_pwd}"
     fi
 
-    local insecure=0
+    local insecure=0 pin_param=""
     local cert_badge="${C_GREEN}CA 签发证书${C_RESET}"
     if is_cert_self_signed; then
         insecure=1
-        cert_badge="${C_CYAN}极速自签名 ECC 证书 (全客户端通用免维护)${C_RESET}"
+        local pin
+        pin=$(get_cert_pin) || { echo "无法计算证书指纹，停止导出。"; return 1; }
+        pin_param="&pinSHA256=${pin}"
+        cert_badge="${C_CYAN}自签名 ECC 证书 (SHA-256 指纹固定)${C_RESET}"
     fi
 
     echo -e "\n  ${C_BAR}  ${C_WHITE}节点连接凭据 · CONNECTION CREDENTIALS${C_RESET}"
@@ -298,18 +323,18 @@ link() {
     echo -e "     ${C_GRAY_MID}伪装反代    :${C_RESET} ${C_GRAY_LIGHT}https://news.ycombinator.com/${C_RESET}\n"
 
     if [[ "$public_ports" == *-* ]]; then
-        local link_hop="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${obfs_param}&mport=${public_ports}#${domain}-Hy2"
-        local link_single="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${obfs_param}#${domain}-Hy2-Single"
+        local link_hop="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${pin_param}${obfs_param}&mport=${public_ports}#${domain}-Hy2"
+        local link_single="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${pin_param}${obfs_param}#${domain}-Hy2-Single"
 
         echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 1 · 专属主节点链接${C_RESET} ${C_GRAY_MID}(端口跳跃 · v2rayN 兼容 · 防限速)${C_RESET}"
         echo -e "     ${C_YELLOW}${link_hop}${C_RESET}\n"
 
-        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 2 · 基准单端口链接${C_RESET} ${C_GRAY_MID}(固定单端口 · 全客户端兼容备用)${C_RESET}"
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 2 · 基准单端口链接${C_RESET} ${C_GRAY_MID}(固定单端口 · 固定端口备用)${C_RESET}"
         echo -e "     ${C_YELLOW}${link_single}${C_RESET}\n"
     else
-        local link_main="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${obfs_param}#${domain}-Hy2"
+        local link_main="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${pin_param}${obfs_param}#${domain}-Hy2"
 
-        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}节点连接链接${C_RESET} ${C_GRAY_MID}(v2rayN / Clash Verge / 全客户端通用)${C_RESET}"
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}节点连接链接${C_RESET} ${C_GRAY_MID}(需客户端支持证书指纹验证)${C_RESET}"
         echo -e "     ${C_YELLOW}${link_main}${C_RESET}\n"
     fi
 
@@ -322,9 +347,11 @@ client() {
         return 1
     fi
 
-    local client_insecure="false"
+    local client_insecure="false" client_pin="" pin_line=""
     if is_cert_self_signed; then
         client_insecure="true"
+        client_pin=$(get_cert_pin) || { echo "无法计算证书指纹，停止导出。"; return 1; }
+        pin_line="  pinSHA256: ${client_pin}"
     fi
 
     if [[ ! -f "$CLIENT_CONFIG_FILE" ]]; then
@@ -340,6 +367,7 @@ auth: "${password}"
 tls:
   sni: ${domain}
   insecure: ${client_insecure}
+${pin_line}
 obfs:
   type: salamander
   salamander:
@@ -351,8 +379,26 @@ CLIENT_YAML_EOF
         chown root:root "$CLIENT_CONFIG_FILE" 2>/dev/null || true
         chmod 600 "$CLIENT_CONFIG_FILE"
     else
-        sed -i "s/^[[:space:]]*insecure:[[:space:]]*.*/  insecure: ${client_insecure}/" "$CLIENT_CONFIG_FILE" 2>/dev/null || true
+        local updated
+        updated=$(mktemp "${CLIENT_CONFIG_FILE}.XXXXXX") || return 1
+        if ! awk -v insecure="$client_insecure" -v pin="$client_pin" -v domain="$(get_domain)" '
+            function security() {
+                print "  insecure: " insecure
+                if (pin!="") print "  pinSHA256: " pin
+            }
+            /^tls:[[:space:]]*$/ {found=1; in_tls=1; print; security(); next}
+            /^[^[:space:]#]/ {in_tls=0}
+            in_tls && /^[[:space:]]*(insecure|pinSHA256):/ {next}
+            {print}
+            END {if (!found) {print "tls:"; print "  sni: " domain; security()}}
+        ' "$CLIENT_CONFIG_FILE" > "$updated"; then
+            rm -f "$updated"
+            return 1
+        fi
+        mv -f "$updated" "$CLIENT_CONFIG_FILE"
     fi
+    chown root:root "$CLIENT_CONFIG_FILE" 2>/dev/null || true
+    chmod 600 "$CLIENT_CONFIG_FILE"
 
     echo -e "\n  ${C_BAR}  ${C_WHITE}客户端 YAML 配置 (${CLIENT_CONFIG_FILE})${C_RESET}\n"
     cat "$CLIENT_CONFIG_FILE"
@@ -371,12 +417,14 @@ renew_test() {
 }
 
 remove_ufw_rule() {
-    local rule="$1" rules numbers number
+    local rule="$1" family="${2:--}" rules numbers number
     rules=$(LC_ALL=C ufw status numbered 2>/dev/null) || return 1
     if [[ "$rules" == *"Status: active"* ]]; then
         # 按编号倒序删除带本项目注释的条目，分别保护 IPv4/IPv6 的其他规则。
-        numbers=$(echo "$rules" | awk -v rule="$rule" '
+        numbers=$(echo "$rules" | awk -v rule="$rule" -v family="$family" '
           /# buds-hy2[[:space:]]*$/ {
+            is6=($0 ~ /\(v6\)/)
+            if ((family==4 && is6) || (family==6 && !is6)) next
             line=$0; sub(/^\[[[:space:]]*[0-9]+\][[:space:]]*/, "", line)
             split(line, fields, /[[:space:]]+/)
             if (fields[1]==rule) {sub(/^\[[[:space:]]*/, ""); sub(/\].*$/, ""); print}
@@ -407,7 +455,7 @@ cleanup_firewall() {
         result=0
         case "$backend" in
             ufw)
-                remove_ufw_rule "$rule" || result=1
+                remove_ufw_rule "$rule" "$zone" || result=1
                 ;;
             firewalld)
                 local options=(--zone="$zone")
@@ -463,10 +511,40 @@ cleanup_firewall() {
     rm -f "$rule_file"
 }
 
+read_root_crontab() {
+    local contents
+    if contents=$(LC_ALL=C crontab -l 2>&1); then
+        printf '%s\n' "$contents"
+    elif [[ "$contents" == *"no crontab"* || "$contents" == *"No such file"* ]]; then
+        return 0
+    else
+        echo "无法读取 root 定时任务，未覆盖已有任务。" >&2
+        return 1
+    fi
+}
+
+cleanup_renewal() {
+    if [[ -f /etc/systemd/system/buds-hy2-renew.timer ]]; then
+        if has_systemd; then
+            systemctl disable --now buds-hy2-renew.timer
+        fi
+        rm -f /etc/systemd/system/buds-hy2-renew.timer /etc/systemd/system/buds-hy2-renew.service
+        if has_systemd; then systemctl daemon-reload; fi
+    fi
+    if command -v crontab >/dev/null 2>&1; then
+        local contents
+        contents=$(read_root_crontab) || return 1
+        if printf '%s\n' "$contents" | grep -q '# buds-hy2-renew$'; then
+            printf '%s\n' "$contents" | sed '/# buds-hy2-renew$/d' | crontab -
+        fi
+    fi
+}
+
 uninstall() {
     echo -e "\n  ${C_RED}⚠ 警告: 即将卸载 Hysteria 2 服务！${C_RESET}"
     read -rp "  确认彻底卸载吗？(y/N): " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        cleanup_renewal
         if has_systemd; then
             systemctl disable --now hysteria-server 2>/dev/null || true
             rm -rf /etc/systemd/system/hysteria-server.service.d
@@ -478,9 +556,12 @@ uninstall() {
             rc-update del hysteria-server default 2>/dev/null || true
             rm -f /etc/init.d/hysteria-server
         fi
-        pkill -f "hysteria server" 2>/dev/null || true
+        pkill -fx "$PROCESS_PATTERN" 2>/dev/null || true
 
         cleanup_firewall
+        if [[ -f /etc/rc.local ]]; then
+            sed -i '\|^/usr/local/bin/hysteria-service start$|d' /etc/rc.local
+        fi
         rm -f /usr/local/bin/hysteria /usr/local/bin/buds /usr/local/bin/hy2 /usr/local/bin/hysteria-service
         rm -rf /etc/hysteria /var/log/hysteria.log
         rm -f /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh
@@ -505,7 +586,7 @@ show_menu() {
                 is_running=true
             fi
         else
-            if pgrep -f "hysteria (server|-c)" >/dev/null 2>&1; then
+            if pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; then
                 is_running=true
             fi
         fi
