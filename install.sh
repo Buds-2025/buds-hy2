@@ -1116,6 +1116,7 @@ obfs:
   type: salamander
   salamander:
     password: "${OBFS_PASSWORD}"
+# 带宽配置（Brutal 拥塞控制）：填入本地实际上下行速率；如在 TUN 模式遇 QoS 偶发断流，可注释此段以平滑走标准 BBR
 bandwidth:
   up: 100 mbps
   down: 300 mbps
@@ -1291,6 +1292,17 @@ get_cert_pin() {
     printf '%s\n' "$pin"
 }
 
+get_spki_pin() {
+    [[ -f "${CONFIG_DIR}/server.crt" ]] || return 1
+    local spki
+    spki=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -pubkey -noout 2>/dev/null |
+        openssl pkey -pubin -outform der 2>/dev/null |
+        openssl dgst -sha256 -binary 2>/dev/null |
+        openssl enc -base64 2>/dev/null | tr -d '\r\n') || return 1
+    [[ -n "$spki" ]] || return 1
+    printf '%s\n' "$spki"
+}
+
 status() {
     echo -e "\n  ${C_BAR}  ${C_WHITE}服务运行状态与 UDP 端口监听 · SERVICE STATUS${C_RESET}\n"
     local is_running=false
@@ -1427,26 +1439,29 @@ link() {
     obfs_pwd=$(get_obfs_pwd)
     listen=$(get_listen)
     public_ports=$(get_public_ports)
-    base_port=${public_ports%%-*}
+    base_port=$(echo "$public_ports" | grep -o '^[0-9]\+' || echo "443")
+    [[ -n "$base_port" ]] || base_port=443
 
     local obfs_param=""
     if [[ -n "$obfs_pwd" ]]; then
         obfs_param="&obfs=salamander&obfs-password=${obfs_pwd}"
     fi
 
-    local insecure=0 pin_param=""
-    local cert_badge="${C_GREEN}CA 签发证书${C_RESET}"
+    local pin_param=""
+    local cert_badge="${C_GREEN}CA 权威证书 (标准安全校验)${C_RESET}"
+    local pin=""
     if is_cert_self_signed; then
-        insecure=1
-        local pin
         pin=$(get_cert_pin) || { echo "无法计算证书指纹，停止导出。"; return 1; }
         pin_param="&pinSHA256=${pin}"
-        cert_badge="${C_CYAN}自签名 ECC 证书 (SHA-256 指纹固定)${C_RESET}"
+        cert_badge="${C_CYAN}自签名 ECC 证书 (SHA-256 指纹锁定 · 免 80 端口)${C_RESET}"
     fi
 
     echo -e "\n  ${C_BAR}  ${C_WHITE}节点连接凭据 · CONNECTION CREDENTIALS${C_RESET}"
     echo -e "     ${C_GRAY_MID}域名 (SNI)  :${C_RESET} ${C_WHITE}${domain}${C_RESET}"
     echo -e "     ${C_GRAY_MID}证书类型    :${C_RESET} ${cert_badge}"
+    if is_cert_self_signed && [[ -n "$pin" ]]; then
+        echo -e "     ${C_GRAY_MID}证书指纹    :${C_RESET} ${C_YELLOW}${pin}${C_RESET}"
+    fi
     echo -e "     ${C_GRAY_MID}监听端口    :${C_RESET} ${C_CYAN}${listen}${C_RESET}"
     echo -e "     ${C_GRAY_MID}公网端口    :${C_RESET} ${C_CYAN}${public_ports}${C_RESET} ${C_GRAY_MID}(连接基准端口: ${base_port})${C_RESET}"
     echo -e "     ${C_GRAY_MID}认证密码    :${C_RESET} ${C_WHITE}${password}${C_RESET}"
@@ -1455,18 +1470,18 @@ link() {
     echo -e "     ${C_GRAY_MID}伪装反代    :${C_RESET} ${C_GRAY_LIGHT}https://news.ycombinator.com/${C_RESET}\n"
 
     if [[ "$public_ports" == *-* ]]; then
-        local link_hop="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${pin_param}${obfs_param}&mport=${public_ports}#${domain}-Hy2"
-        local link_single="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${pin_param}${obfs_param}#${domain}-Hy2-Single"
+        local link_hop="hysteria2://${password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}&mport=${public_ports}#${domain}-Hy2"
+        local link_single="hysteria2://${password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}#${domain}-Hy2-Single"
 
-        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 1 · 专属主节点链接${C_RESET} ${C_GRAY_MID}(端口跳跃 · v2rayN 兼容 · 防限速)${C_RESET}"
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 1 · 专属主节点链接${C_RESET} ${C_GRAY_MID}(端口跳跃 · v2rayN / sing-box 现代标准)${C_RESET}"
         echo -e "     ${C_YELLOW}${link_hop}${C_RESET}\n"
 
         echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 2 · 基准单端口链接${C_RESET} ${C_GRAY_MID}(固定单端口 · 固定端口备用)${C_RESET}"
         echo -e "     ${C_YELLOW}${link_single}${C_RESET}\n"
     else
-        local link_main="hysteria2://${password}@${domain}:${base_port}?sni=${domain}&insecure=${insecure}&allowInsecure=${insecure}${pin_param}${obfs_param}#${domain}-Hy2"
+        local link_main="hysteria2://${password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}#${domain}-Hy2"
 
-        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}节点连接链接${C_RESET} ${C_GRAY_MID}(需客户端支持证书指纹验证)${C_RESET}"
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}节点连接链接${C_RESET} ${C_GRAY_MID}(标准 Hysteria 2 URI · 支持指纹锁定)${C_RESET}"
         echo -e "     ${C_YELLOW}${link_main}${C_RESET}\n"
     fi
 
@@ -1486,15 +1501,17 @@ client() {
         pin_line="  pinSHA256: ${client_pin}"
     fi
 
-    if [[ ! -f "$CLIENT_CONFIG_FILE" ]]; then
-        local domain password obfs_pwd listen
-        domain=$(get_domain)
-        password=$(get_password)
-        obfs_pwd=$(get_obfs_pwd)
-        listen=$(get_public_ports)
+    local domain password obfs_pwd public_ports base_port
+    domain=$(get_domain)
+    password=$(get_password)
+    obfs_pwd=$(get_obfs_pwd)
+    public_ports=$(get_public_ports)
+    base_port=$(echo "$public_ports" | grep -o '^[0-9]\+' || echo "443")
+    [[ -n "$base_port" ]] || base_port=443
 
+    if [[ ! -f "$CLIENT_CONFIG_FILE" ]]; then
         cat <<CLIENT_YAML_EOF > "$CLIENT_CONFIG_FILE"
-server: ${domain}:${listen}
+server: ${domain}:${public_ports}
 auth: "${password}"
 tls:
   sni: ${domain}
@@ -1504,6 +1521,7 @@ obfs:
   type: salamander
   salamander:
     password: "${obfs_pwd}"
+# 带宽配置（Brutal 拥塞控制）：填入本地实际上下行速率；如在 TUN 模式遇 QoS 偶发断流，可注释此段以平滑走标准 BBR
 bandwidth:
   up: 100 mbps
   down: 300 mbps
@@ -1532,9 +1550,64 @@ CLIENT_YAML_EOF
     chown root:root "$CLIENT_CONFIG_FILE" 2>/dev/null || true
     chmod 600 "$CLIENT_CONFIG_FILE"
 
-    echo -e "\n  ${C_BAR}  ${C_WHITE}客户端 YAML 配置 (${CLIENT_CONFIG_FILE})${C_RESET}\n"
+    echo -e "\n  ${C_BAR}  ${C_WHITE}配置 1 · Hysteria 2 原生客户端配置 (${CLIENT_CONFIG_FILE})${C_RESET}\n"
     cat "$CLIENT_CONFIG_FILE"
     echo ""
+
+    echo -e "  ${C_BAR}  ${C_WHITE}配置 2 · sing-box 1.14+ 原生 Outbound JSON 片段${C_RESET} ${C_GRAY_MID}(适配 v2rayN 自定义配置 / sing-box)${C_RESET}\n"
+    local sb_tls_pin=""
+    if is_cert_self_signed; then
+        local spki_pin
+        spki_pin=$(get_spki_pin 2>/dev/null || true)
+        if [[ -n "$spki_pin" ]]; then
+            sb_tls_pin=",\n      \"certificate_public_key_sha256\": [\n        \"${spki_pin}\"\n      ]"
+        fi
+    fi
+
+    local sb_ports=""
+    if [[ "$public_ports" == *-* ]]; then
+        local sb_hop_range="${public_ports//-/:}"
+        sb_ports=",\n    \"server_ports\": [\n      \"${sb_hop_range}\"\n    ],\n    \"hop_interval\": \"30s\""
+    fi
+
+    echo -e "  ${C_CYAN}{"
+    echo -e "    \"type\": \"hysteria2\","
+    echo -e "    \"tag\": \"hy2-out\","
+    echo -e "    \"server\": \"${domain}\","
+    echo -e "    \"server_port\": ${base_port}${sb_ports},"
+    echo -e "    \"password\": \"${password}\","
+    if [[ -n "$obfs_pwd" ]]; then
+        echo -e "    \"obfs\": {"
+        echo -e "      \"type\": \"salamander\","
+        echo -e "      \"password\": \"${obfs_pwd}\""
+        echo -e "    },"
+    fi
+    echo -e "    \"tls\": {"
+    echo -e "      \"enabled\": true,"
+    echo -e "      \"server_name\": \"${domain}\","
+    echo -e "      \"insecure\": false${sb_tls_pin}"
+    echo -e "    }"
+    echo -e "  }${C_RESET}\n"
+
+    echo -e "  ${C_BAR}  ${C_WHITE}配置 3 · Clash / Mihomo (Meta) 节点配置片段${C_RESET}\n"
+    echo -e "  ${C_YELLOW}- name: \"Hy2-${domain}\""
+    echo -e "    type: hysteria2"
+    echo -e "    server: ${domain}"
+    echo -e "    port: ${base_port}"
+    if [[ "$public_ports" == *-* ]]; then
+        echo -e "    ports: ${public_ports}"
+    fi
+    echo -e "    password: \"${password}\""
+    echo -e "    sni: ${domain}"
+    echo -e "    skip-cert-verify: false"
+    if is_cert_self_signed && [[ -n "$client_pin" ]]; then
+        echo -e "    fingerprint: \"${client_pin}\""
+    fi
+    if [[ -n "$obfs_pwd" ]]; then
+        echo -e "    obfs: salamander"
+        echo -e "    obfs-password: \"${obfs_pwd}\""
+    fi
+    echo -e "${C_RESET}"
 }
 
 renew_test() {

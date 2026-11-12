@@ -103,13 +103,15 @@ sleep() {{ :; }}
             self.shell("is_cert_self_signed\n", source)
         output = self.shell("link\nclient\n")
         self.assertIn("node.example.com:19957?sni=", output)
-        self.assertIn("insecure=1&allowInsecure=1", output)
+        self.assertIn("pinSHA256=", output)
+        self.assertNotIn("allowInsecure", output)
         self.assertIn("insecure: true", output)
         shutil.copyfile(self.directory / "signed.crt", self.config / "server.crt")
         for source in ("buds", "install.sh"):
             self.shell("if is_cert_self_signed; then exit 9; fi\n", source)
         output = self.shell("link\nclient\n")
-        self.assertIn("insecure=0&allowInsecure=0", output)
+        self.assertNotIn("allowInsecure", output)
+        self.assertNotIn("insecure=", output)
         self.assertIn("insecure: false", output)
         self.assertNotIn("insecure=1", output)
 

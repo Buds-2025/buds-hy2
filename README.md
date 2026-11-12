@@ -46,7 +46,7 @@ buds hy2 log         # 查看实时运行日志
 buds hy2 restart     # 重启服务
 buds hy2 stop        # 停止服务
 buds hy2 start       # 启动服务
-buds hy2 client      # 输出客户端 YAML 配置文件
+buds hy2 client      # 输出客户端配置文件 (原生 YAML、sing-box JSON 与 Clash 配置)
 buds hy2 renew-test  # 模拟测试证书自动续签逻辑
 buds hy2 uninstall   # 安全卸载服务
 ```
@@ -55,7 +55,7 @@ buds hy2 uninstall   # 安全卸载服务
 
 ## 客户端连接
 
-在支持Hysteria 2的客户端中导入脚本输出的`hysteria2://`链接。自签名模式要求客户端识别并实际使用`pinSHA256`；当前v2rayN支持该导入字段，其他客户端及转换工具需确认其支持情况。原生Hysteria客户端可直接使用`buds hy2 client`输出的YAML。若客户端不支持指纹验证，请使用可信CA证书。
+在支持Hysteria 2的客户端中导入脚本输出的`hysteria2://`链接。自签名模式使用规范的`pinSHA256`指纹锁定服务端身份，严格遵循现代核心标准并彻底剥离已废止的`allowInsecure`参数，支持v2rayN及sing-box等客户端稳定导入。同时可通过`buds hy2 client`查看原生YAML、sing-box 1.14+ Outbound JSON以及Clash/Mihomo的配置片段。若客户端不支持指纹验证，请使用可信CA证书。
 
 如需提升传输效率，可在客户端节点设置中填入与本地网络相符的上传与下载带宽数值。
 
