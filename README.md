@@ -54,6 +54,14 @@ buds hy2 uninstall   # 安全卸载服务
 
 当远端 GitHub 仓库发布新版本时，交互式管理面板顶部将自动弹出新版本更新提醒，支持一键热重载更新。
 
+> **提示（已有旧版本无损升级）**：
+> 若您此前部署的旧版管理面板中尚未包含【更新脚本】功能，**完全无需重新安装或卸载已有节点**，只需在终端执行以下单行命令即可无缝升级管理脚本：
+> ```bash
+> curl -fsSL "https://raw.githubusercontent.com/Buds-2025/buds-hy2/main/buds?v=$(date +%s)" -o /usr/local/bin/buds && chmod +x /usr/local/bin/buds
+> ```
+> （国内网络可选用 CDN 镜像加速：`curl -fsSL "https://fastly.jsdelivr.net/gh/Buds-2025/buds-hy2@main/buds?v=$(date +%s)" -o /usr/local/bin/buds && chmod +x /usr/local/bin/buds`）
+> 升级完成后，所有现有配置、自签指纹、密码与证书保持不变，后续即可在面板内直接接收更新提醒并一键升级。
+
 ---
 
 ## 客户端连接
