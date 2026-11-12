@@ -47,9 +47,12 @@ buds hy2 restart     # 重启服务
 buds hy2 stop        # 停止服务
 buds hy2 start       # 启动服务
 buds hy2 client      # 输出客户端配置文件 (原生 YAML、sing-box JSON 与 Clash 配置)
+buds hy2 update      # 检查并更新管理脚本至最新版本
 buds hy2 renew-test  # 模拟测试证书自动续签逻辑
 buds hy2 uninstall   # 安全卸载服务
 ```
+
+当远端 GitHub 仓库发布新版本时，交互式管理面板顶部将自动弹出新版本更新提醒，支持一键热重载更新。
 
 ---
 

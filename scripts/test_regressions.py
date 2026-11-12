@@ -672,6 +672,63 @@ cleanup_renewal
 """, expected=1)
         self.assertNotIn("OVERWRITE", self.actions())
 
+    def test_version_comparison_logic(self):
+        output = self.shell("""
+is_version_newer "1.2.1" "1.2.0" && echo "PASS1"
+is_version_newer "1.2.0" "1.2.0" || echo "PASS2"
+is_version_newer "1.1.9" "1.2.0" || echo "PASS3"
+is_version_newer "1.10.0" "1.9.0" && echo "PASS4"
+is_version_newer "2.0.0" "1.9.9" && echo "PASS5"
+is_version_newer "v1.3.0" "1.2.0" && echo "PASS6"
+is_version_newer "" "1.2.0" || echo "PASS7"
+""")
+        self.assertEqual(output.strip().splitlines(), [f"PASS{i}" for i in range(1, 8)])
+
+    def test_remote_version_cache_and_fallback(self):
+        cache_file = self.config / ".version_cache"
+        cache_file.write_text("9999999999:2.0.0\n", encoding="utf-8")
+        out = self.shell("""
+curl() { echo "CURL_CALLED" >> "$ACTION_FILE"; return 1; }
+wget() { echo "WGET_CALLED" >> "$ACTION_FILE"; return 1; }
+check_remote_version
+""")
+        self.assertEqual(out.strip(), "2.0.0")
+        self.assertNotIn("CURL_CALLED", self.actions())
+
+        cache_file.write_text("0:1.0.0\n", encoding="utf-8")
+        out = self.shell("""
+curl() { echo "CURL_CALLED" >> "$ACTION_FILE"; return 1; }
+wget() { echo "WGET_CALLED" >> "$ACTION_FILE"; return 1; }
+check_remote_version
+""")
+        self.assertEqual(out.strip(), "1.2.0")
+        self.assertIn("CURL_CALLED", self.actions())
+
+    def test_update_script_success_and_syntax_guard(self):
+        target_cli = self.directory / "usr/local/bin/buds"
+        target_cli.parent.mkdir(parents=True, exist_ok=True)
+        target_cli.write_text("#!/usr/bin/env bash\necho old\n", encoding="utf-8")
+
+        # Guard: syntax error rejected
+        out = self.shell(f"""
+check_remote_version() {{ echo "1.3.0"; }}
+curl() {{ local out="${{!#}}"; printf "#!/usr/bin/env bash\\nif then invalid syntax\\n" > "$out"; }}
+BUDS_CLI="{target_cli.as_posix()}"
+update_script
+""", expected=1)
+        self.assertIn("新脚本语法校验未通过", out)
+        self.assertIn("old", target_cli.read_text())
+
+        # Success: valid script downloaded and atomically applied
+        out = self.shell(f"""
+check_remote_version() {{ echo "1.3.0"; }}
+curl() {{ local out="${{!#}}"; printf "#!/usr/bin/env bash\\necho updated-to-1.3.0\\n" > "$out"; }}
+BUDS_CLI="{target_cli.as_posix()}"
+update_script
+""")
+        self.assertIn("脚本已成功更新至 v1.3.0", out)
+        self.assertIn("updated-to-1.3.0", target_cli.read_text())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

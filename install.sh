@@ -16,6 +16,7 @@ OVERRIDE_DIR="/etc/systemd/system/hysteria-server.service.d"
 OVERRIDE_FILE="${OVERRIDE_DIR}/override.conf"
 SERVICE_FILE="/etc/systemd/system/hysteria-server.service"
 SYSCTL_FILE="/etc/sysctl.d/99-hysteria-performance.conf"
+SCRIPT_VERSION="1.2.0"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 
@@ -1137,6 +1138,12 @@ set -e
 CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
+SCRIPT_VERSION="1.2.0"
+BUDS_CLI="/usr/local/bin/buds"
+HY2_CLI="/usr/local/bin/hy2"
+UPDATE_URL_PRIMARY="https://raw.githubusercontent.com/Buds-2025/buds-hy2/main/buds"
+UPDATE_URL_MIRROR="https://fastly.jsdelivr.net/gh/Buds-2025/buds-hy2@main/buds"
+VERSION_CACHE_FILE="${CONFIG_DIR}/.version_cache"
 PROCESS_PATTERN='/usr/local/bin/hysteria server (-c|--config) /etc/hysteria/config[.]yaml'
 
 # 优雅终端色彩 · MiMo Code 极客调色盘
@@ -1769,6 +1776,7 @@ uninstall() {
         fi
         rm -f /usr/local/bin/hysteria /usr/local/bin/buds /usr/local/bin/hy2 /usr/local/bin/hysteria-service
         rm -rf /etc/hysteria /var/log/hysteria.log
+        rm -f /tmp/.buds_hy2_ver_cache
         rm -f /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh
         rm -f /etc/periodic/daily/certbot-renew
         rm -f /etc/sysctl.d/99-hysteria-performance.conf
@@ -1778,9 +1786,146 @@ uninstall() {
     fi
 }
 
+is_version_newer() {
+    local remote="$1" current="$2"
+    [[ -z "$remote" || -z "$current" || "$remote" == "$current" ]] && return 1
+
+    local -a r_parts c_parts
+    IFS='.' read -r -a r_parts <<< "$remote"
+    IFS='.' read -r -a c_parts <<< "$current"
+
+    local max_len=${#r_parts[@]}
+    [[ ${#c_parts[@]} -gt $max_len ]] && max_len=${#c_parts[@]}
+
+    local i
+    for ((i=0; i<max_len; i++)); do
+        local r="${r_parts[i]:-0}"
+        local c="${c_parts[i]:-0}"
+        r="${r//[^0-9]/}"
+        c="${c//[^0-9]/}"
+        [[ -z "$r" ]] && r=0
+        [[ -z "$c" ]] && c=0
+        if (( 10#$r > 10#$c )); then
+            return 0
+        elif (( 10#$r < 10#$c )); then
+            return 1
+        fi
+    done
+    return 1
+}
+
+check_remote_version() {
+    local force="${1:-false}"
+    local cache_file now cache_time remote_ver
+    cache_file="${VERSION_CACHE_FILE}"
+    if [[ ! -d "${CONFIG_DIR}" ]]; then
+        cache_file="/tmp/.buds_hy2_ver_cache"
+    fi
+    now=$(date +%s 2>/dev/null || echo 0)
+
+    if [[ "$force" != "true" && -f "$cache_file" ]]; then
+        cache_time=$(cut -d':' -f1 "$cache_file" 2>/dev/null || echo 0)
+        remote_ver=$(cut -d':' -f2 "$cache_file" 2>/dev/null || true)
+        if [[ -n "$remote_ver" && "$cache_time" =~ ^[0-9]+$ ]] && (( now - cache_time < 1800 )); then
+            echo "$remote_ver"
+            return 0
+        fi
+    fi
+
+    local fetched=""
+    local url
+    for url in "${UPDATE_URL_PRIMARY}?v=${now}" "${UPDATE_URL_MIRROR}?v=${now}"; do
+        if command -v curl >/dev/null 2>&1; then
+            fetched=$(curl -sSfL --connect-timeout 2 --max-time 4 "$url" 2>/dev/null | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2 || true)
+        elif command -v wget >/dev/null 2>&1; then
+            fetched=$(wget -qO- --timeout=3 -t 1 "$url" 2>/dev/null | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2 || true)
+        fi
+        if [[ -n "$fetched" ]]; then
+            break
+        fi
+    done
+
+    if [[ -n "$fetched" ]]; then
+        echo "${now}:${fetched}" > "$cache_file" 2>/dev/null || true
+        echo "$fetched"
+    else
+        echo "$SCRIPT_VERSION"
+    fi
+}
+
+update_script() {
+    echo -e "\n  ${C_BAR}  ${C_ORANGE_BOLD}检查脚本更新 · SCRIPT UPDATE${C_RESET}\n"
+    echo -e "  当前版本: ${C_CYAN}v${SCRIPT_VERSION}${C_RESET}"
+    echo -ne "  正在连接远程仓库获取最新版本..."
+    local remote_ver
+    remote_ver=$(check_remote_version true)
+    echo -e " ${C_GREEN}完成${C_RESET}"
+
+    if ! is_version_newer "$remote_ver" "$SCRIPT_VERSION"; then
+        echo -e "\n  ${C_GREEN}✔ 当前已是最新版本 (v${SCRIPT_VERSION})，无需更新。${C_RESET}\n"
+        return 0
+    fi
+
+    echo -e "  发现新版本: ${C_SPARK}v${remote_ver}${C_RESET}"
+    local target_cli="${BUDS_CLI:-/usr/local/bin/buds}"
+    local tmp_file
+    tmp_file=$(mktemp "/tmp/buds_update.XXXXXX" 2>/dev/null || echo "/tmp/buds_update.$$")
+
+    echo -ne "  正在下载最新脚本..."
+    local downloaded=false
+    local url
+    local now
+    now=$(date +%s 2>/dev/null || echo 0)
+    for url in "${UPDATE_URL_PRIMARY}?v=${now}" "${UPDATE_URL_MIRROR}?v=${now}"; do
+        if command -v curl >/dev/null 2>&1; then
+            if curl -sSfL --connect-timeout 5 --max-time 15 "$url" -o "$tmp_file" 2>/dev/null; then
+                downloaded=true
+                break
+            fi
+        elif command -v wget >/dev/null 2>&1; then
+            if wget -qO "$tmp_file" --timeout=10 -t 2 "$url" 2>/dev/null; then
+                downloaded=true
+                break
+            fi
+        fi
+    done
+
+    if [[ "$downloaded" != "true" || ! -s "$tmp_file" ]]; then
+        rm -f "$tmp_file"
+        echo -e " ${C_RED}失败${C_RESET}"
+        echo -e "\n  ${C_RED}✖ 下载最新脚本失败，请检查网络或稍后重试。${C_RESET}\n"
+        return 1
+    fi
+    echo -e " ${C_GREEN}完成${C_RESET}"
+
+    # 校验下载脚本有效性 (必须为 shell 脚本且能通过语法解析)
+    if ! head -n 1 "$tmp_file" | grep -q '^#!/'; then
+        rm -f "$tmp_file"
+        echo -e "\n  ${C_RED}✖ 下载的文件不是有效的 shell 脚本，更新已终止。${C_RESET}\n"
+        return 1
+    fi
+
+    if command -v bash >/dev/null 2>&1; then
+        if ! bash -n "$tmp_file" 2>/dev/null; then
+            rm -f "$tmp_file"
+            echo -e "\n  ${C_RED}✖ 新脚本语法校验未通过，更新已终止以保护现有环境。${C_RESET}\n"
+            return 1
+        fi
+    fi
+
+    mkdir -p "$(dirname "$target_cli")" 2>/dev/null || true
+    chmod 755 "$tmp_file"
+    cp -f "$tmp_file" "$target_cli"
+    rm -f "$tmp_file"
+    ln -sf "$target_cli" "${HY2_CLI:-/usr/local/bin/hy2}" 2>/dev/null || true
+    rm -f "${VERSION_CACHE_FILE}" "/tmp/.buds_hy2_ver_cache" 2>/dev/null || true
+
+    echo -e "\n  ${C_BAR}  ${C_GREEN}✔ 脚本已成功更新至 v${remote_ver}！${C_RESET}\n"
+}
+
 show_menu() {
     while true; do
-        local status_badge domain listen
+        local status_badge domain listen remote_ver has_update
         local is_running=false
         if has_systemd; then
             if systemctl is-active --quiet hysteria-server 2>/dev/null; then
@@ -1805,6 +1950,11 @@ show_menu() {
         domain=$(get_domain)
         listen=$(get_listen)
         [[ -z "$listen" ]] && listen="未配置"
+        remote_ver=$(check_remote_version)
+        has_update=false
+        if is_version_newer "$remote_ver" "$SCRIPT_VERSION"; then
+            has_update=true
+        fi
 
         clear 2>/dev/null || true
         echo -e "       ${C_SPARK}✧${C_RESET}                                      ${C_SPARK}✦${C_RESET}"
@@ -1812,10 +1962,14 @@ show_menu() {
         echo -e "  ${C_ORANGE_BOLD}█▀▀▄ █  █ █  █ ▀▀▀█${C_RESET}   ${C_GRAY_LIGHT}█▀▀█ ▀██▀   ▄▀${C_RESET}"
         echo -e "  ${C_ORANGE_BOLD}█  █ █  █ █  █    █${C_RESET}   ${C_GRAY_LIGHT}█  █   █  ▄▀  ${C_RESET}"
         echo -e "  ${C_ORANGE_BOLD}▀▀▀▀ ▀▀▀▀ ▀▀▀  ▀▀▀▀${C_RESET}   ${C_GRAY_LIGHT}▀  ▀   ▀  ▀▀▀▀${C_RESET}"
-        echo -e "  ${C_GRAY_MID}Hysteria 2 High-Performance Protocol Suite${C_RESET}\n"
+        echo -e "  ${C_GRAY_MID}Hysteria 2 High-Performance Protocol Suite${C_RESET}  ${C_CYAN}v${SCRIPT_VERSION}${C_RESET}\n"
 
         echo -e "  ${C_BAR}  ${C_WHITE}节点状态${C_RESET}  ${status_badge}    ${C_WHITE}监听端口${C_RESET}  ${C_CYAN}${listen}${C_RESET}"
-        echo -e "  ${C_BAR}  ${C_GRAY_MID}解析域名${C_RESET}  ${C_GRAY_LIGHT}${domain}${C_RESET}    ${C_GRAY_MID}协议混淆${C_RESET}  ${C_AMBER}Salamander${C_RESET}\n"
+        echo -e "  ${C_BAR}  ${C_GRAY_MID}解析域名${C_RESET}  ${C_GRAY_LIGHT}${domain}${C_RESET}    ${C_GRAY_MID}协议混淆${C_RESET}  ${C_AMBER}Salamander${C_RESET}"
+        if [[ "$has_update" == "true" ]]; then
+            echo -e "  ${C_BAR}  ${C_SPARK}✦ 发现脚本新版本  v${remote_ver} (当前: v${SCRIPT_VERSION})  ▶ 输入 8 或 u 即可一键更新${C_RESET}"
+        fi
+        echo ""
 
         echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}核心业务${C_RESET} ${C_GRAY_MID}· CORE ACTIONS${C_RESET}"
         echo -e "     ${C_ORANGE_BOLD}1.${C_RESET} ${C_WHITE}运行状态${C_RESET}      ${C_GRAY_MID}Service Status & UDP Socket${C_RESET}"
@@ -1829,11 +1983,16 @@ show_menu() {
         echo -e "     ${C_ORANGE_BOLD}7.${C_RESET} ${C_WHITE}停止服务${C_RESET}      ${C_GRAY_MID}Stop Hysteria 2${C_RESET}\n"
 
         echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}系统维护${C_RESET} ${C_GRAY_MID}· MAINTENANCE${C_RESET}"
-        echo -e "     ${C_ORANGE_BOLD}8.${C_RESET} ${C_WHITE}模拟续签${C_RESET}      ${C_GRAY_MID}Let's Encrypt SSL Dry-Run${C_RESET}"
-        echo -e "     ${C_ORANGE_BOLD}9.${C_RESET} ${C_WHITE}卸载节点${C_RESET}      ${C_GRAY_MID}Uninstall & Clean Firewall${C_RESET}"
+        if [[ "$has_update" == "true" ]]; then
+            echo -e "     ${C_ORANGE_BOLD}8.${C_RESET} ${C_SPARK}更新脚本${C_RESET}      ${C_GRAY_MID}Update buds CLI to Latest${C_RESET} ${C_SPARK}(新版本: v${remote_ver})${C_RESET}"
+        else
+            echo -e "     ${C_ORANGE_BOLD}8.${C_RESET} ${C_WHITE}更新脚本${C_RESET}      ${C_GRAY_MID}Update buds CLI to Latest${C_RESET}"
+        fi
+        echo -e "     ${C_ORANGE_BOLD}9.${C_RESET} ${C_WHITE}模拟续签${C_RESET}      ${C_GRAY_MID}Let's Encrypt SSL Dry-Run${C_RESET}"
+        echo -e "    ${C_ORANGE_BOLD}10.${C_RESET} ${C_WHITE}卸载节点${C_RESET}      ${C_GRAY_MID}Uninstall & Clean Firewall${C_RESET}"
         echo -e "     ${C_GRAY_MID}0.${C_RESET} ${C_GRAY_MID}退出脚本${C_RESET}      ${C_GRAY_MID}Exit${C_RESET}\n"
 
-        read -rp "$(echo -e "  ${C_ORANGE_BOLD}❯${C_RESET} ${C_WHITE}请选择操作编号 [0-9]: ${C_RESET}")" choice
+        read -rp "$(echo -e "  ${C_ORANGE_BOLD}❯${C_RESET} ${C_WHITE}请选择操作编号 [0-10]: ${C_RESET}")" choice
         case "$choice" in
             1) status; read -rp "按回车键返回主菜单..." ;;
             2) link; read -rp "按回车键返回主菜单..." ;;
@@ -1842,8 +2001,15 @@ show_menu() {
             5) restart; read -rp "按回车键返回主菜单..." ;;
             6) start; read -rp "按回车键返回主菜单..." ;;
             7) stop; read -rp "按回车键返回主菜单..." ;;
-            8) renew_test; read -rp "按回车键返回主菜单..." ;;
-            9) uninstall; break ;;
+            8|[uU]|update)
+                update_script
+                read -rp "按回车键重新加载主菜单..."
+                if [[ -x "${BUDS_CLI:-/usr/local/bin/buds}" ]]; then
+                    exec "${BUDS_CLI:-/usr/local/bin/buds}" hy2
+                fi
+                ;;
+            9) renew_test; read -rp "按回车键返回主菜单..." ;;
+            10) uninstall; break ;;
             0) exit 0 ;;
             *) echo "输入无效，请重新选择。" ;;
         esac
@@ -1862,6 +2028,21 @@ case "$1" in
     client) client ;;
     renew-test) renew_test ;;
     uninstall) uninstall ;;
+    update) update_script ;;
+    check-update)
+        r_ver=$(check_remote_version true)
+        if is_version_newer "$r_ver" "$SCRIPT_VERSION"; then
+            echo "新版本可用: v${r_ver} (当前: v${SCRIPT_VERSION})"
+            exit 0
+        else
+            echo "已是最新版本: v${SCRIPT_VERSION}"
+            exit 0
+        fi
+        ;;
+    version|-v|--version)
+        echo "buds-hy2 v${SCRIPT_VERSION}"
+        exit 0
+        ;;
     *) show_menu ;;
 esac
 EOF
@@ -1879,7 +2060,8 @@ display_summary() {
     echo -e "     ${C_ORANGE_BOLD}buds hy2 status${C_RESET}   ${C_GRAY_MID}查看服务运行状态与监听端口${C_RESET}"
     echo -e "     ${C_ORANGE_BOLD}buds hy2 link${C_RESET}     ${C_GRAY_MID}查看节点连接链接与导入凭据${C_RESET}"
     echo -e "     ${C_ORANGE_BOLD}buds hy2 log${C_RESET}      ${C_GRAY_MID}查看实时日志 (Ctrl+C 退出)${C_RESET}"
-    echo -e "     ${C_ORANGE_BOLD}buds hy2 restart${C_RESET}  ${C_GRAY_MID}重启服务${C_RESET}\n"
+    echo -e "     ${C_ORANGE_BOLD}buds hy2 restart${C_RESET}  ${C_GRAY_MID}重启服务${C_RESET}"
+    echo -e "     ${C_ORANGE_BOLD}buds hy2 update${C_RESET}   ${C_GRAY_MID}检查并更新管理脚本到最新版本${C_RESET}\n"
 }
 
 main() {
