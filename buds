@@ -4,7 +4,7 @@ set -e
 CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 UPDATE_URL_PRIMARY="https://raw.githubusercontent.com/Buds-2025/buds-hy2/main/buds"
@@ -116,10 +116,22 @@ get_obfs_pwd() {
 get_listen() {
     local listen=""
     if [[ -f "$CONFIG_FILE" ]]; then
-        listen=$(sed -n 's/^[[:space:]]*listen:[[:space:]]*\(.*\)/\1/p' "$CONFIG_FILE" 2>/dev/null | tr -d ' :\r' | head -1)
+        listen=$(sed -n 's/^[[:space:]]*listen:[[:space:]]*\(.*\)/\1/p' "$CONFIG_FILE" 2>/dev/null | tr -d ' "\047\r' | head -1)
+        if [[ "$listen" == :* ]]; then
+            listen="${listen#:}"
+        elif [[ "$listen" =~ ^\[[^]]+\]:(.*)$ ]]; then
+            listen="${BASH_REMATCH[1]}"
+        elif [[ "$listen" =~ ^[^:]+:([0-9]+(-[0-9]+)?)$ ]]; then
+            listen="${BASH_REMATCH[1]}"
+        fi
     fi
     if [[ -z "$listen" && -f "$CLIENT_CONFIG_FILE" ]]; then
-        listen=$(sed -n 's/^[[:space:]]*server:[[:space:]]*[^:]*:\(.*\)/\1/p' "$CLIENT_CONFIG_FILE" 2>/dev/null | tr -d ' \r' | head -1)
+        listen=$(sed -n 's/^[[:space:]]*server:[[:space:]]*\(.*\)/\1/p' "$CLIENT_CONFIG_FILE" 2>/dev/null | tr -d ' "\047\r' | head -1)
+        if [[ "$listen" =~ ^\[[^]]+\]:(.*)$ ]]; then
+            listen="${BASH_REMATCH[1]}"
+        else
+            listen="${listen##*:}"
+        fi
     fi
     echo "$listen"
 }
@@ -127,13 +139,61 @@ get_listen() {
 get_public_ports() {
     local ports=""
     if [[ -f "$CLIENT_CONFIG_FILE" ]]; then
-        ports=$(sed -n 's/^[[:space:]]*server:[[:space:]]*[^:]*:\(.*\)/\1/p' "$CLIENT_CONFIG_FILE" | tr -d ' "\r' | head -1)
+        ports=$(sed -n 's/^[[:space:]]*server:[[:space:]]*\(.*\)/\1/p' "$CLIENT_CONFIG_FILE" 2>/dev/null | tr -d ' "\047\r' | head -1)
+        if [[ "$ports" =~ ^\[[^]]+\]:(.*)$ ]]; then
+            ports="${BASH_REMATCH[1]}"
+        elif [[ "$ports" == *:* ]]; then
+            ports="${ports##*:}"
+        else
+            ports=""
+        fi
     fi
     if [[ -z "$ports" && -f "${CONFIG_DIR}/.public_port" ]]; then
         ports=$(cat "${CONFIG_DIR}/.public_port")
     fi
     [[ -n "$ports" ]] || ports=$(get_listen)
     echo "$ports"
+}
+
+get_masquerade_url() {
+    local url=""
+    if [[ -f "$CONFIG_FILE" ]]; then
+        url=$(awk '
+          /^[[:space:]]*masquerade:/ { in_masq=1; next }
+          in_masq && /^[^[:space:]#]/ { in_masq=0 }
+          in_masq && /^[[:space:]]*url:[[:space:]]*/ {
+            sub(/^[[:space:]]*url:[[:space:]]*/, "");
+            gsub(/^["\047 ]+|["\047 \r]+$/, "");
+            print;
+            exit;
+          }
+        ' "$CONFIG_FILE" 2>/dev/null)
+    fi
+    [[ -n "$url" ]] || url="https://news.ycombinator.com/"
+    echo "$url"
+}
+
+urlencode() {
+    local s="$1" out="" i c hex
+    local LC_ALL=C
+    for ((i=0; i<${#s}; i++)); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out+="$c" ;;
+            *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'	'/\\t}"
+    printf '%s' "$s"
 }
 
 has_systemd() {
@@ -315,9 +375,12 @@ link() {
     base_port=$(echo "$public_ports" | grep -o '^[0-9]\+' || echo "443")
     [[ -n "$base_port" ]] || base_port=443
 
+    local enc_password enc_obfs_pwd
+    enc_password=$(urlencode "$password")
+    enc_obfs_pwd=$(urlencode "$obfs_pwd")
     local obfs_param=""
     if [[ -n "$obfs_pwd" ]]; then
-        obfs_param="&obfs=salamander&obfs-password=${obfs_pwd}"
+        obfs_param="&obfs=salamander&obfs-password=${enc_obfs_pwd}"
     fi
 
     local pin_param=""
@@ -340,11 +403,12 @@ link() {
     echo -e "     ${C_GRAY_MID}认证密码    :${C_RESET} ${C_WHITE}${password}${C_RESET}"
     echo -e "     ${C_GRAY_MID}协议混淆    :${C_RESET} ${C_AMBER}salamander${C_RESET}"
     echo -e "     ${C_GRAY_MID}混淆密钥    :${C_RESET} ${C_WHITE}${obfs_pwd}${C_RESET}"
-    echo -e "     ${C_GRAY_MID}伪装反代    :${C_RESET} ${C_GRAY_LIGHT}https://news.ycombinator.com/${C_RESET}\n"
+    local masq_url; masq_url=$(get_masquerade_url)
+    echo -e "     ${C_GRAY_MID}伪装反代    :${C_RESET} ${C_GRAY_LIGHT}${masq_url}${C_RESET}\n"
 
     if [[ "$public_ports" == *-* ]]; then
-        local link_hop="hysteria2://${password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}&mport=${public_ports}#${domain}-Hy2"
-        local link_single="hysteria2://${password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}#${domain}-Hy2-Single"
+        local link_hop="hysteria2://${enc_password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}&mport=${public_ports}#${domain}-Hy2"
+        local link_single="hysteria2://${enc_password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}#${domain}-Hy2-Single"
 
         echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 1 · 专属主节点链接${C_RESET} ${C_GRAY_MID}(端口跳跃 · v2rayN / sing-box 现代标准)${C_RESET}"
         echo -e "     ${C_YELLOW}${link_hop}${C_RESET}\n"
@@ -352,7 +416,7 @@ link() {
         echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 2 · 基准单端口链接${C_RESET} ${C_GRAY_MID}(固定单端口 · 固定端口备用)${C_RESET}"
         echo -e "     ${C_YELLOW}${link_single}${C_RESET}\n"
     else
-        local link_main="hysteria2://${password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}#${domain}-Hy2"
+        local link_main="hysteria2://${enc_password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}#${domain}-Hy2"
 
         echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}节点连接链接${C_RESET} ${C_GRAY_MID}(标准 Hysteria 2 URI · 支持指纹锁定)${C_RESET}"
         echo -e "     ${C_YELLOW}${link_main}${C_RESET}\n"
@@ -443,21 +507,25 @@ CLIENT_YAML_EOF
         sb_ports=",\n    \"server_ports\": [\n      \"${sb_hop_range}\"\n    ],\n    \"hop_interval\": \"30s\""
     fi
 
+    local j_domain j_password j_obfs
+    j_domain=$(json_escape "$domain")
+    j_password=$(json_escape "$password")
+    j_obfs=$(json_escape "$obfs_pwd")
     echo -e "  ${C_CYAN}{"
     echo -e "    \"type\": \"hysteria2\","
     echo -e "    \"tag\": \"hy2-out\","
-    echo -e "    \"server\": \"${domain}\","
+    echo -e "    \"server\": \"${j_domain}\","
     echo -e "    \"server_port\": ${base_port}${sb_ports},"
-    echo -e "    \"password\": \"${password}\","
+    echo -e "    \"password\": \"${j_password}\","
     if [[ -n "$obfs_pwd" ]]; then
         echo -e "    \"obfs\": {"
         echo -e "      \"type\": \"salamander\","
-        echo -e "      \"password\": \"${obfs_pwd}\""
+        echo -e "      \"password\": \"${j_obfs}\""
         echo -e "    },"
     fi
     echo -e "    \"tls\": {"
     echo -e "      \"enabled\": true,"
-    echo -e "      \"server_name\": \"${domain}\","
+    echo -e "      \"server_name\": \"${j_domain}\","
     echo -e "      \"insecure\": false${sb_tls_pin}"
     echo -e "    }"
     echo -e "  }${C_RESET}\n"
@@ -511,15 +579,32 @@ remove_ufw_rule() {
             ufw --force delete "$number" >/dev/null 2>&1 || return 1
         done
     else
-        # UFW 停用时，show added 仍可读取持久规则；仅接受本项目原样新增的条目。
+        # UFW 停用时，show added 仍可读取持久规则；同时兼容旧格式与带 proto/from 的规则格式。
         rules=$(LC_ALL=C ufw show added 2>/dev/null) || return 1
-        local owned="ufw allow ${rule} comment 'buds-hy2'"
-        if echo "$rules" | grep -Fxq "$owned"; then
-            if echo "$rules" | awk -v prefix="ufw allow ${rule}" -v owned="$owned" '
-                index($0,prefix)==1 && $0!=owned {found=1} END {exit !found}'; then
-                return 1
-            fi
+        local port="${rule%/*}" proto="${rule#*/}"
+        local owned_simple="ufw allow ${rule} comment 'buds-hy2'"
+        local owned_v4="ufw allow in proto ${proto} from 0.0.0.0/0 to any port ${port} comment 'buds-hy2'"
+        local owned_v6="ufw allow in proto ${proto} from ::/0 to any port ${port} comment 'buds-hy2'"
+        local has_other=false
+        if echo "$rules" | awk -v rule="$rule" -v port="$port" -v proto="$proto" -v tag="comment 'buds-hy2'" '
+            /^ufw allow / {
+                is_target = ($0 ~ "^ufw allow " rule "([[:space:]]|$)" || ($0 ~ "proto " proto " " && $0 ~ "to any port " port "([[:space:]]|$)"))
+                if (is_target && (length($0) < length(tag) || substr($0, length($0)-length(tag)+1) != tag)) {found=1}
+            }
+            END {exit !found}'; then
+            has_other=true
+        fi
+        if echo "$rules" | grep -Fxq "$owned_simple"; then
+            [[ "$has_other" == false ]] || return 1
             ufw --force delete allow "$rule" comment buds-hy2 >/dev/null 2>&1 || return 1
+        fi
+        if [[ "$family" != 6 ]] && echo "$rules" | grep -Fxq "$owned_v4"; then
+            [[ "$has_other" == false ]] || return 1
+            ufw --force delete allow in proto "$proto" from 0.0.0.0/0 to any port "$port" comment buds-hy2 >/dev/null 2>&1 || return 1
+        fi
+        if [[ "$family" != 4 ]] && echo "$rules" | grep -Fxq "$owned_v6"; then
+            [[ "$has_other" == false ]] || return 1
+            ufw --force delete allow in proto "$proto" from ::/0 to any port "$port" comment buds-hy2 >/dev/null 2>&1 || return 1
         fi
     fi
 }
@@ -616,13 +701,17 @@ cleanup_renewal() {
             printf '%s\n' "$contents" | sed '/# buds-hy2-renew$/d' | crontab -
         fi
     fi
+    if [[ -f /etc/periodic/daily/certbot-renew ]] &&
+       grep -q '^# buds-hy2-renew$' /etc/periodic/daily/certbot-renew; then
+        rm -f /etc/periodic/daily/certbot-renew
+    fi
 }
 
 uninstall() {
     echo -e "\n  ${C_RED}⚠ 警告: 即将卸载 Hysteria 2 服务！${C_RESET}"
     read -rp "  确认彻底卸载吗？(y/N): " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        cleanup_renewal
+        cleanup_renewal || echo "  警告: 续签任务清理未完全成功，请稍后检查。" >&2
         if has_systemd; then
             systemctl disable --now hysteria-server 2>/dev/null || true
             rm -rf /etc/systemd/system/hysteria-server.service.d
@@ -636,17 +725,18 @@ uninstall() {
         fi
         pkill -fx "$PROCESS_PATTERN" 2>/dev/null || true
 
-        cleanup_firewall
+        if ! cleanup_firewall; then
+            echo "  卸载已停止：防火墙规则未能安全清理，节点配置和规则记录均已保留，请处理后重试。" >&2
+            return 1
+        fi
         if [[ -f /etc/rc.local ]]; then
             sed -i '\|^/usr/local/bin/hysteria-service start$|d' /etc/rc.local
         fi
         rm -f /usr/local/bin/hysteria /usr/local/bin/buds /usr/local/bin/hy2 /usr/local/bin/hysteria-service
-        rm -rf /etc/hysteria /var/log/hysteria.log
-        rm -f /tmp/.buds_hy2_ver_cache
+        rm -rf /etc/hysteria /var/log/hysteria.log /etc/logrotate.d/hysteria
         rm -f /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh
-        rm -f /etc/periodic/daily/certbot-renew
         rm -f /etc/sysctl.d/99-hysteria-performance.conf
-        echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务及防火墙规则已安全卸载，原有 Nginx 及网站保持原样。${C_RESET}\n"
+        echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已卸载，本项目创建的防火墙规则已清理，原有 Nginx 及其他系统服务未作修改。${C_RESET}\n"
     else
         echo -e "\n  已取消卸载。\n"
     fi
@@ -683,13 +773,13 @@ is_version_newer() {
 check_remote_version() {
     local force="${1:-false}"
     local cache_file now cache_time remote_ver
-    cache_file="${VERSION_CACHE_FILE}"
-    if [[ ! -d "${CONFIG_DIR}" ]]; then
-        cache_file="/tmp/.buds_hy2_ver_cache"
+    cache_file=""
+    if [[ -d "${CONFIG_DIR}" ]]; then
+        cache_file="${VERSION_CACHE_FILE}"
     fi
     now=$(date +%s 2>/dev/null || echo 0)
 
-    if [[ "$force" != "true" && -f "$cache_file" ]]; then
+    if [[ "$force" != "true" && -n "$cache_file" && -f "$cache_file" ]]; then
         cache_time=$(cut -d':' -f1 "$cache_file" 2>/dev/null || echo 0)
         remote_ver=$(cut -d':' -f2 "$cache_file" 2>/dev/null || true)
         if [[ -n "$remote_ver" && "$cache_time" =~ ^[0-9]+$ ]] && (( now - cache_time < 1800 )); then
@@ -702,9 +792,9 @@ check_remote_version() {
     local url
     for url in "${UPDATE_URL_PRIMARY}?v=${now}" "${UPDATE_URL_MIRROR}?v=${now}"; do
         if command -v curl >/dev/null 2>&1; then
-            fetched=$(curl -sSfL --connect-timeout 2 --max-time 4 "$url" 2>/dev/null | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2 || true)
+            fetched=$(curl -sSfL --proto '=https' --proto-redir '=https' --connect-timeout 2 --max-time 4 "$url" 2>/dev/null | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2 || true)
         elif command -v wget >/dev/null 2>&1; then
-            fetched=$(wget -qO- --timeout=3 -t 1 "$url" 2>/dev/null | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2 || true)
+            fetched=$(wget -qO- --https-only --timeout=3 -t 1 "$url" 2>/dev/null | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2 || true)
         fi
         if [[ -n "$fetched" ]]; then
             break
@@ -712,7 +802,9 @@ check_remote_version() {
     done
 
     if [[ -n "$fetched" ]]; then
-        echo "${now}:${fetched}" > "$cache_file" 2>/dev/null || true
+        if [[ -n "$cache_file" ]]; then
+            (umask 077; echo "${now}:${fetched}" > "$cache_file") 2>/dev/null || true
+        fi
         echo "$fetched"
     else
         echo "$SCRIPT_VERSION"
@@ -734,8 +826,11 @@ update_script() {
 
     echo -e "  发现新版本: ${C_SPARK}v${remote_ver}${C_RESET}"
     local target_cli="${BUDS_CLI:-/usr/local/bin/buds}"
+    local target_dir
+    target_dir="$(dirname "$target_cli")"
+    mkdir -p "$target_dir" || { echo "无法访问脚本目录：$target_dir" >&2; return 1; }
     local tmp_file
-    tmp_file=$(mktemp "/tmp/buds_update.XXXXXX" 2>/dev/null || echo "/tmp/buds_update.$$")
+    tmp_file=$(mktemp "${target_dir}/.buds_update.XXXXXX") || return 1
 
     echo -ne "  正在下载最新脚本..."
     local downloaded=false
@@ -744,12 +839,12 @@ update_script() {
     now=$(date +%s 2>/dev/null || echo 0)
     for url in "${UPDATE_URL_PRIMARY}?v=${now}" "${UPDATE_URL_MIRROR}?v=${now}"; do
         if command -v curl >/dev/null 2>&1; then
-            if curl -sSfL --connect-timeout 5 --max-time 15 "$url" -o "$tmp_file" 2>/dev/null; then
+            if curl -sSfL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 15 "$url" -o "$tmp_file" 2>/dev/null; then
                 downloaded=true
                 break
             fi
         elif command -v wget >/dev/null 2>&1; then
-            if wget -qO "$tmp_file" --timeout=10 -t 2 "$url" 2>/dev/null; then
+            if wget -qO "$tmp_file" --https-only --timeout=10 -t 2 "$url" 2>/dev/null; then
                 downloaded=true
                 break
             fi
@@ -764,8 +859,16 @@ update_script() {
     fi
     echo -e " ${C_GREEN}完成${C_RESET}"
 
+    local downloaded_ver
+    downloaded_ver=$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)"$/\1/p' "$tmp_file" | head -n 1)
+    if [[ -z "$downloaded_ver" || "$downloaded_ver" != "$remote_ver" ]]; then
+        rm -f "$tmp_file"
+        echo -e "\n  ${C_RED}✖ 下载脚本版本不匹配，已保留现有脚本。${C_RESET}\n"
+        return 1
+    fi
+
     # 校验下载脚本有效性 (必须为 shell 脚本且能通过语法解析)
-    if ! head -n 1 "$tmp_file" | grep -q '^#!/'; then
+    if ! head -n 1 "$tmp_file" | grep -q '^#!/usr/bin/env bash$'; then
         rm -f "$tmp_file"
         echo -e "\n  ${C_RED}✖ 下载的文件不是有效的 shell 脚本，更新已终止。${C_RESET}\n"
         return 1
@@ -779,12 +882,16 @@ update_script() {
         fi
     fi
 
-    mkdir -p "$(dirname "$target_cli")" 2>/dev/null || true
     chmod 755 "$tmp_file"
-    cp -f "$tmp_file" "$target_cli"
-    rm -f "$tmp_file"
-    ln -sf "$target_cli" "${HY2_CLI:-/usr/local/bin/hy2}" 2>/dev/null || true
-    rm -f "${VERSION_CACHE_FILE}" "/tmp/.buds_hy2_ver_cache" 2>/dev/null || true
+    if ! mv -f "$tmp_file" "$target_cli"; then
+        rm -f "$tmp_file"
+        echo -e "\n  ${C_RED}✖ 无法替换管理脚本，现有脚本保持不变。${C_RESET}\n"
+        return 1
+    fi
+    if ! ln -sf "$target_cli" "${HY2_CLI:-/usr/local/bin/hy2}"; then
+        echo -e "  ${C_AMBER}⚠ 主脚本已更新，但 hy2 快捷链接创建失败，可继续使用 buds 命令。${C_RESET}" >&2
+    fi
+    rm -f "${VERSION_CACHE_FILE}" 2>/dev/null || true
 
     echo -e "\n  ${C_BAR}  ${C_GREEN}✔ 脚本已成功更新至 v${remote_ver}！${C_RESET}\n"
 }
@@ -860,22 +967,25 @@ show_menu() {
 
         read -rp "$(echo -e "  ${C_ORANGE_BOLD}❯${C_RESET} ${C_WHITE}请选择操作编号 [0-10]: ${C_RESET}")" choice
         case "$choice" in
-            1) status; read -rp "按回车键返回主菜单..." ;;
-            2) link; read -rp "按回车键返回主菜单..." ;;
-            3) client; read -rp "按回车键返回主菜单..." ;;
-            4) log ;;
-            5) restart; read -rp "按回车键返回主菜单..." ;;
-            6) start; read -rp "按回车键返回主菜单..." ;;
-            7) stop; read -rp "按回车键返回主菜单..." ;;
+            1) status || true; read -rp "按回车键返回主菜单..." ;;
+            2) link || true; read -rp "按回车键返回主菜单..." ;;
+            3) client || true; read -rp "按回车键返回主菜单..." ;;
+            4) log || true ;;
+            5) restart || echo -e "  ${C_RED}✖ 重启服务失败，请检查状态或日志。${C_RESET}"; read -rp "按回车键返回主菜单..." ;;
+            6) start || echo -e "  ${C_RED}✖ 启动服务失败，请检查状态或日志。${C_RESET}"; read -rp "按回车键返回主菜单..." ;;
+            7) stop || echo -e "  ${C_RED}✖ 停止服务失败，请检查进程状态。${C_RESET}"; read -rp "按回车键返回主菜单..." ;;
             8|[uU]|update)
-                update_script
-                read -rp "按回车键重新加载主菜单..."
-                if [[ -x "${BUDS_CLI:-/usr/local/bin/buds}" ]]; then
-                    exec "${BUDS_CLI:-/usr/local/bin/buds}" hy2
+                if update_script; then
+                    read -rp "按回车键重新加载主菜单..."
+                    if [[ -x "${BUDS_CLI:-/usr/local/bin/buds}" ]]; then
+                        exec "${BUDS_CLI:-/usr/local/bin/buds}" hy2
+                    fi
+                else
+                    read -rp "按回车键返回主菜单..."
                 fi
                 ;;
-            9) renew_test; read -rp "按回车键返回主菜单..." ;;
-            10) uninstall; break ;;
+            9) renew_test || echo -e "  ${C_RED}✖ 证书续签模拟失败，请检查日志。${C_RESET}"; read -rp "按回车键返回主菜单..." ;;
+            10) uninstall || true; break ;;
             0) exit 0 ;;
             *) echo "输入无效，请重新选择。" ;;
         esac

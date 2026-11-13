@@ -161,9 +161,45 @@ detect_init_system
         self.assertIn("ExecStart=", unit)
         self.assertIn("hysteria server --config", unit)
         self.assertIn("WantedBy=multi-user.target", unit)
-        self.assertIn("AmbientCapabilities=CAP_NET_ADMIN", unit)
+        self.assertIn("AmbientCapabilities=CAP_NET_BIND_SERVICE", unit)
+        self.assertNotIn("CAP_NET_ADMIN", unit)
         self.assertTrue((self.directory / "etc/systemd/system/hysteria-server.service.d/override.conf").exists())
         self.assertIn("systemctl daemon-reload", self.actions())
+
+    def test_port_hopping_retains_required_net_admin_capability(self):
+        self.shell("INIT_SYSTEM=systemd; IS_PORT_HOPPING=true\nconfigure_service\n", "install.sh")
+        unit = (self.directory / "etc/systemd/system/hysteria-server.service").read_text()
+        self.assertIn("CapabilityBoundingSet=CAP_NET_BIND_SERVICE,CAP_NET_ADMIN", unit)
+        self.assertIn("AmbientCapabilities=CAP_NET_BIND_SERVICE,CAP_NET_ADMIN", unit)
+        self.assertNotIn("CAP_NET_RAW", unit)
+        self.shell("""
+INIT_SYSTEM=openrc; IS_PORT_HOPPING=true
+mkdir -p "$SANDBOX/etc/init.d"
+setcap() { return 1; }
+configure_service
+""", "install.sh")
+        unit = (self.directory / "etc/init.d/hysteria-server").read_text()
+        self.assertIn('command_user="root:root"', unit)
+        self.assertNotIn("cap_net_admin", unit)
+
+    def test_openrc_capability_and_user_fallback(self):
+        self.shell('id() { return 0; }; command() { if [[ "$1" == -v && "$2" == setcap ]]; then return 0; fi; builtin command "$@"; }\nmkdir -p "$SANDBOX/etc/init.d" "$SANDBOX/usr/local/bin"; touch "$SANDBOX/usr/local/bin/hysteria"\nINIT_SYSTEM=openrc; IS_PORT_HOPPING=true\nconfigure_service\n', "install.sh")
+        unit = (self.directory / "etc/init.d/hysteria-server").read_text()
+        self.assertIn('command_user="hysteria:hysteria"', unit)
+        self.assertIn("cap_net_admin", unit)
+        self.assertNotIn("cap_net_raw", unit)
+
+    def test_openrc_missing_user_uses_root_fallback(self):
+        self.shell('id() { return 1; }\nmkdir -p "$SANDBOX/etc/init.d" "$SANDBOX/usr/local/bin"; touch "$SANDBOX/usr/local/bin/hysteria"\nINIT_SYSTEM=openrc; IS_PORT_HOPPING=true\nconfigure_service\n', "install.sh")
+        unit = (self.directory / "etc/init.d/hysteria-server").read_text()
+        self.assertIn('command_user="root:root"', unit)
+        self.assertNotIn("cap_net_admin", unit)
+
+    def test_start_service_reloads_new_configuration(self):
+        self.shell("INIT_SYSTEM=systemd\nstart_service\n", "install.sh")
+        actions = self.actions()
+        self.assertIn("systemctl enable hysteria-server", actions)
+        self.assertIn("systemctl restart hysteria-server", actions)
 
     def test_no_init_container_gets_lightweight_runner(self):
         self.shell('mkdir -p "$SANDBOX/usr/local/bin"\nINIT_SYSTEM=other\nconfigure_service\n', "install.sh")
@@ -701,7 +737,7 @@ curl() { echo "CURL_CALLED" >> "$ACTION_FILE"; return 1; }
 wget() { echo "WGET_CALLED" >> "$ACTION_FILE"; return 1; }
 check_remote_version
 """)
-        self.assertEqual(out.strip(), "1.2.0")
+        self.assertEqual(out.strip(), "1.3.0")
         self.assertIn("CURL_CALLED", self.actions())
 
     def test_update_script_success_and_syntax_guard(self):
@@ -711,8 +747,8 @@ check_remote_version
 
         # Guard: syntax error rejected
         out = self.shell(f"""
-check_remote_version() {{ echo "1.3.0"; }}
-curl() {{ local out="${{!#}}"; printf "#!/usr/bin/env bash\\nif then invalid syntax\\n" > "$out"; }}
+check_remote_version() {{ echo "1.4.0"; }}
+curl() {{ local out="${{!#}}"; printf "#!/usr/bin/env bash\\nSCRIPT_VERSION=\\\"1.4.0\\\"\\nif then invalid syntax\\n" > "$out"; }}
 BUDS_CLI="{target_cli.as_posix()}"
 update_script
 """, expected=1)
@@ -721,14 +757,131 @@ update_script
 
         # Success: valid script downloaded and atomically applied
         out = self.shell(f"""
-check_remote_version() {{ echo "1.3.0"; }}
-curl() {{ local out="${{!#}}"; printf "#!/usr/bin/env bash\\necho updated-to-1.3.0\\n" > "$out"; }}
+check_remote_version() {{ echo "1.4.0"; }}
+curl() {{ local out="${{!#}}"; printf "#!/usr/bin/env bash\\nSCRIPT_VERSION=\\\"1.4.0\\\"\\necho updated-to-1.4.0\\n" > "$out"; }}
 BUDS_CLI="{target_cli.as_posix()}"
 update_script
 """)
-        self.assertIn("脚本已成功更新至 v1.3.0", out)
-        self.assertIn("updated-to-1.3.0", target_cli.read_text())
+        self.assertIn("脚本已成功更新至 v1.4.0", out)
+        self.assertIn("updated-to-1.4.0", target_cli.read_text())
 
+
+
+    def test_disabled_ufw_matches_proto_from_format(self):
+        self.journal("ufw|4|runtime|24443/udp\n")
+        self.shell("""
+ufw() {
+ if [[ "$1" == status ]]; then echo 'Status: inactive'
+ elif [[ "$1" == show ]]; then echo "ufw allow in proto udp from 0.0.0.0/0 to any port 24443 comment 'buds-hy2'"
+ else echo "ufw $*" >> "$ACTION_FILE"; fi
+}
+cleanup_firewall
+""")
+        self.assertEqual(
+            self.actions().strip(),
+            "ufw --force delete allow in proto udp from 0.0.0.0/0 to any port 24443 comment buds-hy2",
+        )
+        self.assertFalse((self.config / ".firewall_rule").exists())
+
+    def test_uninstall_preserves_external_periodic_certbot_and_removes_logrotate(self):
+        self.node_config()
+        periodic = self.directory / "etc/periodic/daily/certbot-renew"
+        periodic.parent.mkdir(parents=True)
+        periodic.write_text("#!/bin/sh\ncertbot renew\n", encoding="utf-8")
+        logrotate = self.directory / "etc/logrotate.d/hysteria"
+        logrotate.parent.mkdir(parents=True)
+        logrotate.write_text("/var/log/hysteria.log {}\n", encoding="utf-8")
+        self.shell("uninstall <<<'y'\n")
+        self.assertTrue(periodic.exists())
+        self.assertFalse(logrotate.exists())
+
+    def test_get_listen_and_url_encoding_with_special_chars(self):
+        self.certificates()
+        (self.config / "config.yaml").write_text(
+            'listen: 0.0.0.0:8443\nauth:\n  type: password\n  password: "p@ss#1&2"\n'
+            'obfs:\n  type: salamander\n  salamander:\n    password: "obf$1+2"\n'
+            'masquerade:\n  type: proxy\n  proxy:\n    url: https://example.org/\n',
+            encoding="utf-8",
+        )
+        (self.config / "client.yaml").write_text(
+            'server: [2001:db8::1]:8443\ntls:\n  sni: node.example.com\n',
+            encoding="utf-8",
+        )
+        out = self.shell("get_listen\nget_public_ports\nlink\n")
+        self.assertIn("8443", out)
+        self.assertIn("p%40ss%231%262@", out)
+        self.assertIn("obfs-password=obf%241%2B2", out)
+        self.assertIn("https://example.org/", out)
+
+    def test_uninstall_failure_preserves_recovery_metadata(self):
+        self.node_config()
+        self.journal("ufw|-|runtime|24443/udp\n")
+        (self.config / ".public_port").write_text("19957\n")
+        out = self.shell("""
+crontab() { return 1; }
+ufw() { return 1; }
+uninstall <<<'y'
+""", expected=1)
+        self.assertTrue(self.config.exists())
+        self.assertTrue((self.config / ".firewall_rule").exists())
+        self.assertNotIn("服务及防火墙规则已安全卸载", out)
+
+    def test_uninstall_removes_owned_periodic_job_only(self):
+        self.node_config()
+        periodic = self.directory / "etc/periodic/daily/certbot-renew"
+        periodic.parent.mkdir(parents=True)
+        periodic.write_text("#!/bin/sh\n# buds-hy2-renew\ncertbot renew\n", encoding="utf-8")
+        self.shell("uninstall <<<'y'\n")
+        self.assertFalse(periodic.exists())
+
+    def test_certificate_hook_escapes_domain_and_waits_for_old_process(self):
+        (self.directory / "etc/letsencrypt/live/node.example.com").mkdir(parents=True)
+        for name in ("fullchain.pem", "privkey.pem"):
+            (self.directory / "etc/letsencrypt/live/node.example.com" / name).write_text("certificate")
+        # Extract the deployment hook from setup_certificates without issuing a certificate.
+        body = self.sources["install.sh"].split("    {\n        printf '#!/usr/bin/env bash", 1)[1]
+        body = body.split("    } > \"$HOOK_FILE\"", 1)[0]
+        hook_script = "    {\n        printf '#!/usr/bin/env bash" + body + '    } > "$HOOK_FILE"\n'
+        self.shell('mkdir -p "$HOOK_DIR"\nDOMAIN=node.example.com\n' + hook_script, "install.sh")
+        hook = self.directory / "etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh"
+        self.assertIn("DOMAIN=node.example.com", hook.read_text())
+        out = self.shell(f"""
+command() {{ if [[ "$1" == -v && "$2" =~ ^(systemctl|rc-service|rc-update|openrc-run)$ ]]; then return 1; fi; builtin command "$@"; }}
+pgrep() {{ return 0; }}
+pkill() {{ return 0; }}
+nohup() {{ echo UNEXPECTED_RESTART >> "$ACTION_FILE"; }}
+export -f pgrep pkill nohup command
+export SANDBOX ACTION_FILE
+bash {hook.as_posix()}
+""", expected=1)
+        self.assertNotIn("UNEXPECTED_RESTART", self.actions())
+
+    def test_update_rejects_version_mismatch_and_preserves_current_script(self):
+        target_cli = self.directory / "usr/local/bin/buds"
+        target_cli.parent.mkdir(parents=True, exist_ok=True)
+        target_cli.write_text("existing-script\n", encoding="utf-8")
+        out = self.shell(f"""
+check_remote_version() {{ echo "1.4.0"; }}
+curl() {{ local out="${{!#}}"; printf '#!/usr/bin/env bash\\nSCRIPT_VERSION="9.9.9"\\n' > "$out"; }}
+BUDS_CLI="{target_cli.as_posix()}"
+update_script
+""", expected=1)
+        self.assertIn("版本不匹配", out)
+        self.assertEqual(target_cli.read_text(), "existing-script\n")
+
+    def test_range_port_check_is_awk_compatible(self):
+        output = self.shell("""
+ss() { printf 'UNCONN 0 0 0.0.0.0:20005 0.0.0.0:* users:(("other",pid=1,fd=1))\\n'; }
+validate_domain() { :; }; generate_random_port() { echo 24443; }
+generate_random_string() { echo random; }
+IS_NAT=false; IS_CONTAINER=false
+collect_parameters <<'INPUT'
+node.example.com
+20000-20010
+INPUT
+[[ "$LISTEN_STR" == :20000-20010 ]]
+""", "install.sh")
+        self.assertIn("20005", output)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
