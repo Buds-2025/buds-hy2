@@ -932,7 +932,7 @@ EOF
             openrc_user="hysteria"
             openrc_group="hysteria"
             if [[ "$IS_PORT_HOPPING" == true ]]; then
-                supervise_help=$(supervise-daemon --help 2>&1 || true)
+                supervise_help=$(RC_SVCNAME=hysteria-server supervise-daemon hysteria-server --help 2>&1 || true)
                 if [[ "$supervise_help" == *--capabilities* ]]; then
                     openrc_caps="^cap_net_admin"
                 else

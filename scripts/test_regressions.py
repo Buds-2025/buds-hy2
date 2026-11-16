@@ -203,7 +203,10 @@ configure_service
         self.shell("""
 id() { return 0; }
 service_group_exists() { return 0; }
-supervise-daemon() { printf '%s\\n' '--capabilities'; return 1; }
+supervise-daemon() {
+    [[ "$RC_SVCNAME" == hysteria-server && "$*" == 'hysteria-server --help' ]] || return 1
+    printf '%s\\n' '--capabilities'
+}
 mkdir -p "$SANDBOX/etc/init.d" "$SANDBOX/usr/local/bin"
 touch "$SANDBOX/usr/local/bin/hysteria"
 INIT_SYSTEM=openrc; IS_PORT_HOPPING=true
