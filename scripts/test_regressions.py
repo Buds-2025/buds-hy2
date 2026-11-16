@@ -191,6 +191,7 @@ detect_init_system
 INIT_SYSTEM=openrc; IS_PORT_HOPPING=true
 mkdir -p "$SANDBOX/etc/init.d"
 id() { return 0; }
+service_group_exists() { return 0; }
 supervise-daemon() { return 1; }
 configure_service
 """, "install.sh")
@@ -201,6 +202,7 @@ configure_service
     def test_openrc_capability_is_set_on_service(self):
         self.shell("""
 id() { return 0; }
+service_group_exists() { return 0; }
 supervise-daemon() { printf '%s\\n' '--capabilities'; return 1; }
 mkdir -p "$SANDBOX/etc/init.d" "$SANDBOX/usr/local/bin"
 touch "$SANDBOX/usr/local/bin/hysteria"
@@ -216,6 +218,7 @@ configure_service
     def test_openrc_single_port_omits_capability_option(self):
         self.shell("""
 id() { return 0; }
+service_group_exists() { return 0; }
 mkdir -p "$SANDBOX/etc/init.d"
 INIT_SYSTEM=openrc; IS_PORT_HOPPING=false
 configure_service
@@ -229,6 +232,23 @@ configure_service
         unit = (self.directory / "etc/init.d/hysteria-server").read_text(encoding="utf-8")
         self.assertIn('command_user="root:root"', unit)
         self.assertNotIn("cap_net_admin", unit)
+
+    def test_busybox_creates_dedicated_service_group_before_user(self):
+        self.shell("""
+service_group_exists() { return 1; }
+id() { return 1; }
+command() {
+    if [[ "$1" == -v && "$2" =~ ^(groupadd|useradd)$ ]]; then return 1; fi
+    builtin command "$@"
+}
+addgroup() { echo "addgroup $*" >> "$ACTION_FILE"; }
+adduser() { echo "adduser $*" >> "$ACTION_FILE"; }
+ensure_service_account
+""", "install.sh")
+        self.assertEqual(self.actions().splitlines(), [
+            "addgroup -S hysteria",
+            "adduser -S -D -H -G hysteria -s /sbin/nologin hysteria",
+        ])
 
     def test_start_service_reloads_new_configuration(self):
         self.shell("INIT_SYSTEM=systemd\nstart_service\n", "install.sh")

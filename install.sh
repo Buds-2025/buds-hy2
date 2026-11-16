@@ -778,6 +778,32 @@ install_official_core() (
     success "官方内核 ${version#app/} 安装完成，SHA-256 校验通过。"
 )
 
+service_group_exists() {
+    if command -v getent >/dev/null 2>&1; then
+        getent group hysteria >/dev/null 2>&1
+    else
+        grep -q '^hysteria:' /etc/group
+    fi
+}
+
+ensure_service_account() {
+    if ! service_group_exists; then
+        if command -v groupadd >/dev/null 2>&1; then
+            groupadd -r hysteria || return 1
+        else
+            addgroup -S hysteria || return 1
+        fi
+    fi
+    if id hysteria >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v useradd >/dev/null 2>&1; then
+        useradd -r -M -g hysteria -s /sbin/nologin hysteria
+    else
+        adduser -S -D -H -G hysteria -s /sbin/nologin hysteria
+    fi
+}
+
 generate_server_config() {
     info "写入服务端安全加固与极致性能配置..."
     cat <<EOF > "$CONFIG_FILE"
@@ -809,16 +835,7 @@ masquerade:
     rewriteHost: true
 EOF
 
-    # 确保 hysteria 服务专属用户存在
-    if ! id hysteria >/dev/null 2>&1; then
-        if command -v useradd >/dev/null 2>&1; then
-            useradd -r -s /sbin/nologin hysteria >/dev/null 2>&1 || true
-        elif command -v adduser >/dev/null 2>&1; then
-            adduser -S -D -H -s /sbin/nologin hysteria >/dev/null 2>&1 || true
-        fi
-    fi
-
-    if id hysteria >/dev/null 2>&1; then
+    if ensure_service_account; then
         chown -R root:hysteria "$CONFIG_DIR" 2>/dev/null || true
         chmod 750 "$CONFIG_DIR"
         chmod 640 "$CONFIG_FILE"
@@ -879,7 +896,7 @@ configure_service() {
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
         mkdir -p "$(dirname "$SERVICE_FILE")" "$OVERRIDE_DIR"
         local service_user="root"
-        if id hysteria >/dev/null 2>&1; then
+        if id hysteria >/dev/null 2>&1 && service_group_exists; then
             service_user="hysteria"
         fi
         cat <<EOF > "$SERVICE_FILE"
@@ -911,7 +928,7 @@ EOF
         success "systemd 自动重启与并发限制配置生效 (崩溃 3 秒自愈 + 104 万描述符)。"
     elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
         local openrc_user="root" openrc_group="root" openrc_caps="" supervise_help
-        if id hysteria >/dev/null 2>&1; then
+        if id hysteria >/dev/null 2>&1 && service_group_exists; then
             openrc_user="hysteria"
             openrc_group="hysteria"
             if [[ "$IS_PORT_HOPPING" == true ]]; then
