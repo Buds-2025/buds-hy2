@@ -6,16 +6,8 @@ root = Path(__file__).resolve().parents[1]
 installer = root / "install.sh"
 text = installer.read_text(encoding="utf-8")
 
-start_marker = '        cat <<\'EOF\' > "$BUDS_CLI"\n'
-end_marker = "\nEOF\n    fi\n"
-
-if start_marker not in text or end_marker not in text:
-    # Try legacy format if not yet adapted
-    legacy_start = '    cat <<\'EOF\' > "$BUDS_CLI"\n'
-    legacy_end = "\nEOF\n    chmod +x \"$BUDS_CLI\"\n"
-    if legacy_start in text and legacy_end in text:
-        start_marker = legacy_start
-        end_marker = legacy_end
+start_marker = '    cat <<\'BUDS_CLI_EOF\' > "$BUDS_CLI"\n'
+end_marker = "\nBUDS_CLI_EOF\n"
 
 start = text.index(start_marker) + len(start_marker)
 end = text.index(end_marker, start)

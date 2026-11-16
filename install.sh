@@ -16,7 +16,7 @@ OVERRIDE_DIR="/etc/systemd/system/hysteria-server.service.d"
 OVERRIDE_FILE="${OVERRIDE_DIR}/override.conf"
 SERVICE_FILE="/etc/systemd/system/hysteria-server.service"
 SYSCTL_FILE="/etc/sysctl.d/99-hysteria-performance.conf"
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 
@@ -870,27 +870,11 @@ EOF
 configure_service() {
     info "设置服务守护进程与高可用自愈..."
     
-    local capabilities="" setcap_failed=false
+    local service_caps="CAP_NET_BIND_SERVICE"
     if [[ "$IS_PORT_HOPPING" == true ]]; then
         # Hysteria 原生端口范围通过 nftables/iptables 重定向，需要网络管理权限。
-        capabilities=",cap_net_admin"
+        service_caps+=" CAP_NET_ADMIN"
     fi
-    if command -v setcap >/dev/null 2>&1 && [[ -f /usr/local/bin/hysteria ]]; then
-        if ! setcap "cap_net_bind_service${capabilities}=+ep" /usr/local/bin/hysteria >/dev/null 2>&1; then
-            setcap_failed=true
-        fi
-    else
-        setcap_failed=true
-    fi
-    if [[ "$setcap_failed" == true ]]; then
-        if [[ "$IS_PORT_HOPPING" == true ]]; then
-            warn "无法附加 CAP_NET_ADMIN，systemd 通过 AmbientCapabilities 提供权限，OpenRC 回退 root 运行。"
-        else
-            warn "无法附加低端口绑定能力；当前使用 1024 以上端口，不受影响。"
-        fi
-    fi
-    local service_caps="${capabilities#,}"
-    [[ -z "$service_caps" ]] || service_caps="CAP_NET_BIND_SERVICE,${service_caps^^}"
 
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
         mkdir -p "$(dirname "$SERVICE_FILE")" "$OVERRIDE_DIR"
@@ -909,8 +893,8 @@ ExecStart=/usr/local/bin/hysteria server --config ${CONFIG_FILE}
 WorkingDirectory=${CONFIG_DIR}
 User=${service_user}
 Group=${service_user}
-CapabilityBoundingSet=${service_caps:-CAP_NET_BIND_SERVICE}
-AmbientCapabilities=${service_caps:-CAP_NET_BIND_SERVICE}
+CapabilityBoundingSet=${service_caps}
+AmbientCapabilities=${service_caps}
 NoNewPrivileges=true
 
 [Install]
@@ -926,13 +910,19 @@ EOF
         systemctl daemon-reload
         success "systemd 自动重启与并发限制配置生效 (崩溃 3 秒自愈 + 104 万描述符)。"
     elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
-        local openrc_user="root" openrc_group="root" openrc_caps=""
-        if [[ "$setcap_failed" != true ]] && id hysteria >/dev/null 2>&1; then
+        local openrc_user="root" openrc_group="root" openrc_caps="" supervise_help
+        if id hysteria >/dev/null 2>&1; then
             openrc_user="hysteria"
             openrc_group="hysteria"
-            openrc_caps="^cap_net_bind_service"
             if [[ "$IS_PORT_HOPPING" == true ]]; then
-                openrc_caps+=",^cap_net_admin"
+                supervise_help=$(supervise-daemon --help 2>&1 || true)
+                if [[ "$supervise_help" == *--capabilities* ]]; then
+                    openrc_caps="^cap_net_admin"
+                else
+                    warn "当前 OpenRC 无法为服务进程设置 CAP_NET_ADMIN，端口跳跃服务将以 root 运行。"
+                    openrc_user="root"
+                    openrc_group="root"
+                fi
             fi
         fi
         {
@@ -955,7 +945,9 @@ depend() {
 }
 INIT_EOF
             printf 'command_user="%s:%s"\n' "$openrc_user" "$openrc_group"
-            printf 'capabilities="%s"\n' "$openrc_caps"
+            if [[ -n "$openrc_caps" ]]; then
+                printf 'capabilities="%s"\n' "$openrc_caps"
+            fi
             cat <<INIT_EOF
 
 start_pre() {
@@ -1201,23 +1193,18 @@ EOF
     chmod 600 "$CLIENT_CONFIG_FILE"
 
     # 生成极客优雅的全局管理命令 /usr/local/bin/buds
-    local script_dir
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
-    if [[ -f "${script_dir}/buds" ]]; then
-        cp -f "${script_dir}/buds" "$BUDS_CLI"
-    else
-        cat <<'EOF' > "$BUDS_CLI"
+    cat <<'BUDS_CLI_EOF' > "$BUDS_CLI"
 #!/usr/bin/env bash
 set -e
 
 CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
-UPDATE_URL_PRIMARY="https://raw.githubusercontent.com/Buds-2025/buds-hy2/main/buds"
-UPDATE_URL_MIRROR="https://fastly.jsdelivr.net/gh/Buds-2025/buds-hy2@main/buds"
+UPDATE_RELEASE_URL="https://github.com/Buds-2025/buds-hy2/releases"
+UPDATE_PUBLIC_KEY="/etc/buds-hy2/update.pub"
 VERSION_CACHE_FILE="${CONFIG_DIR}/.version_cache"
 PROCESS_PATTERN='/usr/local/bin/hysteria server (-c|--config) /etc/hysteria/config[.]yaml'
 
@@ -1434,7 +1421,8 @@ get_cert_pin() {
     printf '%s\n' "$pin"
 }
 
-get_spki_pin() {
+get_spki_pin() (
+    set -o pipefail
     [[ -f "${CONFIG_DIR}/server.crt" ]] || return 1
     local spki
     spki=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -pubkey -noout 2>/dev/null |
@@ -1443,7 +1431,7 @@ get_spki_pin() {
         openssl enc -base64 2>/dev/null | tr -d '\r\n') || return 1
     [[ -n "$spki" ]] || return 1
     printf '%s\n' "$spki"
-}
+)
 
 status() {
     echo -e "\n  ${C_BAR}  ${C_WHITE}服务运行状态与 UDP 端口监听 · SERVICE STATUS${C_RESET}\n"
@@ -1615,11 +1603,19 @@ link() {
     local masq_url; masq_url=$(get_masquerade_url)
     echo -e "     ${C_GRAY_MID}伪装反代    :${C_RESET} ${C_GRAY_LIGHT}${masq_url}${C_RESET}\n"
 
+    if [[ -n "$pin" || "$public_ports" == *-* ]]; then
+        local native_tls="$pin_param"
+        [[ -z "$pin" ]] || native_tls+="&insecure=1"
+        printf '  Hysteria 2 原生链接（用作客户端的 server，自签名请用 2.6.4 或更新版本）\n'
+        printf '     hysteria2://%s@%s:%s/?sni=%s%s%s#%s-Hy2\n\n' \
+            "$enc_password" "$domain" "$public_ports" "$domain" "$native_tls" "$obfs_param" "$domain"
+    fi
+
     if [[ "$public_ports" == *-* ]]; then
         local link_hop="hysteria2://${enc_password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}&mport=${public_ports}#${domain}-Hy2"
         local link_single="hysteria2://${enc_password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}#${domain}-Hy2-Single"
 
-        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 1 · 专属主节点链接${C_RESET} ${C_GRAY_MID}(端口跳跃 · v2rayN / sing-box 现代标准)${C_RESET}"
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}第三方导入链接（需确认客户端支持 mport）${C_RESET}"
         echo -e "     ${C_YELLOW}${link_hop}${C_RESET}\n"
 
         echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 2 · 基准单端口链接${C_RESET} ${C_GRAY_MID}(固定单端口 · 固定端口备用)${C_RESET}"
@@ -1627,11 +1623,13 @@ link() {
     else
         local link_main="hysteria2://${enc_password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}#${domain}-Hy2"
 
-        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}节点连接链接${C_RESET} ${C_GRAY_MID}(标准 Hysteria 2 URI · 支持指纹锁定)${C_RESET}"
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}节点连接链接${C_RESET}"
         echo -e "     ${C_YELLOW}${link_main}${C_RESET}\n"
     fi
 
-    echo -e "  ${C_ORANGE}●${C_RESET} ${C_GRAY_MID}提示: 在客户端中按 Ctrl+V 即可直接导入链接${C_RESET}\n"
+    if [[ -n "$pin" ]]; then
+        echo "     自签名节点仅用于能强制验证指纹的客户端。可用 buds hy2 client 获取对应配置。"
+    fi
 }
 
 client() {
@@ -1701,45 +1699,36 @@ CLIENT_YAML_EOF
     echo ""
 
     echo -e "  ${C_BAR}  ${C_WHITE}配置 2 · sing-box 1.14+ 原生 Outbound JSON 片段${C_RESET} ${C_GRAY_MID}(适配 v2rayN 自定义配置 / sing-box)${C_RESET}\n"
-    local sb_tls_pin=""
-    if is_cert_self_signed; then
-        local spki_pin
+    local spki_pin=""
+    if [[ -n "$client_pin" ]]; then
         spki_pin=$(get_spki_pin 2>/dev/null || true)
-        if [[ -n "$spki_pin" ]]; then
-            sb_tls_pin=",\n      \"certificate_public_key_sha256\": [\n        \"${spki_pin}\"\n      ]"
-        fi
-    fi
-
-    local sb_ports=""
-    if [[ "$public_ports" == *-* ]]; then
-        local sb_hop_range="${public_ports//-/:}"
-        sb_ports=",\n    \"server_ports\": [\n      \"${sb_hop_range}\"\n    ],\n    \"hop_interval\": \"30s\""
     fi
 
     local j_domain j_password j_obfs
     j_domain=$(json_escape "$domain")
     j_password=$(json_escape "$password")
     j_obfs=$(json_escape "$obfs_pwd")
-    echo -e "  ${C_CYAN}{"
-    echo -e "    \"type\": \"hysteria2\","
-    echo -e "    \"tag\": \"hy2-out\","
-    echo -e "    \"server\": \"${j_domain}\","
-    echo -e "    \"server_port\": ${base_port}${sb_ports},"
-    echo -e "    \"password\": \"${j_password}\","
-    if [[ -n "$obfs_pwd" ]]; then
-        echo -e "    \"obfs\": {"
-        echo -e "      \"type\": \"salamander\","
-        echo -e "      \"password\": \"${j_obfs}\""
-        echo -e "    },"
+    if [[ -n "$client_pin" && -z "$spki_pin" ]]; then
+        echo "  无法计算公钥指纹，已跳过 sing-box 配置。"
+    else
+        printf '{\n  "type": "hysteria2",\n  "tag": "hy2-out",\n  "server": "%s",\n' "$j_domain"
+        if [[ "$public_ports" == *-* ]]; then
+            printf '  "server_ports": ["%s"],\n  "hop_interval": "30s",\n' "${public_ports//-/:}"
+        else
+            printf '  "server_port": %s,\n' "$base_port"
+        fi
+        printf '  "password": "%s",\n' "$j_password"
+        if [[ -n "$obfs_pwd" ]]; then
+            printf '  "obfs": {"type": "salamander", "password": "%s"},\n' "$j_obfs"
+        fi
+        printf '  "tls": {\n    "enabled": true,\n    "server_name": "%s",\n    "insecure": false' "$j_domain"
+        if [[ -n "$spki_pin" ]]; then
+            printf ',\n    "certificate_public_key_sha256": ["%s"]' "$spki_pin"
+        fi
+        printf '\n  }\n}\n\n'
     fi
-    echo -e "    \"tls\": {"
-    echo -e "      \"enabled\": true,"
-    echo -e "      \"server_name\": \"${j_domain}\","
-    echo -e "      \"insecure\": false${sb_tls_pin}"
-    echo -e "    }"
-    echo -e "  }${C_RESET}\n"
 
-    echo -e "  ${C_BAR}  ${C_WHITE}配置 3 · Clash / Mihomo (Meta) 节点配置片段${C_RESET}\n"
+    echo -e "  ${C_BAR}  ${C_WHITE}配置 3 · Mihomo 节点配置片段${C_RESET}\n"
     echo -e "  ${C_YELLOW}- name: \"Hy2-${domain}\""
     echo -e "    type: hysteria2"
     echo -e "    server: ${domain}"
@@ -1747,7 +1736,7 @@ CLIENT_YAML_EOF
     if [[ "$public_ports" == *-* ]]; then
         echo -e "    ports: ${public_ports}"
     fi
-    echo -e "    password: \"${password}\""
+    printf '    password: "%s"\n' "$j_password"
     echo -e "    sni: ${domain}"
     echo -e "    skip-cert-verify: false"
     if is_cert_self_signed && [[ -n "$client_pin" ]]; then
@@ -1755,7 +1744,7 @@ CLIENT_YAML_EOF
     fi
     if [[ -n "$obfs_pwd" ]]; then
         echo -e "    obfs: salamander"
-        echo -e "    obfs-password: \"${obfs_pwd}\""
+        printf '    obfs-password: "%s"\n' "$j_obfs"
     fi
     echo -e "${C_RESET}"
 }
@@ -1864,7 +1853,10 @@ cleanup_firewall() {
                 ;;
         esac
         if [[ "$result" != 0 ]]; then
-            printf '%s|%s|%s|%s\n' "$backend" "$zone" "$mode" "$rule" >> "$remaining"
+            if ! printf '%s|%s|%s|%s\n' "$backend" "$zone" "$mode" "$rule" >> "$remaining"; then
+                rm -f -- "$remaining"
+                return 1
+            fi
             failed=true
         fi
     done < "$rule_file"
@@ -1875,7 +1867,10 @@ cleanup_firewall() {
             return 1
         fi
     fi
-    mv -f "$remaining" "$rule_file"
+    if ! mv -f "$remaining" "$rule_file"; then
+        rm -f -- "$remaining"
+        return 1
+    fi
     if [[ "$failed" == true ]]; then
         echo "  部分防火墙规则未能安全清理，已保留配置和规则记录，请检查权限后重试卸载。"
         return 1
@@ -1898,16 +1893,16 @@ read_root_crontab() {
 cleanup_renewal() {
     if [[ -f /etc/systemd/system/buds-hy2-renew.timer ]]; then
         if has_systemd; then
-            systemctl disable --now buds-hy2-renew.timer
+            systemctl disable --now buds-hy2-renew.timer || return 1
         fi
-        rm -f /etc/systemd/system/buds-hy2-renew.timer /etc/systemd/system/buds-hy2-renew.service
-        if has_systemd; then systemctl daemon-reload; fi
+        rm -f /etc/systemd/system/buds-hy2-renew.timer /etc/systemd/system/buds-hy2-renew.service || return 1
+        if has_systemd; then systemctl daemon-reload || return 1; fi
     fi
     if command -v crontab >/dev/null 2>&1; then
         local contents
         contents=$(read_root_crontab) || return 1
         if printf '%s\n' "$contents" | grep -q '# buds-hy2-renew$'; then
-            printf '%s\n' "$contents" | sed '/# buds-hy2-renew$/d' | crontab -
+            printf '%s\n' "$contents" | sed '/# buds-hy2-renew$/d' | crontab - || return 1
         fi
     fi
     if [[ -f /etc/periodic/daily/certbot-renew ]] &&
@@ -1920,23 +1915,35 @@ uninstall() {
     echo -e "\n  ${C_RED}⚠ 警告: 即将卸载 Hysteria 2 服务！${C_RESET}"
     read -rp "  确认彻底卸载吗？(y/N): " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        cleanup_renewal || echo "  警告: 续签任务清理未完全成功，请稍后检查。" >&2
+        if ! cleanup_renewal; then
+            echo "  卸载已停止：续签任务未能清理，请处理后重试。" >&2
+            return 1
+        fi
+        # 历史版本可能已删除服务定义。停止失败时，仅在服务仍活动时中止清理。
+        if ! stop && { (has_systemd && systemctl is-active --quiet hysteria-server) ||
+            (has_openrc && rc-service hysteria-server status >/dev/null 2>&1) ||
+            pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; }; then
+            echo "  卸载已停止：服务未能停止，请处理后重试。" >&2
+            return 1
+        fi
+        if ! cleanup_firewall; then
+            echo "  服务已停止，卸载尚未完成：防火墙清理失败，已保留服务定义、节点配置和待清理规则。" >&2
+            return 1
+        fi
         if has_systemd; then
-            systemctl disable --now hysteria-server 2>/dev/null || true
-            rm -rf /etc/systemd/system/hysteria-server.service.d
-            rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service
-            systemctl daemon-reload 2>/dev/null || true
+            if [[ -f /etc/systemd/system/hysteria-server.service ]] ||
+                systemctl is-enabled --quiet hysteria-server; then
+                systemctl disable hysteria-server || return 1
+            fi
+            rm -rf /etc/systemd/system/hysteria-server.service.d || return 1
+            rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service || return 1
+            systemctl daemon-reload || return 1
         fi
         if has_openrc; then
-            rc-service hysteria-server stop 2>/dev/null || true
-            rc-update del hysteria-server default 2>/dev/null || true
-            rm -f /etc/init.d/hysteria-server
-        fi
-        pkill -fx "$PROCESS_PATTERN" 2>/dev/null || true
-
-        if ! cleanup_firewall; then
-            echo "  卸载已停止：防火墙规则未能安全清理，节点配置和规则记录均已保留，请处理后重试。" >&2
-            return 1
+            if [[ -e /etc/runlevels/default/hysteria-server || -L /etc/runlevels/default/hysteria-server ]]; then
+                rc-update del hysteria-server default || return 1
+            fi
+            rm -f /etc/init.d/hysteria-server || return 1
         fi
         if [[ -f /etc/rc.local ]]; then
             sed -i '\|^/usr/local/bin/hysteria-service start$|d' /etc/rc.local
@@ -1979,135 +1986,115 @@ is_version_newer() {
     return 1
 }
 
-check_remote_version() {
-    local force="${1:-false}"
-    local cache_file now cache_time remote_ver
-    cache_file=""
-    if [[ -d "${CONFIG_DIR}" ]]; then
-        cache_file="${VERSION_CACHE_FILE}"
-    fi
-    now=$(date +%s 2>/dev/null || echo 0)
+valid_release_version() {
+    [[ "$1" =~ ^(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){2}$ ]]
+}
 
-    if [[ "$force" != "true" && -n "$cache_file" && -f "$cache_file" ]]; then
-        cache_time=$(cut -d':' -f1 "$cache_file" 2>/dev/null || echo 0)
-        remote_ver=$(cut -d':' -f2 "$cache_file" 2>/dev/null || true)
-        if [[ -n "$remote_ver" && "$cache_time" =~ ^[0-9]+$ ]] && (( now - cache_time < 1800 )); then
-            echo "$remote_ver"
+read_script_version() {
+    sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)"$/\1/p' "$1"
+}
+
+check_remote_version() {
+    local force="${1:-false}" now cache_time remote_ver
+    now=$(date +%s) || return 1
+
+    if [[ "$force" != true && -f "$VERSION_CACHE_FILE" ]]; then
+        IFS=: read -r cache_time remote_ver < "$VERSION_CACHE_FILE" || true
+        if [[ "$cache_time" =~ ^[1-9][0-9]{0,11}$ ]] &&
+            valid_release_version "$remote_ver" && (( now >= cache_time && now - cache_time < 1800 )); then
+            printf '%s\n' "$remote_ver"
             return 0
         fi
     fi
 
-    local fetched=""
-    local url
-    for url in "${UPDATE_URL_PRIMARY}?v=${now}" "${UPDATE_URL_MIRROR}?v=${now}"; do
-        if command -v curl >/dev/null 2>&1; then
-            fetched=$(curl -sSfL --proto '=https' --proto-redir '=https' --connect-timeout 2 --max-time 4 "$url" 2>/dev/null | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2 || true)
-        elif command -v wget >/dev/null 2>&1; then
-            fetched=$(wget -qO- --https-only --timeout=3 -t 1 "$url" 2>/dev/null | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2 || true)
-        fi
-        if [[ -n "$fetched" ]]; then
-            break
-        fi
-    done
-
-    if [[ -n "$fetched" ]]; then
-        if [[ -n "$cache_file" ]]; then
-            (umask 077; echo "${now}:${fetched}" > "$cache_file") 2>/dev/null || true
-        fi
-        echo "$fetched"
-    else
-        echo "$SCRIPT_VERSION"
+    if ! remote_ver=$(curl -q -fsSL --proto '=https' --proto-redir '=https' \
+        --connect-timeout 2 --max-time 4 --max-filesize 128 \
+        "${UPDATE_RELEASE_URL}/latest/download/buds.version" 2>/dev/null) ||
+        ! valid_release_version "$remote_ver"; then
+        return 1
     fi
+    if [[ -d "$CONFIG_DIR" ]]; then
+        (umask 077; printf '%s:%s\n' "$now" "$remote_ver" > "$VERSION_CACHE_FILE") 2>/dev/null || true
+    fi
+    printf '%s\n' "$remote_ver"
 }
 
-update_script() {
-    echo -e "\n  ${C_BAR}  ${C_ORANGE_BOLD}检查脚本更新 · SCRIPT UPDATE${C_RESET}\n"
-    echo -e "  当前版本: ${C_CYAN}v${SCRIPT_VERSION}${C_RESET}"
-    echo -ne "  正在连接远程仓库获取最新版本..."
+update_script() (
     local remote_ver
-    remote_ver=$(check_remote_version true)
-    echo -e " ${C_GREEN}完成${C_RESET}"
-
+    if ! remote_ver=$(check_remote_version true); then
+        echo "无法获取有效的发布版本，请检查网络或发布资产。" >&2
+        return 1
+    fi
     if ! is_version_newer "$remote_ver" "$SCRIPT_VERSION"; then
-        echo -e "\n  ${C_GREEN}✔ 当前已是最新版本 (v${SCRIPT_VERSION})，无需更新。${C_RESET}\n"
+        printf '当前已是最新版本（v%s）。\n' "$SCRIPT_VERSION"
         return 0
     fi
-
-    echo -e "  发现新版本: ${C_SPARK}v${remote_ver}${C_RESET}"
-    local target_cli="${BUDS_CLI:-/usr/local/bin/buds}"
-    local target_dir
-    target_dir="$(dirname "$target_cli")"
-    mkdir -p "$target_dir" || { echo "无法访问脚本目录：$target_dir" >&2; return 1; }
-    local tmp_file
-    tmp_file=$(mktemp "${target_dir}/.buds_update.XXXXXX") || return 1
-
-    echo -ne "  正在下载最新脚本..."
-    local downloaded=false
-    local url
-    local now
-    now=$(date +%s 2>/dev/null || echo 0)
-    for url in "${UPDATE_URL_PRIMARY}?v=${now}" "${UPDATE_URL_MIRROR}?v=${now}"; do
-        if command -v curl >/dev/null 2>&1; then
-            if curl -sSfL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 15 "$url" -o "$tmp_file" 2>/dev/null; then
-                downloaded=true
-                break
-            fi
-        elif command -v wget >/dev/null 2>&1; then
-            if wget -qO "$tmp_file" --https-only --timeout=10 -t 2 "$url" 2>/dev/null; then
-                downloaded=true
-                break
-            fi
-        fi
-    done
-
-    if [[ "$downloaded" != "true" || ! -s "$tmp_file" ]]; then
-        rm -f "$tmp_file"
-        echo -e " ${C_RED}失败${C_RESET}"
-        echo -e "\n  ${C_RED}✖ 下载最新脚本失败，请检查网络或稍后重试。${C_RESET}\n"
+    if [[ ! -s "$UPDATE_PUBLIC_KEY" ]]; then
+        printf '缺少可信发布公钥 %s，已停止更新。\n' "$UPDATE_PUBLIC_KEY" >&2
         return 1
     fi
-    echo -e " ${C_GREEN}完成${C_RESET}"
-
-    local downloaded_ver
-    downloaded_ver=$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)"$/\1/p' "$tmp_file" | head -n 1)
-    if [[ -z "$downloaded_ver" || "$downloaded_ver" != "$remote_ver" ]]; then
-        rm -f "$tmp_file"
-        echo -e "\n  ${C_RED}✖ 下载脚本版本不匹配，已保留现有脚本。${C_RESET}\n"
+    if ! command -v flock >/dev/null 2>&1; then
+        echo "更新需要 flock，请安装系统提供的 flock 工具。" >&2
         return 1
     fi
 
-    # 校验下载脚本有效性 (必须为 shell 脚本且能通过语法解析)
-    if ! head -n 1 "$tmp_file" | grep -q '^#!/usr/bin/env bash$'; then
-        rm -f "$tmp_file"
-        echo -e "\n  ${C_RED}✖ 下载的文件不是有效的 shell 脚本，更新已终止。${C_RESET}\n"
-        return 1
-    fi
-
-    if command -v bash >/dev/null 2>&1; then
-        if ! bash -n "$tmp_file" 2>/dev/null; then
-            rm -f "$tmp_file"
-            echo -e "\n  ${C_RED}✖ 新脚本语法校验未通过，更新已终止以保护现有环境。${C_RESET}\n"
-            return 1
+    local target_dir installed_ver tmp_dir release_url downloaded_ver lock_fd
+    target_dir=$(dirname "$BUDS_CLI") || return 1
+    # 持锁重新检查已安装版本，避免并发更新用较旧版本覆盖新版本。
+    (umask 077; : >> "${UPDATE_PUBLIC_KEY}.lock") || return 1
+    exec {lock_fd}<> "${UPDATE_PUBLIC_KEY}.lock" || return 1
+    flock -x "$lock_fd" || return 1
+    if [[ -f "$BUDS_CLI" ]]; then
+        installed_ver=$(read_script_version "$BUDS_CLI") || return 1
+        if valid_release_version "$installed_ver" && ! is_version_newer "$remote_ver" "$installed_ver"; then
+            printf '已安装 v%s，无需替换。\n' "$installed_ver"
+            return 0
         fi
     fi
 
-    chmod 755 "$tmp_file"
-    if ! mv -f "$tmp_file" "$target_cli"; then
-        rm -f "$tmp_file"
-        echo -e "\n  ${C_RED}✖ 无法替换管理脚本，现有脚本保持不变。${C_RESET}\n"
+    tmp_dir=$(mktemp -d "${target_dir}/.buds_update.XXXXXX") || return 1
+    trap 'rm -rf -- "$tmp_dir"' EXIT
+    release_url="${UPDATE_RELEASE_URL}/download/v${remote_ver}"
+    if ! curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 20 --max-filesize 1048576 \
+        "${release_url}/buds" -o "${tmp_dir}/buds" ||
+        ! curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 20 --max-filesize 16384 \
+        "${release_url}/buds.sig" -o "${tmp_dir}/buds.sig"; then
+        echo "下载发布脚本或签名失败，已保留现有脚本。" >&2
         return 1
     fi
-    if ! ln -sf "$target_cli" "${HY2_CLI:-/usr/local/bin/hy2}"; then
-        echo -e "  ${C_AMBER}⚠ 主脚本已更新，但 hy2 快捷链接创建失败，可继续使用 buds 命令。${C_RESET}" >&2
+    if ! openssl dgst -sha256 -verify "$UPDATE_PUBLIC_KEY" \
+        -signature "${tmp_dir}/buds.sig" "${tmp_dir}/buds" >/dev/null 2>&1; then
+        echo "发布签名验证失败，已保留现有脚本。" >&2
+        return 1
     fi
-    rm -f "${VERSION_CACHE_FILE}" 2>/dev/null || true
 
-    echo -e "\n  ${C_BAR}  ${C_GREEN}✔ 脚本已成功更新至 v${remote_ver}！${C_RESET}\n"
-}
+    downloaded_ver=$(read_script_version "${tmp_dir}/buds") || return 1
+    if [[ "$downloaded_ver" != "$remote_ver" ]]; then
+        echo "下载脚本版本不匹配，已保留现有脚本。" >&2
+        return 1
+    fi
+    if [[ "$(head -n 1 "${tmp_dir}/buds")" != '#!/usr/bin/env bash' ]] ||
+        ! bash -n "${tmp_dir}/buds" 2>/dev/null; then
+        echo "新脚本语法校验未通过，已保留现有脚本。" >&2
+        return 1
+    fi
+    if [[ -d "$BUDS_CLI" ]] ||
+        ! chmod 755 "${tmp_dir}/buds" || ! mv -f "${tmp_dir}/buds" "$BUDS_CLI"; then
+        echo "无法替换管理脚本，已保留现有脚本。" >&2
+        return 1
+    fi
+    if ! ln -sf "$BUDS_CLI" "$HY2_CLI"; then
+        echo "主脚本已更新，hy2 快捷链接创建失败，可继续使用 buds。" >&2
+    fi
+    rm -f "$VERSION_CACHE_FILE" 2>/dev/null || true
+    printf '脚本已成功更新至 v%s！\n' "$remote_ver"
+)
 
 show_menu() {
+    local remote_ver
+    remote_ver=$(check_remote_version) || remote_ver=""
     while true; do
-        local status_badge domain listen remote_ver has_update
+        local status_badge domain listen has_update
         local is_running=false
         if has_systemd; then
             if systemctl is-active --quiet hysteria-server 2>/dev/null; then
@@ -2132,7 +2119,6 @@ show_menu() {
         domain=$(get_domain)
         listen=$(get_listen)
         [[ -z "$listen" ]] && listen="未配置"
-        remote_ver=$(check_remote_version)
         has_update=false
         if is_version_newer "$remote_ver" "$SCRIPT_VERSION"; then
             has_update=true
@@ -2215,7 +2201,10 @@ case "$1" in
     uninstall) uninstall ;;
     update) update_script ;;
     check-update)
-        r_ver=$(check_remote_version true)
+        if ! r_ver=$(check_remote_version true); then
+            echo "无法获取有效的发布版本，请检查网络或发布资产。" >&2
+            exit 1
+        fi
         if is_version_newer "$r_ver" "$SCRIPT_VERSION"; then
             echo "新版本可用: v${r_ver} (当前: v${SCRIPT_VERSION})"
             exit 0
@@ -2230,8 +2219,7 @@ case "$1" in
         ;;
     *) show_menu ;;
 esac
-EOF
-    fi
+BUDS_CLI_EOF
     chmod 755 "$BUDS_CLI"
     ln -sf "$BUDS_CLI" "$HY2_CLI"
     success "已配置快捷管理命令：'buds hy2' 或 'hy2'。"

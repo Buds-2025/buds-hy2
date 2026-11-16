@@ -3,6 +3,7 @@
 Run: python scripts/test_regressions.py (Python 3 and Bash required).
 """
 from pathlib import Path
+import json
 import os
 import re
 import shlex
@@ -51,7 +52,7 @@ success() {{ :; }}
 warn() {{ echo "WARN: $*"; }}
 error() {{ echo "ERROR: $*"; }}
 chown() {{ :; }}
-setcap() {{ :; }}
+setcap() {{ echo "setcap $*" >> "$ACTION_FILE"; }}
 systemctl() {{ echo "systemctl $*" >> "$ACTION_FILE"; }}
 rc-service() {{ echo "rc-service $*" >> "$ACTION_FILE"; }}
 rc-update() {{ echo "rc-update $*" >> "$ACTION_FILE"; }}
@@ -104,6 +105,7 @@ sleep() {{ :; }}
         output = self.shell("link\nclient\n")
         self.assertIn("node.example.com:19957?sni=", output)
         self.assertIn("pinSHA256=", output)
+        self.assertRegex(output, r":19957/\?sni=node\.example\.com&pinSHA256=[0-9a-f]{64}&insecure=1")
         self.assertNotIn("allowInsecure", output)
         self.assertIn("insecure: true", output)
         shutil.copyfile(self.directory / "signed.crt", self.config / "server.crt")
@@ -124,12 +126,24 @@ sleep() {{ :; }}
         # Stop setup_cli after YAML generation, before deploying the global CLI.
         self.sources["install.sh"] = self.sources["install.sh"].split("    # 生成极客优雅的全局管理命令")[0] + "\n}\n"
         self.shell("DOMAIN=node.example.com; CLIENT_PORT_STR=19957; AUTH_PASSWORD=pass; OBFS_PASSWORD=obfs\nsetup_cli\n", "install.sh")
-        self.assertIn("insecure: true", (self.config / "client.yaml").read_text())
-        self.assertEqual((self.config / ".public_port").read_text().strip(), "19957")
+        self.assertIn("insecure: true", (self.config / "client.yaml").read_text(encoding="utf-8"))
+        self.assertEqual((self.config / ".public_port").read_text(encoding="utf-8").strip(), "19957")
 
     def test_invalid_certificate_does_not_disable_validation(self):
         (self.config / "server.crt").write_text("invalid certificate")
         self.shell("if is_cert_self_signed; then exit 9; fi\n", "install.sh")
+
+    def test_installer_uses_embedded_cli_instead_of_a_sibling_file(self):
+        self.shell("""
+mkdir -p "$SANDBOX/usr/local/bin"
+cd "$SANDBOX"
+printf 'unsigned sibling\n' > buds
+DOMAIN=node.example.com; CLIENT_PORT_STR=19957; AUTH_PASSWORD=pass; OBFS_PASSWORD=obfs
+setup_cli
+""", "install.sh")
+        installed_cli = (self.directory / "usr/local/bin/buds").read_text(encoding="utf-8")
+        self.assertIn('SCRIPT_VERSION="1.3.1"', installed_cli)
+        self.assertNotIn("unsigned sibling", installed_cli)
 
     def test_init_detection_requires_commands_and_runtime(self):
         for source in ("buds", "install.sh"):
@@ -157,7 +171,7 @@ detect_init_system
 
     def test_systemd_direct_download_gets_complete_service(self):
         self.shell("INIT_SYSTEM=systemd\nconfigure_service\n", "install.sh")
-        unit = (self.directory / "etc/systemd/system/hysteria-server.service").read_text()
+        unit = (self.directory / "etc/systemd/system/hysteria-server.service").read_text(encoding="utf-8")
         self.assertIn("ExecStart=", unit)
         self.assertIn("hysteria server --config", unit)
         self.assertIn("WantedBy=multi-user.target", unit)
@@ -168,30 +182,51 @@ detect_init_system
 
     def test_port_hopping_retains_required_net_admin_capability(self):
         self.shell("INIT_SYSTEM=systemd; IS_PORT_HOPPING=true\nconfigure_service\n", "install.sh")
-        unit = (self.directory / "etc/systemd/system/hysteria-server.service").read_text()
-        self.assertIn("CapabilityBoundingSet=CAP_NET_BIND_SERVICE,CAP_NET_ADMIN", unit)
-        self.assertIn("AmbientCapabilities=CAP_NET_BIND_SERVICE,CAP_NET_ADMIN", unit)
+        unit = (self.directory / "etc/systemd/system/hysteria-server.service").read_text(encoding="utf-8")
+        self.assertIn("CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN", unit)
+        self.assertIn("AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN", unit)
         self.assertNotIn("CAP_NET_RAW", unit)
+        self.assertNotIn("setcap", self.actions())
         self.shell("""
 INIT_SYSTEM=openrc; IS_PORT_HOPPING=true
 mkdir -p "$SANDBOX/etc/init.d"
-setcap() { return 1; }
+id() { return 0; }
+supervise-daemon() { return 1; }
 configure_service
 """, "install.sh")
-        unit = (self.directory / "etc/init.d/hysteria-server").read_text()
+        unit = (self.directory / "etc/init.d/hysteria-server").read_text(encoding="utf-8")
         self.assertIn('command_user="root:root"', unit)
-        self.assertNotIn("cap_net_admin", unit)
+        self.assertNotIn("capabilities=", unit)
 
-    def test_openrc_capability_and_user_fallback(self):
-        self.shell('id() { return 0; }; command() { if [[ "$1" == -v && "$2" == setcap ]]; then return 0; fi; builtin command "$@"; }\nmkdir -p "$SANDBOX/etc/init.d" "$SANDBOX/usr/local/bin"; touch "$SANDBOX/usr/local/bin/hysteria"\nINIT_SYSTEM=openrc; IS_PORT_HOPPING=true\nconfigure_service\n', "install.sh")
-        unit = (self.directory / "etc/init.d/hysteria-server").read_text()
+    def test_openrc_capability_is_set_on_service(self):
+        self.shell("""
+id() { return 0; }
+supervise-daemon() { printf '%s\\n' '--capabilities'; return 1; }
+mkdir -p "$SANDBOX/etc/init.d" "$SANDBOX/usr/local/bin"
+touch "$SANDBOX/usr/local/bin/hysteria"
+INIT_SYSTEM=openrc; IS_PORT_HOPPING=true
+configure_service
+""", "install.sh")
+        unit = (self.directory / "etc/init.d/hysteria-server").read_text(encoding="utf-8")
         self.assertIn('command_user="hysteria:hysteria"', unit)
-        self.assertIn("cap_net_admin", unit)
+        self.assertIn('capabilities="^cap_net_admin"', unit)
         self.assertNotIn("cap_net_raw", unit)
+        self.assertNotIn("setcap", self.actions())
+
+    def test_openrc_single_port_omits_capability_option(self):
+        self.shell("""
+id() { return 0; }
+mkdir -p "$SANDBOX/etc/init.d"
+INIT_SYSTEM=openrc; IS_PORT_HOPPING=false
+configure_service
+""", "install.sh")
+        unit = (self.directory / "etc/init.d/hysteria-server").read_text(encoding="utf-8")
+        self.assertIn('command_user="hysteria:hysteria"', unit)
+        self.assertNotIn("capabilities=", unit)
 
     def test_openrc_missing_user_uses_root_fallback(self):
         self.shell('id() { return 1; }\nmkdir -p "$SANDBOX/etc/init.d" "$SANDBOX/usr/local/bin"; touch "$SANDBOX/usr/local/bin/hysteria"\nINIT_SYSTEM=openrc; IS_PORT_HOPPING=true\nconfigure_service\n', "install.sh")
-        unit = (self.directory / "etc/init.d/hysteria-server").read_text()
+        unit = (self.directory / "etc/init.d/hysteria-server").read_text(encoding="utf-8")
         self.assertIn('command_user="root:root"', unit)
         self.assertNotIn("cap_net_admin", unit)
 
@@ -308,7 +343,7 @@ add_ufw_rule 24443/udp
 add_ufw_rule 80/tcp
 """, "install.sh")
         self.assertEqual(self.actions().strip(), "ufw allow in proto tcp from 0.0.0.0/0 to any port 80 comment buds-hy2")
-        self.assertEqual((self.config / ".firewall_rule").read_text(), "ufw|4|runtime|80/tcp\n")
+        self.assertEqual((self.config / ".firewall_rule").read_text(encoding="utf-8"), "ufw|4|runtime|80/tcp\n")
 
     def test_ufw_cleanup_deletes_only_owned_numbered_rules(self):
         self.journal("ufw|-|runtime|24443/udp\n")
@@ -375,8 +410,11 @@ cleanup_firewall
         (self.config / ".public_port").write_text("19957\n")
         binary_dir = self.directory / "usr/local/bin"
         binary_dir.mkdir(parents=True)
-        for name in ("buds", "hy2", "hysteria", "hysteria-service"):
+        for name in ("buds", "hy2", "hysteria"):
             (binary_dir / name).write_text("old-install")
+        runner = binary_dir / "hysteria-service"
+        runner.write_text('#!/usr/bin/env bash\n[[ "$1" == stop ]]\n', encoding="utf-8", newline="\n")
+        runner.chmod(0o755)
         self.shell("uninstall <<<'y'\n")
         self.assertFalse(self.config.exists())
         self.assertTrue(all(not (binary_dir / name).exists() for name in ("buds", "hy2", "hysteria", "hysteria-service")))
@@ -391,7 +429,7 @@ collect_parameters() { DOMAIN=new.example.com; AUTH_PASSWORD=new-password; }
 generate_server_config() { mkdir -p "$CONFIG_DIR"; printf '%s\\n' "$DOMAIN" "$AUTH_PASSWORD" > "$CONFIG_FILE"; }
 main
 """, "install.sh")
-        self.assertEqual((self.config / "config.yaml").read_text(), "new.example.com\nnew-password\n")
+        self.assertEqual((self.config / "config.yaml").read_text(encoding="utf-8"), "new.example.com\nnew-password\n")
 
     def test_firewalld_runtime_and_permanent_ownership(self):
         self.shell("""
@@ -407,7 +445,7 @@ firewall-cmd() {
 UFW_PORT_RULE=24443/udp
 configure_firewall
 """, "install.sh")
-        self.assertEqual((self.config / ".firewall_rule").read_text(), "firewalld|public|permanent|24443/udp\n")
+        self.assertEqual((self.config / ".firewall_rule").read_text(encoding="utf-8"), "firewalld|public|permanent|24443/udp\n")
         self.assertNotIn("--reload", self.actions())
         self.shell('firewall-cmd() { echo "firewall-cmd $*" >> "$ACTION_FILE"; }\ncleanup_firewall\n')
         self.assertIn("--permanent --remove-port=24443/udp", self.actions())
@@ -505,7 +543,7 @@ add_ufw_rule 24443/udp
 """, "install.sh")
         self.assertIn("from 0.0.0.0/0", self.actions())
         self.assertNotIn("from ::/0", self.actions())
-        self.assertEqual((self.config / ".firewall_rule").read_text(), "ufw|4|runtime|24443/udp\n")
+        self.assertEqual((self.config / ".firewall_rule").read_text(encoding="utf-8"), "ufw|4|runtime|24443/udp\n")
 
     def test_lightweight_failed_restart_returns_failure(self):
         output = self.shell("""
@@ -541,7 +579,7 @@ bash "$SANDBOX/usr/local/bin/hysteria-service" stop
             newline="\n",
         )
         self.shell("uninstall <<<'y'\n")
-        self.assertEqual(startup.read_text(), "#!/bin/sh\necho keep-this\nexit 0\n")
+        self.assertEqual(startup.read_text(encoding="utf-8"), "#!/bin/sh\necho keep-this\nexit 0\n")
 
     def test_self_signed_pin_matches_der_sha256_and_is_exported(self):
         import hashlib
@@ -555,7 +593,7 @@ bash "$SANDBOX/usr/local/bin/hysteria-service" stop
             self.assertEqual(self.shell("get_cert_pin\n", source).strip(), expected)
         output = self.shell("link\nclient\nclient\n")
         self.assertIn("&pinSHA256=" + expected, output)
-        yaml = (self.config / "client.yaml").read_text()
+        yaml = (self.config / "client.yaml").read_text(encoding="utf-8")
         self.assertEqual(yaml.count("pinSHA256:"), 1)
         self.assertIn("pinSHA256: " + expected, yaml)
         shutil.copyfile(self.directory / "signed.crt", self.config / "server.crt")
@@ -570,10 +608,24 @@ bash "$SANDBOX/usr/local/bin/hysteria-service" stop
             "server: node.example.com:19957\nauth: keep-me\n", newline="\n"
         )
         self.shell("client\n")
-        result = (self.config / "client.yaml").read_text()
+        result = (self.config / "client.yaml").read_text(encoding="utf-8")
         self.assertIn("auth: keep-me", result)
         self.assertIn("pinSHA256:", result)
         self.assertIn("insecure: true", result)
+
+    def test_sing_box_export_is_valid_and_requires_self_signed_pin(self):
+        self.certificates()
+        self.node_config(public="19957-19959")
+        output = self.shell("link\nclient\n")
+        self.assertRegex(output, r":19957-19959/\?sni=[^&]+&pinSHA256=[0-9a-f]{64}&insecure=1")
+        outbound = json.loads(re.search(r"(?ms)^\{\n.*?^\}", output).group())
+        self.assertEqual(outbound["server_ports"], ["19957:19959"])
+        self.assertNotIn("server_port", outbound)
+        self.assertFalse(outbound["tls"]["insecure"])
+        self.assertRegex(outbound["tls"]["certificate_public_key_sha256"][0], r"^[A-Za-z0-9+/]{43}=$")
+        output = self.shell("get_spki_pin() { return 1; }\nclient\n")
+        self.assertIn("已跳过 sing-box 配置", output)
+        self.assertNotIn('"type": "hysteria2"', output)
 
     def test_pin_failure_refuses_unverified_self_signed_export(self):
         self.certificates()
@@ -617,14 +669,14 @@ curl() {{
         binary.parent.mkdir(parents=True)
         binary.write_text("existing-core")
         self.shell(self.download_fixture(digest="0" * 64) + "install_official_core\n", "install.sh", expected=1)
-        self.assertEqual(binary.read_text(), "existing-core")
+        self.assertEqual(binary.read_text(encoding="utf-8"), "existing-core")
         self.assertNotIn("VALIDATE", self.actions())
         self.assertFalse(list(binary.parent.glob(".buds-hy2-download.*")))
 
     def test_verified_download_is_fixed_version_and_temp_is_removed(self):
         self.shell(self.download_fixture() + "install_official_core\n", "install.sh")
         binary = self.directory / "usr/local/bin/hysteria"
-        self.assertEqual(binary.read_text(), "test-core-fixture")
+        self.assertEqual(binary.read_text(encoding="utf-8"), "test-core-fixture")
         self.assertIn("VALIDATE", self.actions())
         downloads = [line for line in self.actions().splitlines() if "/download/" in line]
         self.assertEqual(len(downloads), 2)
@@ -637,7 +689,7 @@ curl() {{
         binary.write_text("existing-core")
         for fixture in (self.download_fixture(valid_version=False), self.download_fixture(valid_binary=False)):
             self.shell(fixture + "install_official_core\n", "install.sh", expected=1)
-            self.assertEqual(binary.read_text(), "existing-core")
+            self.assertEqual(binary.read_text(encoding="utf-8"), "existing-core")
             self.assertFalse(list(binary.parent.glob(".buds-hy2-download.*")))
 
     def test_non_elf_download_is_not_executed(self):
@@ -665,7 +717,7 @@ certbot() { :; }
 systemctl() { echo "systemctl $*" >> "$ACTION_FILE"; [[ "$1" != cat ]]; }
 configure_renewal
 """, "install.sh")
-        unit = (self.directory / "etc/systemd/system/buds-hy2-renew.service").read_text()
+        unit = (self.directory / "etc/systemd/system/buds-hy2-renew.service").read_text(encoding="utf-8")
         self.assertIn("renew --quiet --run-deploy-hooks", unit)
         self.assertIn("enable --now buds-hy2-renew.timer", self.actions())
 
@@ -681,7 +733,7 @@ ensure_cron_running() { echo CRON_READY >> "$ACTION_FILE"; }
 configure_renewal
 """, "install.sh")
         self.assertIn("CRON_READY", self.actions())
-        self.assertEqual(path.read_text(), contents)
+        self.assertEqual(path.read_text(encoding="utf-8"), contents)
         self.assertFalse((self.directory / "etc/systemd/system/buds-hy2-renew.timer").exists())
 
     def test_owned_cron_job_is_idempotent_and_uninstall_preserves_other_jobs(self):
@@ -697,9 +749,9 @@ ensure_cron_running() { return 0; }
 configure_renewal
 configure_renewal
 """, "install.sh")
-        self.assertEqual(root_cron.read_text().count("# buds-hy2-renew"), 1)
+        self.assertEqual(root_cron.read_text(encoding="utf-8").count("# buds-hy2-renew"), 1)
         self.shell(common + "cleanup_renewal\n")
-        self.assertEqual(root_cron.read_text(), original)
+        self.assertEqual(root_cron.read_text(encoding="utf-8"), original)
 
     def test_crontab_read_failure_never_overwrites_other_jobs(self):
         self.shell("""
@@ -721,51 +773,85 @@ is_version_newer "" "1.2.0" || echo "PASS7"
         self.assertEqual(output.strip().splitlines(), [f"PASS{i}" for i in range(1, 8)])
 
     def test_remote_version_cache_and_fallback(self):
-        cache_file = self.config / ".version_cache"
-        cache_file.write_text("9999999999:2.0.0\n", encoding="utf-8")
         out = self.shell("""
-curl() { echo "CURL_CALLED" >> "$ACTION_FILE"; return 1; }
-wget() { echo "WGET_CALLED" >> "$ACTION_FILE"; return 1; }
+printf '%s:2.0.0\n' "$(date +%s)" > "$VERSION_CACHE_FILE"
+curl() { echo CURL_CALLED >> "$ACTION_FILE"; return 1; }
 check_remote_version
 """)
         self.assertEqual(out.strip(), "2.0.0")
         self.assertNotIn("CURL_CALLED", self.actions())
 
-        cache_file.write_text("0:1.0.0\n", encoding="utf-8")
         out = self.shell("""
-curl() { echo "CURL_CALLED" >> "$ACTION_FILE"; return 1; }
-wget() { echo "WGET_CALLED" >> "$ACTION_FILE"; return 1; }
+printf '%s:2.0.0\n' "$(( $(date +%s) + 3600 ))" > "$VERSION_CACHE_FILE"
+curl() { echo CURL_CALLED >> "$ACTION_FILE"; return 1; }
 check_remote_version
-""")
-        self.assertEqual(out.strip(), "1.3.0")
-        self.assertIn("CURL_CALLED", self.actions())
-
-    def test_update_script_success_and_syntax_guard(self):
-        target_cli = self.directory / "usr/local/bin/buds"
-        target_cli.parent.mkdir(parents=True, exist_ok=True)
-        target_cli.write_text("#!/usr/bin/env bash\necho old\n", encoding="utf-8")
-
-        # Guard: syntax error rejected
-        out = self.shell(f"""
-check_remote_version() {{ echo "1.4.0"; }}
-curl() {{ local out="${{!#}}"; printf "#!/usr/bin/env bash\\nSCRIPT_VERSION=\\\"1.4.0\\\"\\nif then invalid syntax\\n" > "$out"; }}
-BUDS_CLI="{target_cli.as_posix()}"
-update_script
 """, expected=1)
-        self.assertIn("新脚本语法校验未通过", out)
-        self.assertIn("old", target_cli.read_text())
+        self.assertEqual(out, "")
+        self.assertIn("CURL_CALLED", self.actions())
+        self.shell('curl() { echo "1.4.0/invalid"; }\ncheck_remote_version true\n', expected=1)
 
-        # Success: valid script downloaded and atomically applied
-        out = self.shell(f"""
-check_remote_version() {{ echo "1.4.0"; }}
-curl() {{ local out="${{!#}}"; printf "#!/usr/bin/env bash\\nSCRIPT_VERSION=\\\"1.4.0\\\"\\necho updated-to-1.4.0\\n" > "$out"; }}
-BUDS_CLI="{target_cli.as_posix()}"
-update_script
-""")
+    def test_update_verifies_release_before_replacing_script(self):
+        target_cli = self.directory / "usr/local/bin/buds"
+        target_cli.parent.mkdir(parents=True)
+        initial = '#!/usr/bin/env bash\nSCRIPT_VERSION="1.3.1"\n'
+        target_cli.write_text(initial, encoding="utf-8", newline="\n")
+        public_key = self.directory / "etc/buds-hy2/update.pub"
+        public_key.parent.mkdir(parents=True)
+        release_script = self.directory / "release-buds"
+        private_key = self.directory / "fixture.key"
+        signature = self.directory / "release-buds.sig"
+
+        def openssl(*args):
+            subprocess.run([OPENSSL, *map(str, args)], check=True, capture_output=True)
+
+        def sign_script(contents):
+            release_script.write_text(contents, encoding="utf-8", newline="\n")
+            openssl("dgst", "-sha256", "-sign", private_key, "-out", signature, release_script)
+
+        openssl("genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", private_key)
+        openssl("pkey", "-in", private_key, "-pubout", "-out", public_key)
+        mock_download = """
+flock() { [[ "$1" == -x && "$2" =~ ^[0-9]+$ ]]; }
+curl() {
+    case " $* " in
+        *'/latest/download/buds.version '*) echo 1.4.0 ;;
+        *'/download/v1.4.0/buds '*) cp "$SANDBOX/release-buds" "${!#}" ;;
+        *'/download/v1.4.0/buds.sig '*) cp "$SANDBOX/release-buds.sig" "${!#}" ;;
+        *) return 1 ;;
+    esac
+}
+update_script 2>&1
+"""
+        valid = '#!/usr/bin/env bash\nSCRIPT_VERSION="1.4.0"\necho updated\n'
+        sign_script(valid)
+        release_script.write_text(valid + "echo changed\n", encoding="utf-8", newline="\n")
+        out = self.shell(mock_download, expected=1)
+        self.assertIn("发布签名验证失败", out)
+        self.assertEqual(target_cli.read_text(encoding="utf-8"), initial)
+        self.assertEqual(list(target_cli.parent.glob(".buds_update.*")), [])
+
+        sign_script(valid.replace("1.4.0", "9.9.9"))
+        out = self.shell(mock_download, expected=1)
+        self.assertIn("版本不匹配", out)
+        self.assertEqual(target_cli.read_text(encoding="utf-8"), initial)
+
+        sign_script(valid + "if then invalid syntax\n")
+        out = self.shell(mock_download, expected=1)
+        self.assertIn("语法校验未通过", out)
+        self.assertEqual(target_cli.read_text(encoding="utf-8"), initial)
+
+        sign_script(valid)
+        out = self.shell(mock_download)
         self.assertIn("脚本已成功更新至 v1.4.0", out)
-        self.assertIn("updated-to-1.4.0", target_cli.read_text())
+        self.assertEqual(target_cli.read_text(encoding="utf-8"), valid)
+        self.assertEqual(list(target_cli.parent.glob(".buds_update.*")), [])
 
+        out = self.shell(mock_download)
+        self.assertIn("已安装 v1.4.0", out)
 
+    def test_update_requires_provisioned_key(self):
+        out = self.shell('curl() { echo "1.4.0"; }\nupdate_script 2>&1\n', expected=1)
+        self.assertIn("缺少可信发布公钥", out)
 
     def test_disabled_ufw_matches_proto_from_format(self):
         self.journal("ufw|4|runtime|24443/udp\n")
@@ -817,14 +903,19 @@ cleanup_firewall
         self.node_config()
         self.journal("ufw|-|runtime|24443/udp\n")
         (self.config / ".public_port").write_text("19957\n")
+        unit = self.directory / "etc/systemd/system/hysteria-server.service"
+        unit.parent.mkdir(parents=True)
+        unit.touch()
         out = self.shell("""
-crontab() { return 1; }
+has_systemd() { return 0; }
+crontab() { echo "no crontab"; return 1; }
 ufw() { return 1; }
-uninstall <<<'y'
+uninstall 2>&1 <<<'y'
 """, expected=1)
         self.assertTrue(self.config.exists())
         self.assertTrue((self.config / ".firewall_rule").exists())
-        self.assertNotIn("服务及防火墙规则已安全卸载", out)
+        self.assertTrue(unit.exists())
+        self.assertIn("防火墙清理失败", out)
 
     def test_uninstall_removes_owned_periodic_job_only(self):
         self.node_config()
@@ -833,6 +924,31 @@ uninstall <<<'y'
         periodic.write_text("#!/bin/sh\n# buds-hy2-renew\ncertbot renew\n", encoding="utf-8")
         self.shell("uninstall <<<'y'\n")
         self.assertFalse(periodic.exists())
+
+    def test_uninstall_keeps_old_firewall_journal_if_replacement_fails(self):
+        self.node_config()
+        journal = "ufw|-|runtime|24443/udp\n"
+        self.journal(journal)
+        self.shell("""
+crontab() { echo "no crontab"; return 1; }
+ufw() { return 1; }
+mv() { return 1; }
+uninstall <<<'y'
+""", expected=1)
+        self.assertEqual((self.config / ".firewall_rule").read_text(encoding="utf-8"), journal)
+
+    def test_uninstall_can_retry_after_service_definition_was_removed(self):
+        self.node_config()
+        self.shell("""
+has_systemd() { return 0; }
+has_openrc() { return 1; }
+systemctl() {
+    case "$1" in stop|is-active) return 1 ;; esac
+}
+pgrep() { return 1; }
+uninstall <<<'y'
+""")
+        self.assertFalse(self.config.exists())
 
     def test_certificate_hook_escapes_domain_and_waits_for_old_process(self):
         (self.directory / "etc/letsencrypt/live/node.example.com").mkdir(parents=True)
@@ -844,7 +960,7 @@ uninstall <<<'y'
         hook_script = "    {\n        printf '#!/usr/bin/env bash" + body + '    } > "$HOOK_FILE"\n'
         self.shell('mkdir -p "$HOOK_DIR"\nDOMAIN=node.example.com\n' + hook_script, "install.sh")
         hook = self.directory / "etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh"
-        self.assertIn("DOMAIN=node.example.com", hook.read_text())
+        self.assertIn("DOMAIN=node.example.com", hook.read_text(encoding="utf-8"))
         out = self.shell(f"""
 command() {{ if [[ "$1" == -v && "$2" =~ ^(systemctl|rc-service|rc-update|openrc-run)$ ]]; then return 1; fi; builtin command "$@"; }}
 pgrep() {{ return 0; }}
@@ -852,22 +968,9 @@ pkill() {{ return 0; }}
 nohup() {{ echo UNEXPECTED_RESTART >> "$ACTION_FILE"; }}
 export -f pgrep pkill nohup command
 export SANDBOX ACTION_FILE
-bash {hook.as_posix()}
+bash "$SANDBOX/etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh"
 """, expected=1)
         self.assertNotIn("UNEXPECTED_RESTART", self.actions())
-
-    def test_update_rejects_version_mismatch_and_preserves_current_script(self):
-        target_cli = self.directory / "usr/local/bin/buds"
-        target_cli.parent.mkdir(parents=True, exist_ok=True)
-        target_cli.write_text("existing-script\n", encoding="utf-8")
-        out = self.shell(f"""
-check_remote_version() {{ echo "1.4.0"; }}
-curl() {{ local out="${{!#}}"; printf '#!/usr/bin/env bash\\nSCRIPT_VERSION="9.9.9"\\n' > "$out"; }}
-BUDS_CLI="{target_cli.as_posix()}"
-update_script
-""", expected=1)
-        self.assertIn("版本不匹配", out)
-        self.assertEqual(target_cli.read_text(), "existing-script\n")
 
     def test_range_port_check_is_awk_compatible(self):
         output = self.shell("""
