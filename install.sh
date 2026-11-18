@@ -16,7 +16,7 @@ OVERRIDE_DIR="/etc/systemd/system/hysteria-server.service.d"
 OVERRIDE_FILE="${OVERRIDE_DIR}/override.conf"
 SERVICE_FILE="/etc/systemd/system/hysteria-server.service"
 SYSCTL_FILE="/etc/sysctl.d/99-hysteria-performance.conf"
-SCRIPT_VERSION="1.6.2"
+SCRIPT_VERSION="1.6.3"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 
@@ -1224,7 +1224,7 @@ set -e
 CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
-SCRIPT_VERSION="1.6.2"
+SCRIPT_VERSION="1.6.3"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 UPDATE_REPO_URL="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates"
@@ -1356,6 +1356,15 @@ get_listen() {
     echo "$listen"
 }
 
+legacy_client_ports() {
+    # 旧导出可能把地址拆成两行，第二行保留了原公网映射。
+    awk 'NR==1 && /^server: [^[:space:]:]+$/ {host=substr($0,9)}
+         NR==2 {if (host!="" && index($0,host ":")==1) {
+             port=substr($0,length(host)+2)
+             if (port ~ /^[0-9]+(-[0-9]+)?$/) print port
+         }; exit}' "$CLIENT_CONFIG_FILE"
+}
+
 get_public_ports() {
     local ports=""
     if [[ -f "$CLIENT_CONFIG_FILE" ]]; then
@@ -1365,7 +1374,7 @@ get_public_ports() {
         elif [[ "$ports" == *:* ]]; then
             ports="${ports##*:}"
         else
-            ports=""
+            ports=$(legacy_client_ports)
         fi
     fi
     if [[ -z "$ports" && -f "${CONFIG_DIR}/.public_port" ]]; then
@@ -1699,12 +1708,25 @@ CLIENT_YAML_EOF
         chown root:root "$CLIENT_CONFIG_FILE" 2>/dev/null || true
         chmod 600 "$CLIENT_CONFIG_FILE"
     else
-        local updated
+        local updated legacy_port
+        legacy_port=$(legacy_client_ports)
+        if [[ -n "$legacy_port" && ( -z "$password" || -z "$obfs_pwd" ) ]]; then
+            echo "旧客户端配置缺少凭据，无法从服务端配置恢复，请检查 $CONFIG_FILE。" >&2
+            return 1
+        fi
         updated=$(mktemp "${CLIENT_CONFIG_FILE}.XXXXXX") || return 1
-        if ! awk -v insecure="$client_insecure" -v pin="$client_pin" -v domain="$(get_domain)" '
+        if ! BUDS_EXPORT_AUTH="$(json_escape "$password")" BUDS_EXPORT_OBFS="$(json_escape "$obfs_pwd")" \
+            awk -v insecure="$client_insecure" -v pin="$client_pin" -v domain="$domain" -v legacy="$legacy_port" '
             function security() {
                 print "  insecure: " insecure
                 if (pin!="") print "  pinSHA256: " pin
+            }
+            legacy && NR==1 {print $0 ":" legacy; next}
+            legacy && (NR==2 || $0==domain) {next}
+            legacy && /^auth:[[:space:]]*("")?[[:space:]]*$/ {print "auth: \"" ENVIRON["BUDS_EXPORT_AUTH"] "\""; next}
+            legacy && /^[^[:space:]#]/ {in_obfs=($0 ~ /^obfs:/)}
+            in_obfs && /^[[:space:]]+password:[[:space:]]*("")?[[:space:]]*$/ {
+                sub(/password:.*/, ""); print $0 "password: \"" ENVIRON["BUDS_EXPORT_OBFS"] "\""; next
             }
             /^tls:[[:space:]]*$/ {found=1; in_tls=1; print; security(); next}
             /^[^[:space:]#]/ {in_tls=0}
@@ -1715,7 +1737,7 @@ CLIENT_YAML_EOF
             rm -f "$updated"
             return 1
         fi
-        mv -f "$updated" "$CLIENT_CONFIG_FILE"
+        mv -f "$updated" "$CLIENT_CONFIG_FILE" || { rm -f "$updated"; return 1; }
     fi
     chown root:root "$CLIENT_CONFIG_FILE" 2>/dev/null || true
     chmod 600 "$CLIENT_CONFIG_FILE"
@@ -3956,15 +3978,20 @@ read_script_version() {
 
 fetch_repo_version() (
     [[ -s "$UPDATE_PUBLIC_KEY" ]] || return 1
-    local tmp version
+    local tmp version query
     tmp=$(mktemp -d) || return 2
     trap 'rm -rf -- "$tmp"' EXIT
-    curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 3 --max-time 6 --max-filesize 128 \
-        "$UPDATE_REPO_URL/buds.version" -o "$tmp/version" 2>/dev/null || return 1
-    curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 3 --max-time 6 --max-filesize 16384 \
-        "$UPDATE_REPO_URL/buds.version.sig" -o "$tmp/version.sig" 2>/dev/null &&
-        openssl dgst -sha256 -verify "$UPDATE_PUBLIC_KEY" -signature "$tmp/version.sig" "$tmp/version" >/dev/null 2>&1 ||
-        { echo "仓库更新版本验签失败。" >&2; return 2; }
+    # 分支更新时两个文件的缓存可能先后刷新。重取整对文件，始终用已安装公钥验签。
+    for query in '' "?check=$(date +%s)-$RANDOM"; do
+        curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 3 --max-time 6 --max-filesize 128 \
+            "$UPDATE_REPO_URL/buds.version$query" -o "$tmp/version" 2>/dev/null || return 1
+        if curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 3 --max-time 6 --max-filesize 16384 \
+                "$UPDATE_REPO_URL/buds.version.sig$query" -o "$tmp/version.sig" 2>/dev/null &&
+                openssl dgst -sha256 -verify "$UPDATE_PUBLIC_KEY" -signature "$tmp/version.sig" "$tmp/version" >/dev/null 2>&1; then
+            break
+        fi
+        if [[ -n "$query" ]]; then echo "仓库更新版本验签失败。" >&2; return 2; fi
+    done
     version=$(cat "$tmp/version") || return 2
     valid_release_version "$version" || return 2
     printf '%s\n' "$version"

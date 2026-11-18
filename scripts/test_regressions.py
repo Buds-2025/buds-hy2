@@ -689,7 +689,9 @@ DOMAIN=node.example.com; CLIENT_PORT_STR=19957; AUTH_PASSWORD=pass; OBFS_PASSWOR
 setup_cli
 """, "install.sh")
         installed_cli = (self.directory / "usr/local/bin/buds").read_text(encoding="utf-8")
-        self.assertIn('SCRIPT_VERSION="1.6.2"', installed_cli)
+        version_line = re.search(r'^SCRIPT_VERSION="[0-9]+\.[0-9]+\.[0-9]+"$', self.sources["install.sh"], re.M)
+        self.assertIsNotNone(version_line)
+        self.assertIn(version_line.group(), installed_cli.splitlines())
         self.assertNotIn("unsigned sibling", installed_cli)
 
     def test_init_detection_requires_commands_and_runtime(self):
@@ -1171,6 +1173,24 @@ bash "$SANDBOX/usr/local/bin/hysteria-service" stop
         self.assertNotIn("pinSHA256", output)
         self.assertIn("insecure: false", output)
 
+    def test_split_legacy_client_recovers_nat_port_and_credentials_without_losing_options(self):
+        self.node_config()
+        path = self.config / "client.yaml"
+        path.write_text('server: node.example.com\nnode.example.com:19957-19959\nauth: ""\n'
+                        'tls:\n  sni: node.example.com\nnode.example.com\n  insecure: false\n'
+                        'obfs:\n  type: salamander\n  salamander:\n    password: ""\n'
+                        'socks5:\n  listen: 127.0.0.1:1088\n', encoding="utf-8")
+        self.assertEqual(self.shell("get_public_ports\n").strip(), "19957-19959")
+        self.shell("client >/dev/null\n")
+        recovered = path.read_text(encoding="utf-8")
+        self.assertIn("server: node.example.com:19957-19959\n", recovered)
+        self.assertNotIn("\nnode.example.com", recovered)
+        self.assertIn('auth: "test-password"', recovered)
+        self.assertIn('password: "test-obfs"', recovered)
+        self.assertIn("127.0.0.1:1088", recovered)
+        self.shell("client >/dev/null\n")
+        self.assertEqual(path.read_text(encoding="utf-8"), recovered)
+
     def test_pin_is_added_when_existing_yaml_has_no_tls_block(self):
         self.certificates()
         self.node_config()
@@ -1391,8 +1411,8 @@ SCRIPT_VERSION=1.3.1
 flock() { [[ "$1" == -x && "$2" =~ ^[0-9]+$ ]]; }
 curl() {
     case " $* " in
-        *'/updates/buds.version '*) cp "$SANDBOX/release-buds.version" "${!#}" ;;
-        *'/updates/buds.version.sig '*) cp "$SANDBOX/release-buds.version.sig" "${!#}" ;;
+        *'/updates/buds.version '*|*'/updates/buds.version?check='*) cp "$SANDBOX/release-buds.version" "${!#}" ;;
+        *'/updates/buds.version.sig '*|*'/updates/buds.version.sig?check='*) cp "$SANDBOX/release-buds.version.sig" "${!#}" ;;
         *'/updates/releases/1.4.0/buds '*) cp "$SANDBOX/release-buds" "${!#}" ;;
         *'/updates/releases/1.4.0/buds.sig '*) cp "$SANDBOX/release-buds.sig" "${!#}" ;;
         *) return 1 ;;
@@ -1406,6 +1426,11 @@ update_script 2>&1
         self.assertIn("仓库更新版本验签失败", out)
         self.assertEqual(target_cli.read_text(encoding="utf-8"), initial)
         manifest.write_text("1.4.0\n", encoding="utf-8", newline="\n")
+        mixed_cache = mock_download.replace('case " $* " in', '''case " $* " in
+        *'/updates/buds.version.sig '*) printf stale > "${!#}" ;;
+        *'/updates/buds.version?check='*) echo retry >> "$ACTION_FILE"; cp "$SANDBOX/release-buds.version" "${!#}" ;;''')
+        self.assertEqual(self.shell(mixed_cache.replace("update_script 2>&1", "fetch_repo_version")).strip(), "1.4.0")
+        self.assertEqual(self.actions(), "retry\n")
         sign_script(valid)
         release_script.write_text(valid + "echo changed\n", encoding="utf-8", newline="\n")
         out = self.shell(mock_download, expected=1)
