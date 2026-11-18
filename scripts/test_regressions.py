@@ -3,6 +3,8 @@
 Run: python scripts/test_regressions.py (Python 3 and Bash required).
 """
 from pathlib import Path
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 import json
 import os
 import re
@@ -80,73 +82,112 @@ sleep() {{ :; }}
     def test_nodes_menu_dispatches_all_actions_and_requires_matching_delete_confirmation(self):
         result = self.shell(r'''nodes_manage() {
     printf '%s\n' "$*" >> "$ACTION_FILE"
-    [[ "$2" != failed ]]
+    case "$1" in
+        list) echo '节点列表结果' ;;
+        names) printf '%s\n' alpha beta ;;
+        detail) echo "节点 $2 的资料" ;;
+        quick-add) if [[ "$2" == taken ]]; then return 3; fi; [[ "$2" != failed ]] ;;
+    esac
 }
+panel_clear() { echo '<刷新>'; }
+panel_pause() { echo "按回车返回$1…"; IFS= read -r ignored; }
 nodes_menu <<'INPUT'
+1
+
 2
 failed
 
+2
+taken
+alpha
 
-
-
-
+3
+999
+1
+1
 
 2
-alpha
-proxy.example.org
-auto:32
-44000-44031
-self
-random
-custom
+
 3
-alpha
-
-
-
-
-random
 
 4
-alpha
-wrong-name
+
 5
-alpha
+
 6
-alpha
+
 7
-alpha
+
 8
-alpha
+1
+proxy.example.org
+
+2
+3443:3474
+
+3
+same
+
+4
+y
+
+5
+2
+
+6
+self
+
+0
+9
+wrong-name
+
 9
 alpha
-10
-alpha
-11
-alpha
-4
-alpha
-alpha
-1
+
 0
 INPUT
 ''')
         self.assertIn("新增未完成", result)
         self.assertIn("已取消删除", result)
-        self.assertEqual(self.actions().splitlines(), [
-            "list", "add failed --auth keep --obfs keep",
-            "add alpha --domain proxy.example.org --ports auto:32 --public-ports 44000-44031 --tls self --auth random --obfs custom",
-            "edit alpha --auth random --obfs keep", "link alpha", "client alpha", "status alpha",
-            "log alpha", "start alpha", "stop alpha", "restart alpha", "delete alpha --yes", "list",
+        self.assertIn("请从列表中选择一个节点编号", result)
+        self.assertIn("节点列表结果\n按回车返回多节点管理…\n<刷新>", result)
+        actions = self.actions().splitlines()
+        self.assertEqual(actions[:6], ["list", "quick-add failed", "quick-add taken", "quick-add alpha", "link alpha", "names"])
+        self.assertEqual([action for action in actions[6:] if not action.startswith("detail ")], [
+            "link alpha", "client alpha", "status alpha", "log alpha", "start alpha", "stop alpha", "restart alpha",
+            "edit alpha --domain proxy.example.org", "edit alpha --ports 3443:3474", "edit alpha --public-ports same",
+            "edit alpha --auth random --obfs random", "edit alpha --obfs custom", "edit alpha --tls self", "delete alpha --yes",
         ])
 
-    def test_nodes_reserve_the_entire_range_and_reject_unsafe_hopping_versions(self):
+    def node_manager(self, primary_public="443"):
         source = (ROOT / "buds").read_text(encoding="utf-8")
         source = source.split("nodes_source() {\n    cat <<'PY'\n", 1)[1].split("\ntry:\n    main()", 1)[0]
         manager = {}
-        with patch.object(sys, "argv", ["nodes", str(self.config), "443", "443", "proxy.example.com"]):
+        with patch.object(sys, "argv", ["nodes", str(self.config), "443", primary_public, "proxy.example.com"]):
             with patch.dict(sys.modules, {name: ModuleType(name) for name in ("grp", "pwd")}):
                 exec(compile(source, "buds:nodes_source", "exec"), manager)
+        return manager
+
+    def test_quick_add_retries_invalid_fields_and_only_asks_for_public_mapping_when_needed(self):
+        for public, answers, expected_public in [
+            ("443", ["a" * 64 + ".net", "", "0", "32000"], "32000"),
+            ("30443", ["https://broken", "proxy.example.com", "32000:32003", "30443", "42000-42003"], "42000-42003"),
+        ]:
+            with self.subTest(public=public):
+                manager = self.node_manager(public)
+                manager["UNITS"] = self.directory / "units"
+                manager["port_conflicts"] = lambda _: ([], [((int(public), int(public)), "main")])
+                manager["check_hopping"] = lambda _: None
+                with patch("builtins.input", side_effect=answers) as read:
+                    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                        saved = manager["quick_add_preferences"]("alpha")
+                self.assertEqual(read.call_count, len(answers))
+                self.assertEqual(saved.domain, "proxy.example.com")
+                self.assertEqual(saved.public_ports, expected_public)
+                self.assertEqual((saved.auth, saved.obfs, saved.tls), ("random", "random", None))
+
+    def test_nodes_reserve_the_entire_range_and_reject_unsafe_hopping_versions(self):
+        manager = self.node_manager()
         choose_ports = manager["choose_ports"]
         reservations = [((20000, 30002), "first node"), ((30006, 60999), "second node")]
         self.assertEqual(choose_ports("auto:3", reservations), (30003, 30005))
@@ -648,7 +689,7 @@ DOMAIN=node.example.com; CLIENT_PORT_STR=19957; AUTH_PASSWORD=pass; OBFS_PASSWOR
 setup_cli
 """, "install.sh")
         installed_cli = (self.directory / "usr/local/bin/buds").read_text(encoding="utf-8")
-        self.assertIn('SCRIPT_VERSION="1.6.1"', installed_cli)
+        self.assertIn('SCRIPT_VERSION="1.6.2"', installed_cli)
         self.assertNotIn("unsigned sibling", installed_cli)
 
     def test_init_detection_requires_commands_and_runtime(self):

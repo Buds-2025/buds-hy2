@@ -4,7 +4,7 @@ set -e
 CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
-SCRIPT_VERSION="1.6.1"
+SCRIPT_VERSION="1.6.2"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 UPDATE_REPO_URL="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates"
@@ -1811,7 +1811,7 @@ def active(unit):
 
 
 def ports(text):
-    found = re.fullmatch(r"([0-9]{1,5})(?:-([0-9]{1,5}))?", text)
+    found = re.fullmatch(r"([0-9]{1,5})(?:[-:]([0-9]{1,5}))?", text)
     if found:
         start = int(found[1])
         end = int(found[2] or found[1])
@@ -1831,7 +1831,10 @@ def node_name(value):
 
 
 def domain_name(value):
-    value = value.rstrip(".").encode("idna").decode("ascii").lower()
+    try:
+        value = value.rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        raise ValueError("请输入有效域名或 IPv4 地址。") from None
     try:
         address = ipaddress.ip_address(value)
         if address.version == 4:
@@ -2007,7 +2010,7 @@ def apply_preferences(args, old):
     data["ports"], data["public_ports"] = port_text(local_span), port_text(public_span)
     data["auth"] = secret(args.auth, old.get("auth"), "认证密码")
     data["obfs"] = secret(args.obfs, old.get("obfs"), "混淆密码")
-    data["tls"] = args.tls or old.get("tls") or "auto"
+    data["tls"] = args.tls or (old.get("tls") if data["domain"] == old.get("domain") else None) or "auto"
     return data
 
 
@@ -2066,6 +2069,11 @@ def write_files(data, old, stage, path):
         f'tls:\n  cert: "{cert}"\n  key: "{key}"\n'
         f'auth:\n  type: password\n  password: "{data["auth"]}"\n'
         f'obfs:\n  type: salamander\n  salamander:\n    password: "{data["obfs"]}"\n'
+        'quic:\n'
+        '  initStreamReceiveWindow: 16777216\n'
+        '  maxStreamReceiveWindow: 16777216\n'
+        '  initConnReceiveWindow: 41943040\n'
+        '  maxConnReceiveWindow: 41943040\n'
         'masquerade:\n  type: proxy\n  proxy:\n    url: https://news.ycombinator.com/\n'
         '    rewriteHost: true\n')
     client_tls = "  insecure: false\n"
@@ -2299,11 +2307,59 @@ def save_node(args):
     print(f"查看连接信息：buds hy2 nodes link {args.name}")
 
 
+def quick_add_preferences(name):
+    node_name(name)
+    path = ROOT / name
+    link = unit_link(path)
+    if path.exists() or path.is_symlink() or link.exists() or link.is_symlink():
+        print(f"节点或服务已存在：{name}。请换一个名称。", file=sys.stderr)
+        sys.exit(3)
+    reserved, public = port_conflicts(name)
+    default_domain = "" if PRIMARY_DOMAIN == "your.domain.com" else PRIMARY_DOMAIN
+    hint = f"（回车沿用 {default_domain}）" if default_domain else ""
+    while True:
+        try:
+            domain = domain_name(input(f"访问域名或 IPv4{hint}：").strip() or default_domain)
+            break
+        except ValueError as error:
+            print(error, file=sys.stderr)
+
+    local_main = PRIMARY_LISTEN.partition("#")[0].strip() or "443"
+    public_main = PRIMARY_PUBLIC.partition("#")[0].strip() or local_main
+    mapped = (BASE / ".nat-mode").is_file() or public_main.replace(":", "-") != local_main.replace(":", "-")
+    while True:
+        requested = input("本地 UDP 端口（回车自动；单端口、范围或 auto:32）：").strip() or "auto"
+        try:
+            span = choose_ports(requested, reserved + public if requested.startswith("auto") else reserved)
+            check_hopping(span)
+            local = port_text(span)
+            if not mapped:
+                choose_ports(local, public)
+            break
+        except ValueError as error:
+            print(error, file=sys.stderr)
+
+    external = local
+    if mapped:
+        while True:
+            requested = input(f"公网 UDP 端口或范围（回车使用 {local}，需在服务商处映射）：").strip() or local
+            try:
+                external = port_text(choose_ports(requested, public))
+                break
+            except ValueError as error:
+                print(error, file=sys.stderr)
+
+    return argparse.Namespace(action="add", name=name, domain=domain, ports=local,
+                              public_ports=external, auth="random", obfs="random", tls=None)
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(prog="buds hy2 nodes")
     actions = parser.add_subparsers(dest="action")
     actions.add_parser("list")
+    actions.add_parser("names")
+    actions.add_parser("quick-add").add_argument("name")
     for verb in ("add", "edit"):
         command = actions.add_parser(verb)
         command.add_argument("name")
@@ -2321,18 +2377,36 @@ def main():
     args = parser.parse_args(sys.argv[5:])
     if not args.action:
         parser.error("请选择一个多节点命令，或使用 --help 查看帮助。")
-    if args.action == "list":
-        print("名称\t状态\t本地 UDP\t公网 UDP\t地址")
+    if args.action in ("list", "names"):
+        entries = list(nodes())
+        if args.action == "names":
+            for data in entries:
+                print(data["name"])
+            return
+        rows = []
         if (BASE / "config.yaml").is_file():
             state = "运行中" if active("hysteria-server.service") else "已停止"
-            print(f"main\t{state}\t{PRIMARY_LISTEN}\t{PRIMARY_PUBLIC}\t{PRIMARY_DOMAIN}")
-        for data in nodes():
+            rows.append(("main", state, PRIMARY_LISTEN or "443", PRIMARY_PUBLIC or PRIMARY_LISTEN or "443", PRIMARY_DOMAIN))
+        for data in entries:
             state = "运行中" if active(unit_name(data["name"])) else "已停止"
-            print(f"{data['name']}\t{state}\t{data['ports']}\t{data['public_ports']}\t{data['domain']}")
+            rows.append((data["name"], state, data["ports"], data["public_ports"], data["domain"]))
+        if not rows:
+            print("尚未配置节点。")
+            return
+        width = max(len(row[0]) for row in rows)
+        width = max(width, 4)
+        print(f"{'名称':<{width - 2}}  {'状态':<4}  {'本地 UDP':<11}  {'公网 UDP':<11}  地址")
+        for name, state, local, public, domain in rows:
+            print(f"{name:<{width}}  {state}  {local:<13}  {public:<13}  {domain}")
         return
-    if args.action in ("add", "edit"):
+    if args.action in ("add", "edit", "quick-add"):
         if pwd.getpwnam("hysteria").pw_gid != grp.getgrnam("hysteria").gr_gid:
             raise ValueError("请检查现有 hysteria 服务账户和用户组。")
+        if args.action == "quick-add":
+            import fcntl
+            args = quick_add_preferences(args.name)
+            print("正在生成认证密码、混淆密码和证书，并启动节点…", flush=True)
+            fcntl.flock(9, fcntl.LOCK_EX)
         save_node(args)
         return
     if args.name == "main":
@@ -2378,7 +2452,7 @@ except subprocess.CalledProcessError as error:
     sys.exit((error.stderr or error.stdout or "系统命令执行失败。").strip())
 except subprocess.TimeoutExpired:
     sys.exit("系统命令超时，请检查节点和防火墙状态。")
-except KeyboardInterrupt:
+except (EOFError, KeyboardInterrupt):
     sys.exit("操作已取消。")
 PY
 }
@@ -2398,7 +2472,8 @@ nodes_manage() (
     for dependency in python3 flock ss openssl; do
         command -v "$dependency" >/dev/null || { echo "多节点管理缺少 $dependency。" >&2; return 1; }
     done
-    exec 9>/run/buds-hy2-nodes.lock && flock -x 9 || return 1
+    exec 9>/run/buds-hy2-nodes.lock || return 1
+    if [[ "$action" != quick-add ]]; then flock -x 9 || return 1; fi
     if [[ "$action" == link || "$action" == client ]]; then
         nodes_tool detail "$name" || return 1
         CONFIG_DIR="$CONFIG_DIR/nodes/$name"
@@ -2413,61 +2488,156 @@ nodes_manage() (
     fi
 )
 
-nodes_form() {
-    local action=$1 name domain ports public tls auth obfs
-    local -a options=()
-    if [[ "$action" == add ]]; then
-        echo '直接回车可沿用主节点地址，自动生成端口、认证密码和混淆密码。'
-    else
-        echo '直接回车可保留现有值。保存更改时，运行中的选定节点会短暂重启。'
+panel_clear() {
+    if [[ -t 1 && "${TERM:-dumb}" != dumb ]]; then printf '\033[H\033[2J'; fi
+}
+
+panel_pause() {
+    if [[ -t 0 && -t 1 ]]; then
+        local key
+        printf '\n'
+        IFS= read -rp "按回车返回$1… " key
     fi
-    read -rp '节点名称（回车取消）: ' name && [[ -n "$name" ]] || return 0
-    read -rp '访问域名或 IPv4 地址: ' domain || return 0
-    read -rp '本地 UDP 端口（如 3443、3443-3474 或 auto:32）: ' ports || return 0
-    read -rp '公网 UDP 端口（NAT 映射时填写，same 表示同本地）: ' public || return 0
-    read -rp 'TLS 证书（auto 自动 / self 自签名 / shared 复用主节点）: ' tls || return 0
-    read -rp '认证密码（random 重新生成 / custom 手动输入）: ' auth || return 0
-    read -rp '混淆密码（random 重新生成 / custom 手动输入）: ' obfs || return 0
-    [[ -z "$domain" ]] || options+=(--domain "$domain")
-    [[ -z "$ports" ]] || options+=(--ports "$ports")
-    [[ -z "$public" ]] || options+=(--public-ports "$public")
-    [[ -z "$tls" ]] || options+=(--tls "$tls")
-    nodes_manage "$action" "$name" "${options[@]}" --auth "${auth:-keep}" --obfs "${obfs:-keep}"
+}
+
+nodes_quick_add() {
+    local name rc
+    printf '\nHysteria 2 新节点安装\n\n'
+    while true; do
+        read -rp '节点名称（回车自动，输入 0 取消）：' name || return 0
+        if [[ "$name" == 0 ]]; then return 0; fi
+        name=${name:-node-$(date +%m%d%H%M%S)-$RANDOM}
+        if [[ ! "$name" =~ ^[a-z0-9][a-z0-9_-]{0,30}$ || "$name" == main ]]; then
+            echo '请输入 1–31 位小写字母、数字、下划线或短横线，名称以字母或数字开头。'
+            continue
+        fi
+        if nodes_manage quick-add "$name"; then break; else rc=$?; fi
+        if (( rc != 3 )); then return "$rc"; fi
+    done
+    nodes_manage link "$name" || printf '节点已启动。可在节点菜单重新查看 %s 的连接链接。\n' "$name"
+}
+
+nodes_edit_menu() {
+    local name=$1 choice flag value prompt
+    while true; do
+        panel_clear
+        printf '\n编辑节点 %s\n\n' "$name"
+        printf '%s\n' '1. 访问地址      2. 本地 UDP 端口' \
+            '3. 公网端口映射  4. 重新生成认证和混淆密码' \
+            '5. 自定义密码    6. TLS 证书' '0. 返回节点菜单'
+        read -rp '请选择要修改的设置：' choice || return 0
+        case "$choice" in
+            1) flag=--domain; prompt='新域名或 IPv4 地址（回车取消）：' ;;
+            2) flag=--ports; prompt='新本地 UDP 单端口、范围或 auto:32（回车取消）：' ;;
+            3) flag=--public-ports; prompt='公网 UDP 端口或范围（same 与本地相同，回车取消）：' ;;
+            4)
+                read -rp '替换两种密码后需重新导入客户端配置。确认？[y/N] ' value || return 0
+                if [[ "${value,,}" == y ]]; then
+                    nodes_manage edit "$name" --auth random --obfs random || echo '密码更新未完成。'
+                    panel_pause '编辑菜单' || return 0
+                fi
+                continue ;;
+            5)
+                read -rp '1. 认证密码  2. 混淆密码  0. 取消：' value || return 0
+                case "$value" in
+                    1) nodes_manage edit "$name" --auth custom || echo '密码更新未完成。' ;;
+                    2) nodes_manage edit "$name" --obfs custom || echo '密码更新未完成。' ;;
+                    *) continue ;;
+                esac
+                panel_pause '编辑菜单' || return 0
+                continue ;;
+            6) flag=--tls; prompt='auto 自动 / self 自签名 / shared 复用主证书（回车取消）：' ;;
+            0|'') return 0 ;;
+            *) echo '请输入有效编号。'; panel_pause '编辑菜单' || return 0; continue ;;
+        esac
+        read -rp "$prompt" value || return 0
+        if [[ -z "$value" ]]; then continue; fi
+        nodes_manage edit "$name" "$flag" "$value" || echo '修改未完成，请检查提示。'
+        panel_pause '编辑菜单' || return 0
+    done
+}
+
+nodes_selected_menu() {
+    local name=$1 choice action confirm
+    while true; do
+        panel_clear
+        printf '\n管理节点 %s\n\n' "$name"
+        if ! nodes_manage detail "$name"; then
+            panel_pause '多节点管理' || true
+            return 0
+        fi
+        printf '\n%s\n' '1. 连接链接  2. 客户端配置  3. 运行状态  4. 最近日志'
+        printf '%s\n' '5. 启动  6. 停止  7. 重启  8. 编辑设置  9. 删除' '0. 返回多节点管理'
+        read -rp '请选择节点操作：' choice || return 0
+        case "$choice" in
+            1) action=link ;;
+            2) action=client ;;
+            3) action=status ;;
+            4) action=log ;;
+            5) action=start ;;
+            6) action=stop ;;
+            7) action=restart ;;
+            8) nodes_edit_menu "$name"; continue ;;
+            9)
+                read -rp "输入 $name 确认删除（回车取消）：" confirm || return 0
+                if [[ "$confirm" == "$name" ]]; then
+                    if nodes_manage delete "$name" --yes; then
+                        panel_pause '多节点管理' || true
+                        return 0
+                    fi
+                    echo '删除未完成，请检查提示。'
+                else
+                    echo '已取消删除。'
+                fi
+                panel_pause '节点菜单' || return 0
+                continue ;;
+            0|'') return 0 ;;
+            *) echo '请输入有效编号。'; panel_pause '节点菜单' || return 0; continue ;;
+        esac
+        nodes_manage "$action" "$name" || echo '操作未完成，请检查提示。'
+        panel_pause '节点菜单' || return 0
+    done
+}
+
+nodes_pick() {
+    local listed choice i
+    local -a names
+    if ! listed=$(nodes_manage names); then
+        panel_pause '多节点管理' || true
+        return 0
+    fi
+    if [[ -z "$listed" ]]; then
+        echo '还没有新增节点。可选择 2 一键新增，原有主节点由主菜单管理。'
+        panel_pause '多节点管理' || true
+        return 0
+    fi
+    mapfile -t names <<< "$listed"
+    printf '\n选择一个新增节点\n\n'
+    for i in "${!names[@]}"; do printf '%s. %s\n' "$((i+1))" "${names[i]}"; done
+    while read -rp '输入节点编号（回车取消）：' choice && [[ -n "$choice" && "$choice" != 0 ]]; do
+        if [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && (( choice <= ${#names[@]} )); then
+            nodes_selected_menu "${names[choice-1]}"
+            return 0
+        fi
+        echo '请从列表中选择一个节点编号。'
+    done
 }
 
 nodes_menu() {
-    local choice action name confirm
-    if ! nodes_manage list; then return 0; fi
+    local choice
     while true; do
-        echo
-        echo '1. 列出节点   2. 新增节点   3. 编辑节点   4. 删除节点'
-        echo '5. 连接链接   6. 客户端配置 7. 节点状态   8. 最近日志'
-        echo '9. 启动节点  10. 停止节点  11. 重启节点   0. 返回主菜单'
-        read -rp '请选择多节点操作: ' choice || return 0
+        panel_clear
+        printf '\nHysteria 2 多节点管理\n\n'
+        printf '%s\n' '1. 节点列表' '2. 一键新增节点' '3. 管理已有节点' '0. 返回主菜单'
+        read -rp '请选择多节点操作：' choice || return 0
         case "$choice" in
-            1) nodes_manage list || true; continue ;;
-            2) nodes_form add || echo '新增未完成，请检查上方提示。'; continue ;;
-            3) nodes_form edit || echo '修改未完成，请检查上方提示。'; continue ;;
-            4) action=delete ;;
-            5) action=link ;;
-            6) action=client ;;
-            7) action=status ;;
-            8) action=log ;;
-            9) action=start ;;
-            10) action=stop ;;
-            11) action=restart ;;
+            1) nodes_manage list || true ;;
+            2) nodes_quick_add || echo '新增未完成，请检查提示。' ;;
+            3) nodes_pick; continue ;;
             0|'') return 0 ;;
-            *) echo '输入无效，请重新选择。'; continue ;;
+            *) echo '请输入有效编号。' ;;
         esac
-        read -rp '节点名称（回车取消）: ' name && [[ -n "$name" ]] || continue
-        if [[ "$action" == delete ]]; then
-            read -rp "再次输入 $name 确认删除: " confirm && [[ "$confirm" == "$name" ]] || {
-                echo '已取消删除。'; continue;
-            }
-            nodes_manage delete "$name" --yes || echo '删除未完成，请检查上方提示。'
-        else
-            nodes_manage "$action" "$name" || echo '操作未完成，请检查上方提示。'
-        fi
+        panel_pause '多节点管理' || return 0
     done
 }
 
@@ -2524,6 +2694,7 @@ uninstall() (
         echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已卸载，本项目创建的防火墙规则已清理，原有 Nginx 及其他系统服务未作修改。${C_RESET}\n"
     else
         echo -e "\n  已取消卸载。\n"
+        if [[ "${1:-}" == menu ]]; then return 1; fi
     fi
 )
 
@@ -2674,10 +2845,11 @@ warp_domains_menu() {
     local choice old new file confirm
     local -a items
     while true; do
+        panel_clear
         printf '\n域名清单：1 查看　2 添加　3 删除　4 修改　5 导入整份清单　6 恢复 Google 默认清单　0 返回\n'
         read -rp "请选择： " choice || return
         case "$choice" in
-            1) warp_manage domains list || return 1 ;;
+            1) warp_manage domains list || true ;;
             2|3)
                 read -ra items -p "输入域名，多个域名用空格分隔： " || return
                 if [[ "$choice" == 2 ]]; then warp_manage domains add "${items[@]}" || true
@@ -2694,6 +2866,7 @@ warp_domains_menu() {
             0|"") return 0 ;;
             *) echo "请输入 0 至 6。" ;;
         esac
+        panel_pause '域名管理' || return 0
     done
 }
 
@@ -2720,6 +2893,7 @@ warp_menu_begin() {
 warp_menu() {
     local choice profile confirm
     while true; do
+        panel_clear
         printf '\nWARP 定向分流\n'
         if systemctl is-active --quiet "$WARP_UNIT" 2>/dev/null; then
             echo "WARP 分流正在运行。"
@@ -2762,7 +2936,7 @@ warp_menu() {
                 ;;
             c) warp_manage check || true ;;
             d) warp_manage disable || echo "关闭未完成，请参照上方提示。" ;;
-            m) warp_domains_menu || true ;;
+            m) warp_domains_menu; continue ;;
             g)
                 warp_manage gemini-family || true
                 read -rp '输入 auto、ipv4 或 ipv6（更改需要短暂重启 WARP，回车返回）: ' profile || return 0
@@ -2771,11 +2945,12 @@ warp_menu() {
             0|"") return 0 ;;
             *) echo "选项无效，请重新选择。" ;;
         esac
+        panel_pause 'WARP 菜单' || return 0
     done
 }
 
 show_menu() {
-    local remote_ver
+    local remote_ver choice
     remote_ver=$(check_remote_version 2>/dev/null) || remote_ver=""
     while true; do
         local status_badge domain listen has_update
@@ -2808,7 +2983,7 @@ show_menu() {
             has_update=true
         fi
 
-        clear 2>/dev/null || true
+        panel_clear
         echo -e "       ${C_SPARK}✧${C_RESET}                                      ${C_SPARK}✦${C_RESET}"
         echo -e "  ${C_ORANGE_BOLD}█▀▀█ █  █ █▀▀▄ █▀▀▀${C_RESET}   ${C_GRAY_LIGHT}█  █ █  █ █▀▀█${C_RESET}"
         echo -e "  ${C_ORANGE_BOLD}█▀▀▄ █  █ █  █ ▀▀▀█${C_RESET}   ${C_GRAY_LIGHT}█▀▀█ ▀██▀   ▄▀${C_RESET}"
@@ -2848,30 +3023,27 @@ show_menu() {
 
         read -rp "$(echo -e "  ${C_ORANGE_BOLD}❯${C_RESET} ${C_WHITE}请选择操作编号 [0-12]: ${C_RESET}")" choice || return 0
         case "$choice" in
-            1) status || true; read -rp "按回车键返回主菜单..." ;;
-            2) link || true; read -rp "按回车键返回主菜单..." ;;
-            3) client || true; read -rp "按回车键返回主菜单..." ;;
+            1) status || true ;;
+            2) link || true ;;
+            3) client || true ;;
             4) log || true ;;
-            5) restart || echo -e "  ${C_RED}✖ 重启服务失败，请检查状态或日志。${C_RESET}"; read -rp "按回车键返回主菜单..." ;;
-            6) start || echo -e "  ${C_RED}✖ 启动服务失败，请检查状态或日志。${C_RESET}"; read -rp "按回车键返回主菜单..." ;;
-            7) stop || echo -e "  ${C_RED}✖ 停止服务失败，请检查进程状态。${C_RESET}"; read -rp "按回车键返回主菜单..." ;;
+            5) restart || echo -e "  ${C_RED}✖ 重启服务失败，请检查状态或日志。${C_RESET}" ;;
+            6) start || echo -e "  ${C_RED}✖ 启动服务失败，请检查状态或日志。${C_RESET}" ;;
+            7) stop || echo -e "  ${C_RED}✖ 停止服务失败，请检查进程状态。${C_RESET}" ;;
             8|[uU]|update)
-                if update_script; then
-                    read -rp "按回车键重新加载主菜单..."
-                    if [[ -x "${BUDS_CLI:-/usr/local/bin/buds}" ]]; then
-                        exec "${BUDS_CLI:-/usr/local/bin/buds}" hy2
-                    fi
-                else
-                    read -rp "按回车键返回主菜单..."
+                if update_script && [[ -x "$BUDS_CLI" ]]; then
+                    panel_pause '主菜单' || return 0
+                    exec "$BUDS_CLI" hy2
                 fi
                 ;;
-            9) renew_test || echo -e "  ${C_RED}✖ 证书续签模拟失败，请检查日志。${C_RESET}"; read -rp "按回车键返回主菜单..." ;;
-            10) if uninstall; then break; fi; read -rp "按回车键返回主菜单..." || return 0 ;;
-            11) warp_menu ;;
-            12) nodes_menu ;;
+            9) renew_test || echo -e "  ${C_RED}✖ 证书续签模拟失败，请检查日志。${C_RESET}" ;;
+            10) if uninstall menu; then break; fi ;;
+            11) warp_menu; continue ;;
+            12) nodes_menu; continue ;;
             0) exit 0 ;;
             *) echo "输入无效，请重新选择。" ;;
         esac
+        panel_pause '主菜单' || return 0
     done
 }
 
