@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -41,7 +42,7 @@ class Regressions(unittest.TestCase):
                 source = source.replace(prefix, self.sandbox + prefix)
             self.sources[name] = source
 
-    def shell(self, script, source="buds", expected=0):
+    def shell(self, script, source="buds", expected=0, timeout=15):
         prelude = f"""
 set -eo pipefail
 SANDBOX={shlex.quote(self.sandbox)}
@@ -65,13 +66,292 @@ sleep() {{ :; }}
         result = subprocess.run(
             [BASH, "--noprofile", "--norc", "-s"],
             input=self.sources[source] + "\n" + prelude + script,
-            text=True, encoding="utf-8", capture_output=True, timeout=15,
+            text=True, encoding="utf-8", capture_output=True, timeout=timeout,
         )
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result.stdout
 
     def actions(self):
         return (self.directory / "actions").read_text(encoding="utf-8")
+
+    def test_warp_domain_policy_and_profile_import(self):
+        profile = self.directory / "wgcf.conf"
+        profile.write_text("[Interface]\nAddress=172.16.0.2/32\nAddress=fd42::2/128\n"
+                           "PrivateKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+                           "PostUp=touch injected\n[Peer]\nEndpoint=[2001:db8::1]:2408\n"
+                           "PublicKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=\n"
+                           "AllowedIPs=0.0.0.0/0, ::/0\n")
+        python = shlex.quote(Path(sys.executable).as_posix())
+        self.shell(f'python3() {{ {python} -X utf8 "$@"; }}\n' + """
+cd "$SANDBOX"
+warp_domains > domains
+warp_config wgcf.conf domains 1.13.0 > split.json
+""")
+        config = json.loads((self.directory / "split.json").read_text())
+        dns_rule = config["dns"]["rules"][0]
+        domains = set(dns_rule["domain_suffix"])
+        for host in ("play.google.com", "scholar.google.co.uk", "gemini.google.com", "www.youtube.com",
+                     "video.googlevideo.com"):
+            self.assertTrue(any(host == d or host.endswith("." + d) for d in domains), host)
+        for host in ("x.com", "github.com", "google.com.example.org", "chatgpt.com", "openai.com",
+                     "cdn.oaistatic.com", "api.anthropic.com", "claude.ai", "claude.com"):
+            self.assertFalse(any(host == d or host.endswith("." + d) for d in domains), host)
+        self.assertEqual(set(dns_rule["query_type"]), {"A", "AAAA"})
+        self.assertEqual(config["route"]["rules"][-1]["action"], "reject")
+        self.assertFalse(config["inbounds"][0]["auto_route"])
+        wg = config["endpoints"][0]
+        self.assertFalse(wg["system"])
+        self.assertEqual(wg["address"], ["172.16.0.2/32", "fd42::2/128"])
+        self.assertEqual(wg["peers"][0]["address"], "2001:db8::1")
+        self.assertFalse((self.directory / "injected").exists())
+        if os.environ.get("BUDS_TEST_SING_BOX"):
+            subprocess.run([os.environ["BUDS_TEST_SING_BOX"], "check", "-c", "split.json"],
+                           cwd=self.directory, check=True, capture_output=True)
+
+    def test_warp_cleanup_preserves_foreign_unit(self):
+        self.shell("""
+mkdir -p "$WARP_DIR"
+touch "$WARP_DIR/config.json" "$WARP_DIR/.buds-managed"
+systemctl() { echo "$*" >> "$ACTION_FILE"; echo loaded; }
+if warp_remove; then exit 9; fi
+test -e "$WARP_DIR/config.json"
+""")
+        self.assertNotIn("disable", self.actions())
+        self.assertNotIn("stop", self.actions())
+
+    def test_warp_policy_migrates_old_install_and_renders_empty_policy(self):
+        python = shlex.quote(Path(sys.executable).as_posix())
+        self.shell(f'python3() {{ {python} -X utf8 "$@"; }}\n' + """
+umask 077
+mkdir -p "$WARP_DIR"
+cd "$WARP_DIR"
+touch .buds-managed
+echo 'google.com chatgpt.com' > domains
+cat > legacy.conf <<'WG'
+[Interface]
+Address=172.16.0.2/32
+PrivateKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+[Peer]
+PublicKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=
+Endpoint=192.0.2.1:2408
+AllowedIPs=0.0.0.0/0
+WG
+warp_config legacy.conf domains 1.13.0 > config.json
+warp_prepare_policy
+python3 policy.py render base.json ../warp-domains .
+grep -Fxq chatgpt.com domains
+warp_domains > "$WARP_LIST"
+python3 policy.py render base.json ../warp-domains .
+if grep -Fxq chatgpt.com domains; then exit 9; fi
+grep -Fxq google.com domains
+: > "$WARP_LIST"
+python3 policy.py render base.json ../warp-domains .
+bash link-up
+test ! -s domains
+""")
+        root = self.directory / "etc/buds-hy2/warp-split"
+        backup = json.loads((root / "base.json").read_text())
+        config = json.loads((root / "config.json").read_text())
+        self.assertEqual(backup["endpoints"], config["endpoints"])
+        self.assertEqual(config["route"]["rules"], [{"action": "reject"}])
+        if os.environ.get("BUDS_TEST_SING_BOX"):
+            subprocess.run([os.environ["BUDS_TEST_SING_BOX"], "check", "-c", "config.json"],
+                           cwd=root, check=True, capture_output=True)
+
+    def test_warp_checks_competing_resolved_domains(self):
+        python = shlex.quote(Path(sys.executable).as_posix())
+        out = self.shell(f'python3() {{ {python} -X utf8 "$@"; }}\n' + """
+cd "$SANDBOX"
+warp_policy_tool > policy.py
+printf '%s\n' team.example.com > domains
+printf '%s\n' 'Global: ~. example.com' 'Link 3 (vpn0): ~other.example.com' \
+    'Link 4 (buds-warp0): ~team.example.com' | python3 -I policy.py check-resolved domains
+for conflict in 'Global: ~TEAM.EXAMPLE.COM.' 'Link 3 (vpn0): team.example.com' \
+    'Link 3 (vpn0): ~branch.team.example.com'; do
+    if printf '%s\n' "$conflict" | python3 -I policy.py check-resolved domains 2>&1; then exit 9; fi
+done
+if printf '%s\n' 'Global: ~.' 'Link 3 (vpn0):' '     ~branch.team.example.com' \
+    | python3 -I policy.py check-resolved domains 2>&1; then exit 9; fi
+""")
+        self.assertEqual(out.count("DNS 路由域冲突"), 4)
+
+    def test_warp_trace_detects_swapped_exits(self):
+        self.shell("""
+mkdir -p "$WARP_DIR"
+echo chatgpt.com > "$WARP_DIR/domains"
+curl() { case "${!#}" in *chatgpt.com/*) echo warp=on ;; *) echo warp=off ;; esac; }
+warp_trace
+curl() { echo warp=off; }
+if warp_trace; then exit 9; fi
+echo google.com > "$WARP_DIR/domains"
+warp_trace
+""")
+
+    def test_warp_requires_exclusive_stub(self):
+        self.shell("""
+resolv="$SANDBOX/etc/resolv.conf"
+printf '%s\n' '#nameserver 9.9.9.9' '  nameserver 127.0.0.53' > "$resolv"
+warp_check_stub
+printf '%s\n' 'nameserver 9.9.9.9' 'options rotate' >> "$resolv"
+if warp_check_stub; then exit 9; fi
+: > "$resolv"
+if warp_check_stub; then exit 9; fi
+""")
+
+    def test_warp_tunnel_probe_requires_confirmed_exit(self):
+        self.shell("""
+mkdir -p "$WARP_DIR"
+echo custom.example > "$WARP_DIR/domains"
+curl() {
+    [[ " $* " == *' --resolve one.one.one.one:443:198.18.240.3 '* ]] || return 1
+    printf '%s\r\n' "$response"
+}
+response=warp=on
+warp_tunnel_probe
+response=warp=off
+if warp_tunnel_probe; then exit 9; fi
+response=
+if warp_tunnel_probe; then exit 9; fi
+: > "$WARP_DIR/domains"
+warp_tunnel_probe
+""")
+
+    def test_warp_partial_install_cleanup_is_retryable(self):
+        self.shell("""
+mkdir -p "$WARP_DIR"
+touch "$WARP_DIR/config.json" "$WARP_DIR/.buds-managed" "$WARP_DIR/unrelated"
+systemctl() { if [[ "$1" == show ]]; then echo not-found; fi; }
+if warp_remove; then exit 9; fi
+test -f "$WARP_DIR/unrelated" && test -f "$WARP_DIR/.buds-managed"
+rm "$WARP_DIR/unrelated"
+warp_remove
+test ! -e "$WARP_DIR"
+warp_remove
+""")
+
+    def test_warp_rollback_clears_only_start_rate_limit(self):
+        python = shlex.quote(Path(sys.executable).as_posix())
+        for result in ("start-limit-hit", "exit-code"):
+            with self.subTest(result=result):
+                output = self.shell(f'PYTHON_BIN={python}\nRESULT={result}\n' + """
+mkdir -p "$WARP_DIR" "$SANDBOX/etc/systemd/system"
+touch "$WARP_DIR/.buds-managed" "$WARP_DIR/$WARP_UNIT"
+ln -f "$WARP_DIR/$WARP_UNIT" "$SANDBOX/etc/systemd/system/$WARP_UNIT"
+echo previous.example > "$WARP_LIST"
+cp "$WARP_LIST" "$WARP_DIR/domains"
+warp_prepare_policy() { :; }
+python3() {
+    case " $* " in *"policy.py render "*) return 0 ;; esac
+    "$PYTHON_BIN" -X utf8 "$@"
+}
+sing-box() { :; }
+systemctl() {
+    echo "$*" >> "$ACTION_FILE"
+    case "$1" in
+        is-active) return 0 ;;
+        restart) return 1 ;;
+        show) echo "$RESULT" ;;
+        reset-failed) [[ "$RESULT" == start-limit-hit ]] ;;
+        start) [[ $(cat "$WARP_LIST") == previous.example ]] ;;
+        *) return 1 ;;
+    esac
+}
+if warp_edit_domains add next.example 2>&1; then exit 9; fi
+[[ $(cat "$WARP_LIST") == previous.example ]]
+""")
+                actions = self.actions().splitlines()
+                self.assertEqual(actions.count("restart buds-warp-split.service"), 2)
+                expected = int(result == "start-limit-hit")
+                self.assertEqual(actions.count("reset-failed buds-warp-split.service"), expected)
+                self.assertEqual(actions.count("start buds-warp-split.service"), expected)
+                self.assertIn("已恢复原清单和服务" if expected else "恢复失败", output)
+
+    def test_warp_enable_failure_rollback_and_repeat_enable(self):
+        # Use a harmless character device for the TUN presence check.
+        self.sources["buds"] = self.sources["buds"].replace("/dev/net/tun", "/dev/null")
+        python = shlex.quote(Path(sys.executable).as_posix())
+        self.shell(f'python3() {{ {python} -X utf8 "$@"; }}\n' + """
+mkdir -p "$SANDBOX/bin" "$SANDBOX/run/systemd/system" "$SANDBOX/etc/systemd/system"
+printf 'nameserver 127.0.0.53\n' > "$SANDBOX/etc/resolv.conf"
+cat > "$SANDBOX/bin/sing-box" <<'SB'
+#!/usr/bin/env bash
+case "$1" in
+    version) echo 'sing-box version 1.13.0' ;;
+    check) test -s "$3" ;;
+    *) exit 1 ;;
+esac
+SB
+chmod +x "$SANDBOX/bin/sing-box"
+export PATH="$SANDBOX/bin:$PATH"
+profile_path="$SANDBOX/wg.conf"
+printf '%s\n' '[Interface]' 'Address=172.16.0.2/32' 'PrivateKey=fixture' '[Peer]' \\
+    'PublicKey=fixture' 'Endpoint=Peer.Example.NET:2408' 'AllowedIPs=0.0.0.0/0' > "$profile_path"
+unit_path="$SANDBOX/etc/systemd/system/$WARP_UNIT"
+resolvectl() { :; }
+ip() { :; }
+flock() { :; }
+systemctl() {
+    echo "$*" >> "$ACTION_FILE"
+    case "$1" in
+        is-active) [[ "${!#}" == systemd-resolved || -f "$SANDBOX/active" ]] ;;
+        show) echo not-found ;;
+        enable) ln "$2" "$unit_path" ;;
+        start|restart)
+            (cd "$WARP_DIR" && python3 policy.py render base.json ../warp-domains .) || return 1
+            if [[ -e "$SANDBOX/fail-once" ]]; then rm "$SANDBOX/fail-once"; return 1; fi
+            touch "$SANDBOX/active" ;;
+        stop) rm -f "$SANDBOX/active" ;;
+        disable) rm "$unit_path" ;;
+        daemon-reload) : ;;
+        *) return 1 ;;
+    esac
+}
+warp_verify() { return "$verify_rc"; }
+warp_trace() { :; }
+warp_tunnel_probe() { :; }
+verify_rc=1
+if warp_manage enable "$profile_path"; then exit 9; fi
+[[ ! -e "$WARP_DIR" && ! -e "$unit_path" && ! -e "$SANDBOX/active" ]]
+verify_rc=0
+warp_manage domains add 'Example.COM.' example.com
+warp_manage domains list > "$SANDBOX/policy"
+[[ $(grep -cx 'example.com' "$SANDBOX/policy") == 1 ]]
+if warp_manage domains add 'https://wrong.example/path' accepted.example; then exit 9; fi
+if grep -Fxq accepted.example "$WARP_LIST"; then exit 9; fi
+warp_manage enable "$profile_path"
+[[ -s "$WARP_DIR/config.json" && -e "$unit_path" && -e "$SANDBOX/active" ]]
+if warp_manage domains add example.net; then exit 9; fi
+if grep -Fxq example.net "$WARP_LIST"; then exit 9; fi
+warp_domain_selected child.example.com
+if warp_domain_selected badexample.com; then exit 9; fi
+warp_manage domains replace example.com new.example
+warp_domain_selected new.example
+if warp_domain_selected example.com; then exit 9; fi
+touch "$SANDBOX/fail-once"
+if warp_manage domains remove new.example; then exit 9; fi
+warp_domain_selected new.example
+grep -Fxq new.example "$WARP_LIST"
+warp_manage domains remove new.example
+if warp_domain_selected new.example; then exit 9; fi
+printf '%s\n' '# Custom' 'chatgpt.com' > "$SANDBOX/list.txt"
+warp_manage domains import "$SANDBOX/list.txt"
+[[ $(cat "$WARP_DIR/domains") == chatgpt.com ]]
+: > "$SANDBOX/list.txt"
+warp_manage domains import "$SANDBOX/list.txt"
+[[ ! -s "$WARP_DIR/domains" ]]
+python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); assert c["route"]["rules"] == [{"action":"reject"}] and not c["dns"]["rules"]' "$WARP_DIR/config.json"
+warp_manage domains add only.example
+warp_manage enable "$profile_path"
+warp_manage disable
+warp_manage disable
+[[ ! -e "$WARP_DIR" && ! -e "$unit_path" && ! -e "$SANDBOX/active" && -s "$profile_path" ]]
+[[ $(warp_manage domains list) == only.example ]]
+warp_manage domains reset
+grep -Fxq google.com "$WARP_LIST"
+if grep -Eq 'only.example|openai.com|chatgpt.com|anthropic.com' "$WARP_LIST"; then exit 9; fi
+""", timeout=45)
+        self.assertEqual(self.actions().splitlines().count("start buds-warp-split.service"), 2)
+        self.assertEqual(self.actions().count("stop buds-warp-split.service"), 2)
 
     def journal(self, contents):
         (self.config / ".firewall_rule").write_text(contents, encoding="utf-8", newline="\n")
@@ -142,7 +422,7 @@ DOMAIN=node.example.com; CLIENT_PORT_STR=19957; AUTH_PASSWORD=pass; OBFS_PASSWOR
 setup_cli
 """, "install.sh")
         installed_cli = (self.directory / "usr/local/bin/buds").read_text(encoding="utf-8")
-        self.assertIn('SCRIPT_VERSION="1.3.1"', installed_cli)
+        self.assertIn('SCRIPT_VERSION="1.5.0"', installed_cli)
         self.assertNotIn("unsigned sibling", installed_cli)
 
     def test_init_detection_requires_commands_and_runtime(self):
@@ -834,6 +1114,7 @@ check_remote_version
         openssl("genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", private_key)
         openssl("pkey", "-in", private_key, "-pubout", "-out", public_key)
         mock_download = """
+SCRIPT_VERSION=1.3.1
 flock() { [[ "$1" == -x && "$2" =~ ^[0-9]+$ ]]; }
 curl() {
     case " $* " in
@@ -873,7 +1154,7 @@ update_script 2>&1
         self.assertIn("已安装 v1.4.0", out)
 
     def test_update_requires_provisioned_key(self):
-        out = self.shell('curl() { echo "1.4.0"; }\nupdate_script 2>&1\n', expected=1)
+        out = self.shell('SCRIPT_VERSION=1.3.1\ncurl() { echo "1.4.0"; }\nupdate_script 2>&1\n', expected=1)
         self.assertIn("缺少可信发布公钥", out)
 
     def test_disabled_ufw_matches_proto_from_format(self):

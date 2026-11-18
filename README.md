@@ -74,6 +74,54 @@ buds hy2 uninstall   # 安全卸载服务
 
 管理面板从 GitHub Release 检查版本。更新需要 `curl`、`openssl`、`flock` 和预先安装的可信公钥。只有版本匹配、签名有效且通过 Bash 语法检查的脚本才会替换现有 CLI。
 
+### WARP 系统级域名分流（v1.5.0）
+
+菜单第11项管理分流，默认关闭。已有节点可在取得包含此功能的签名版本后升级CLI。直接使用可信源码时，将下文的`buds hy2 warp`换为`bash "/源码绝对路径/buds" hy2 warp`，并填入本机实际路径。使用同一份脚本即可查看状态、关闭分流或卸载节点。
+
+适用于使用systemd和systemd-resolved的Linux VPS。`/etc/resolv.conf`中的有效`nameserver`必须全部指向本机存根`127.0.0.53`。混用外部DNS可能导致同一目标有时走WARP、有时走原出口。需要内核TUN、启用本机IPv6协议栈、iproute2、Python 3、curl、flock，以及包含WireGuard和gVisor的sing-box 1.12或更高1.x版本。VPS的公网可以只有IPv4。sing-box可按[官方软件包说明](https://sing-box.sagernet.org/installation/package-manager/)安装。
+
+准备一个有效的WARP WireGuard配置。如果已经用参考项目生成过配置，可以直接使用`/etc/warp/wgcf-profile.conf`。首次使用可在私有目录中运行下列命令生成配置，需要预先安装[wgcf](https://github.com/ViRb3/wgcf)并完成账号注册。只需配置文件，无须启动wg-quick或把系统默认出口切换到WARP。
+
+```bash
+umask 077
+mkdir -p /root/buds-wgcf && cd /root/buds-wgcf
+wgcf register
+wgcf generate
+buds hy2 warp enable /root/buds-wgcf/wgcf-profile.conf
+```
+
+```bash
+buds hy2 warp enable   # 使用 /etc/warp/wgcf-profile.conf
+buds hy2 warp status   # 查看服务状态
+buds hy2 warp check    # 抽查 DNS 和内核选路，非空清单还会实测 WARP 隧道出口
+buds hy2 warp disable  # 停止分流，清理专用服务及配置副本
+```
+
+内置清单只包含Google系列服务，覆盖搜索、Play、谷歌学术、YouTube、Gemini及相关资源域名。ChatGPT、Claude、GitHub和x.com默认沿用原有出口。列入清单的域名由专用解析器分配虚拟IPv4或IPv6地址，sing-box通过WARP查询真实地址并转发TCP或UDP。
+
+在菜单第11项输入`m`即可管理域名。内置条目与自行添加的条目都支持增删和修改。命令行示例：
+
+```bash
+buds hy2 warp domains list                         # 查看当前清单，每行一个域名
+buds hy2 warp domains add chatgpt.com oaistatic.com
+buds hy2 warp domains remove youtube.com
+buds hy2 warp domains replace google.com scholar.google.com
+buds hy2 warp domains import /root/my-domains.txt  # 用文件替换整份清单
+buds hy2 warp domains reset                        # 用内置 Google 清单替换整份清单
+```
+
+一条规则匹配该域名及其所有子域名。例如，把`google.com`改成`scholar.google.com`后，谷歌学术仍走WARP，`www.google.com`恢复原出口。若清单内还保留父域名，删除单个子域名条目后仍会匹配父域名。一个服务可能使用多个独立域名，例如YouTube的视频请求还会访问`googlevideo.com`。
+
+批量导入时可每行写一个域名，支持空行和`#`注释，空文件表示清空。脚本统一大小写并去重。可先用`buds hy2 warp domains list > /root/my-domains.txt`导出、编辑，再导入。配置保存在`/etc/buds-hy2/warp-domains`，关闭分流、重启和升级CLI后继续保留。在线修改会重启专用WARP服务，已有WARP连接需要重连；新规则启动失败时脚本会尝试恢复原清单和服务。
+
+从v1.4.0升级时，正在运行的旧服务继续使用原清单，`domains list`可查看。要立即切换到仅Google的默认规则，执行`buds hy2 warp domains reset`。
+
+该策略覆盖VPS本机和交给HY2服务端按域名连接的请求。客户端提前解析后只交给HY2一个真实IP、应用自带DoH、独立网络命名空间、自定义HY2解析器或已有DNS缓存，都可能绕过分流。已有全局VPN的机器会沿用其原有出口。新启用或关闭后请重连客户端，必要时清除应用DNS缓存。
+
+启动前会检查专用地址段及已有DNS路由。其他解析链路若已接管相同或更具体的目标后缀，脚本会拒绝启用有冲突的清单。WireGuard的`Endpoint`使用域名时，也应将它及覆盖它的父域名留在清单之外，否则建立隧道本身就会依赖该隧道。
+
+启用时会抽查样本域名、GitHub和x.com的选路。清单非空时，还会通过隧道请求Cloudflare Trace并核对WARP出口标记。诊断失败会撤销本次启用。可用`journalctl -u buds-warp-split.service -b`查看日志。关闭分流或卸载节点时会清理专用服务，保留输入的WireGuard配置。Google Play内容、YouTube Premium权益和AI服务可用性仍取决于出口地区、账号及各平台策略，需登录相应服务验证。
+
 ### 从旧管理脚本迁移
 
 先按上面的步骤安装可信公钥。选择已签名的版本，验签后在同一文件系统内替换管理脚本。此操作只更新 CLI，沿用已有节点配置和证书。
@@ -121,7 +169,11 @@ Let's Encrypt模式会复用并启用已有续签定时器或cron任务，缺失
 使用独立保管的 RSA 或 ECDSA 私钥签署同步后的 `buds` 和 `install.sh`，并生成与两个脚本一致的版本文件：
 
 ```bash
-version=1.3.1
+set -e
+python3 scripts/sync_cli.py --check
+version=$(sed -n 's/^SCRIPT_VERSION="\([0-9.]*\)"$/\1/p' buds)
+test -n "$version"
+test "$(grep -m 1 '^SCRIPT_VERSION=' install.sh)" = "SCRIPT_VERSION=\"$version\""
 printf '%s\n' "$version" > buds.version
 openssl dgst -sha256 -sign /secure/path/update.key -out buds.sig buds
 openssl dgst -sha256 -sign /secure/path/update.key -out install.sh.sig install.sh
