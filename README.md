@@ -100,6 +100,8 @@ buds hy2 nodes delete personal --yes
 
 菜单第11项管理分流，默认关闭。首次使用可选 `a` 引导安装并启用。脚本会检查环境、准备 sing-box 和独立 WireGuard 配置，并在需要时确认是否迁移 DNS。启用后会验证选路和实际 WARP 出口。之后可留在同一菜单选 `c` 检测、`m` 管理域名、`d` 关闭，或选 `r` 恢复迁移前的 DNS。分步操作也可以使用同一菜单。
 
+Gemini 提示地区受限时，先在第11项选 `c`，分别查看 Cloudflare 报告的隧道地区和 Gemini 未登录页面经 IPv4、IPv6 入口返回的地区标记。如果两个入口结果不同，可在 `g` 为已列入分流的 Gemini 域名指定 `ipv4` 或 `ipv6`，或选 `auto` 恢复默认。更改会短暂重载 WARP。登录后的可用性需在 Gemini 中确认。
+
 已有节点可先从菜单第8项升级。直接使用可信源码时，将下文的`buds hy2 warp`换为`bash "/源码绝对路径/buds" hy2 warp`，并填入本机实际路径。
 
 适用于使用systemd和systemd-resolved的Linux VPS。`/etc/resolv.conf`中的有效`nameserver`必须全部指向本机存根`127.0.0.53`。混用外部DNS可能导致同一目标有时走WARP、有时走原出口。需要内核TUN、iproute2、Python 3、curl、flock，以及包含WireGuard和gVisor的sing-box 1.12或更高1.x版本。VPS的公网可以只有IPv4。内核关闭IPv6时只建立IPv4虚拟路由。sing-box可按[官方软件包说明](https://sing-box.sagernet.org/installation/package-manager/)安装。

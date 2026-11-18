@@ -4,7 +4,7 @@ set -e
 CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.6.1"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 UPDATE_REPO_URL="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates"
@@ -721,6 +721,7 @@ cleanup_renewal() {
 WARP_DIR=/etc/buds-hy2/warp-split
 WARP_UNIT=buds-warp-split.service
 WARP_LIST=/etc/buds-hy2/warp-domains
+WARP_GEMINI_FAMILY=/etc/buds-hy2/warp-gemini-family
 WARP_TOOLS=/etc/buds-hy2/warp-tools
 WARP_DNS_STATE=/etc/buds-hy2/warp-dns
 WARP_DNS_DROPIN=/etc/systemd/resolved.conf.d/90-buds-warp-static-dns.conf
@@ -980,7 +981,8 @@ googleplay.com play.googleapis.cn gvt1.com gvt2.com gvt3.com android.com android
 gmail.com googlemail.com drive.google docs.google goo.gl chrome.com chromecast.com
 youtube.com youtu.be yt.be googlevideo.com ytimg.com youtube-nocookie.com youtubei.googleapis.com
 youtubekids.com youtubeeducation.com withyoutube.com
-gemini.google deepmind.google ai.google.dev ai.studio
+gemini.google gemini.app.google deepmind.google deepmind.com ai.google.dev ai.studio
+antigravity.google notebooklm.google generativeai.google
 DOMAINS
 }
 
@@ -988,7 +990,7 @@ DOMAINS
 warp_policy_tool() {
     cat <<'PY'
 import json
-from ipaddress import ip_address
+from ipaddress import ip_address, ip_interface, ip_network
 import os
 from pathlib import Path
 import re
@@ -1027,7 +1029,43 @@ def atomic(path, data):
             if os.path.exists(f.name):
                 os.unlink(f.name)
 
-def render(template, policy, dest):
+def gemini_resolver(cfg, selected, family_path):
+    if not family_path or not os.path.isfile(family_path):
+        return
+    family = Path(family_path).read_text(encoding="utf-8").strip()
+    if family == "auto":
+        return
+    if family not in ("ipv4", "ipv6"):
+        raise ValueError("Gemini 出口地址族须为 auto、ipv4 或 ipv6。")
+    gemini = ("gemini.google.com", "gemini.google", "gemini.app.google", "geminiweb-pa.clients6.google.com")
+    targets = [host for host in gemini if any(host == d or host.endswith("." + d) for d in selected)]
+    if not targets:
+        return
+    endpoint = cfg["endpoints"][0]
+    version = int(family[-1])
+    families = {ip_interface(address).version for address in endpoint["address"]}
+    allowed = {ip_network(net).version for peer in endpoint["peers"] for net in peer["allowed_ips"]}
+    if version not in families & allowed:
+        raise ValueError(f"当前 WireGuard 配置没有可用的 {family.upper()} 隧道地址和 AllowedIPs。")
+    wanted, suppressed = ("AAAA", "A") if version == 6 else ("A", "AAAA")
+    dns_rules = cfg["dns"]["rules"]
+    if wanted not in dns_rules[0].get("query_type", []):
+        raise ValueError(f"当前 WARP 分流无法发布 {wanted} 地址。")
+    # TUN 入站和 WireGuard 出站使用同一地址族，让客户端直接选择可用的虚拟地址。
+    dns_rules.insert(0, {"inbound": "split", "domain_suffix": targets, "query_type": [suppressed],
+                         "action": "predefined", "rcode": "NOERROR"})
+    rules = cfg["route"]["rules"]
+    for i, rule in enumerate(rules):
+        if rule.get("action") == "resolve" and "domain_suffix" in rule:
+            rules[i:i] = [
+                dict(rule, domain_suffix=targets, strategy=family + "_only"),
+                {"domain_suffix": targets, "action": "route", "outbound": "warp"},
+            ]
+            return
+    raise ValueError("现有 WARP 配置缺少域名解析规则，请检查配置后重试。")
+
+
+def render(template, policy, dest, family_path=None):
     with open(template, encoding="utf-8") as f:
         cfg = json.load(f)
     if os.path.isfile(policy):
@@ -1047,6 +1085,7 @@ def render(template, policy, dest):
         else:
             cfg[section]["rules"] = [] if section == "dns" else [{"action": "reject"}]
     if selected:
+        gemini_resolver(cfg, selected, family_path)
         trace_address = next(s["server"] for s in cfg["dns"]["servers"] if s["tag"] == "real")
         cfg["route"]["rules"].insert(0, {
             "inbound": "split", "network": "tcp", "ip_cidr": "198.18.240.3/32", "port": 443,
@@ -1174,7 +1213,8 @@ warp_prepare_policy() (
 )
 
 warp_edit_domains() (
-    local action=${1:-list} work binary active=false had_list=false
+    local action=${1:-list} work binary active=false had_previous=false
+    local changed="$WARP_LIST" domains="$WARP_LIST" family="$WARP_GEMINI_FAMILY" label="域名清单" previous="原清单"
     if (( $# )); then shift; fi
     if [[ "$action" == list ]]; then
         set -o pipefail
@@ -1183,6 +1223,16 @@ warp_edit_domains() (
     fi
     case "$action" in
         add|remove|replace|import|reset) ;;
+        gemini-family)
+            if [[ $# == 0 ]]; then
+                printf 'Gemini 出口地址族：%s\n' "$(cat "$family" 2>/dev/null || printf auto)"
+                return 0
+            fi
+            [[ $# == 1 && "$1" =~ ^(auto|ipv4|ipv6)$ ]] || { echo '用法：warp gemini-family [auto|ipv4|ipv6]' >&2; return 2; }
+            changed="$family"
+            label="Gemini 出口地址族"
+            previous="原设置"
+            ;;
         *) echo "用法：domains {list|add|remove|replace|import|reset}" >&2; return 2 ;;
     esac
     umask 077
@@ -1190,11 +1240,17 @@ warp_edit_domains() (
     work=$(mktemp -d "${WARP_LIST}.XXXXXX") || return 1
     trap 'rm -rf -- "$work"' EXIT
     warp_current_domains > "$work/current" || return 1
-    if [[ "$action" == reset && $# == 0 ]]; then
+    if [[ "$action" == gemini-family ]]; then
+        printf '%s\n' "$1" > "$work/next" || return 1
+        domains="$work/current"
+        family="$work/next"
+    elif [[ "$action" == reset && $# == 0 ]]; then
         warp_domains > "$work/defaults" || return 1
         python3 -I - list "$work/defaults" < <(warp_policy_tool) > "$work/next" || return 1
+        domains="$work/next"
     else
         python3 -I -c "$(warp_policy_tool)" "$action" "$work/current" "$@" > "$work/next" || return 1
+        domains="$work/next"
     fi
     if [[ -d "$WARP_DIR" ]]; then
         [[ ! -L "$WARP_DIR" && -f "$WARP_DIR/.buds-managed" &&
@@ -1202,42 +1258,43 @@ warp_edit_domains() (
             { echo "分流服务未完成安装或由其他程序管理，请先检查状态。" >&2; return 1; }
         warp_prepare_policy || return 1
         binary=$(warp_runtime_binary) || return 1
-        python3 -I "$WARP_DIR/policy.py" render "$WARP_DIR/base.json" "$work/next" "$work" &&
+        python3 -I "$WARP_DIR/policy.py" render "$WARP_DIR/base.json" "$domains" "$work" "$family" &&
             (cd "$work" && "$binary" check -c config.json) || return 1
         if systemctl is-active --quiet "$WARP_UNIT"; then
-            if cmp -s "$work/next" "$WARP_DIR/domains" && cmp -s "$work/config.json" "$WARP_DIR/config.json"; then
-                mv -f -- "$work/next" "$WARP_LIST" || return 1
-                echo "当前服务已在使用这份域名清单。"
+            if cmp -s "$work/domains" "$WARP_DIR/domains" && cmp -s "$work/config.json" "$WARP_DIR/config.json"; then
+                mv -f -- "$work/next" "$changed" || return 1
+                echo "$label 已保存，当前选路无需重载。"
                 return 0
             fi
             active=true
         fi
     fi
-    if [[ -f "$WARP_LIST" ]]; then
-        cp -- "$WARP_LIST" "$work/previous" || return 1
-        had_list=true
+    if [[ -f "$changed" ]]; then
+        cp -- "$changed" "$work/previous" || return 1
+        had_previous=true
     fi
-    mv -f -- "$work/next" "$WARP_LIST" || return 1
-    if [[ "$active" == true ]] && ! { systemctl restart "$WARP_UNIT" && warp_tunnel_probe; }; then
-        if [[ "$had_list" == true ]]; then
-            mv -f -- "$work/previous" "$WARP_LIST" || return 1
+    mv -f -- "$work/next" "$changed" || return 1
+    if [[ "$active" == true ]] && ! { systemctl restart "$WARP_UNIT" &&
+            { warp_tunnel_probe || { sleep 2; warp_tunnel_probe; }; }; }; then
+        if [[ "$had_previous" == true ]]; then
+            mv -f -- "$work/previous" "$changed" || return 1
         else
-            rm -f -- "$WARP_LIST" || return 1
+            rm -f -- "$changed" || return 1
         fi
         if ! systemctl restart "$WARP_UNIT"; then
             if [[ $(systemctl show -p Result --value "$WARP_UNIT") != start-limit-hit ]] ||
                 ! systemctl reset-failed "$WARP_UNIT" || ! systemctl start "$WARP_UNIT"; then
-                echo "已还原清单，分流服务恢复失败，请检查日志。" >&2
+                echo "已还原${previous}，分流服务恢复失败，请检查日志。" >&2
                 return 1
             fi
         fi
-        echo "新规则启动失败，已恢复原清单和服务。" >&2
+        echo "新规则启动失败，已恢复${previous}和服务。" >&2
         return 1
     fi
     if [[ "$active" == true ]]; then
-        echo "域名清单已生效。"
+        echo "$label 已生效。"
     else
-        echo "域名清单已保存，下次启动 WARP 分流时生效。"
+        echo "$label 已保存，下次启动 WARP 分流时生效。"
     fi
 )
 
@@ -1433,7 +1490,7 @@ warp_preflight_file() {
     cat <<'PREFLIGHT'
 warp_check_stub
 warp_check_routes
-python3 -I policy.py render base.json ../warp-domains .
+python3 -I policy.py render base.json ../warp-domains . ../warp-gemini-family
 python3 -I policy.py resolve-endpoints config.json
 if [[ -s domains ]]; then
     set -o pipefail
@@ -1481,7 +1538,7 @@ warp_doctor() (
         trap 'rm -rf -- "$work"' EXIT
         if warp_domains > "$work/default-domains" &&
             warp_config "$profile" "$work/default-domains" "$version" > "$work/base.json" &&
-            python3 -I -c "$(warp_policy_tool)" render "$work/base.json" "$WARP_LIST" "$work" &&
+            python3 -I -c "$(warp_policy_tool)" render "$work/base.json" "$WARP_LIST" "$work" "$WARP_GEMINI_FAMILY" &&
             (cd "$work" && "$binary" check -c config.json); then
             echo "配置校验通过。"
         else
@@ -1566,11 +1623,47 @@ warp_tunnel_probe() {
     if trace=$(curl -q --noproxy '*' --resolve one.one.one.one:443:198.18.240.3 \
         -fsS --max-time 15 https://one.one.one.one/cdn-cgi/trace) &&
         tr -d '\r' <<< "$trace" | grep -Eq '^warp=(on|plus)$'; then
-        echo "WARP 隧道 HTTPS 出口验证通过。"
+        printf 'WARP 隧道 HTTPS 出口验证通过。'
+        awk -F= '/^loc=[A-Z][A-Z]\r?$/ {sub(/\r$/, "", $2); printf " 地区 %s（Cloudflare）", $2} END {print ""}' <<< "$trace"
         return 0
     fi
     echo "无法通过 WARP 隧道确认 Cloudflare 出口，请检查 WireGuard 配置和 UDP 连通性。" >&2
     return 1
+}
+
+warp_gemini_check() {
+    warp_domain_selected gemini.google.com || return 0
+    python3 -I - "$WARP_GEMINI_FAMILY" <<'PY'
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+selected = path.read_text().strip() if path.is_file() else "auto"
+
+for family in ("4", "6"):
+    if selected in ("ipv4", "ipv6") and selected != "ipv" + family:
+        print(f"Gemini IPv{family} 入口：当前地址族设置未发布此类虚拟地址。")
+        continue
+    try:
+        result = subprocess.run(["curl", "-q", "-" + family, "--noproxy", "*", "-sS",
+                                 "--max-time", "10", "--max-filesize", "4194304",
+                                 "-H", "Accept-Language: en-US,en", "-w", "\n%{http_code}",
+                                 "https://gemini.google.com/app"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=12)
+    except subprocess.TimeoutExpired:
+        print(f"Gemini IPv{family} 入口：探测超时。")
+        continue
+    if result.returncode:
+        print(f"Gemini IPv{family} 入口：无可用连接或请求失败。")
+        continue
+    page, status = result.stdout.rsplit(b"\n", 1)
+    region = sorted(set(re.findall(rb'\[1,null,null,\d+,\d+,"([A-Z]{3})"', page)))
+    code = ", ".join(tag.decode("ascii") for tag in region) or "未知"
+    print(f"Gemini IPv{family} 入口：HTTP {status.decode('ascii')} · 页面地区标记 {code}")
+print("以上是未登录页面的检测结果。登录后的实际服务可用性请在 Gemini 中确认。")
+PY
 }
 
 warp_trace() {
@@ -1604,9 +1697,13 @@ warp_manage() (
         systemctl status "$WARP_UNIT" --no-pager
         return
     fi
-    if [[ "$action" == domains ]]; then
+    if [[ "$action" == domains || "$action" == gemini-family ]]; then
         shift
         exec 9>/run/buds-warp-split.lock && flock -x 9 || return 1
+        if [[ "$action" == gemini-family ]]; then
+            warp_edit_domains gemini-family "$@"
+            return
+        fi
         warp_edit_domains "$@"
         return
     fi
@@ -1638,7 +1735,8 @@ warp_manage() (
             if grep -Fq '"198.18.240.3/32"' "$WARP_DIR/config.json" || [[ ! -s "$WARP_DIR/domains" ]]; then
                 warp_tunnel_probe || return 1
                 if [[ -s "$WARP_DIR/domains" ]]; then
-                    echo "检测通过。当前分流规则和 WARP 出口正常。"
+                    echo "分流规则和 WARP 隧道连通检查通过。"
+                    warp_gemini_check
                 else
                     echo "检测通过。域名清单为空，当前流量使用原有出口。"
                 fi
@@ -1648,7 +1746,7 @@ warp_manage() (
             fi
             return ;;
         enable) ;;
-        *) echo "用法：buds hy2 warp {doctor|setup [--new-profile|--managed-core]|dns-switch|dns-restore|enable [配置路径]|status|check|disable|domains}"; return 2 ;;
+        *) echo "用法：buds hy2 warp {doctor|setup [--new-profile|--managed-core]|dns-switch|dns-restore|enable [配置路径]|status|check|disable|domains|gemini-family [auto|ipv4|ipv6]}"; return 2 ;;
     esac
     if [[ -d "$WARP_DIR" ]]; then
         systemctl is-active --quiet "$WARP_UNIT" && { echo "WARP 分流已启用。"; return 0; }
@@ -2634,7 +2732,7 @@ warp_menu() {
             'p  启用前诊断    s  准备依赖      i  安装独立内核' \
             'n  迁移 DNS      r  恢复 DNS' \
             'e  启用分流      c  检测出口      d  关闭分流' \
-            'm  管理域名      0  返回主菜单'
+            'm  管理域名      g  Gemini 出口地址族      0  返回主菜单'
         read -rp "请选择： " choice || return 0
         case "${choice,,}" in
             a) warp_menu_begin || echo "引导未完成，可选择 p 检查并按提示重试。" ;;
@@ -2665,6 +2763,11 @@ warp_menu() {
             c) warp_manage check || true ;;
             d) warp_manage disable || echo "关闭未完成，请参照上方提示。" ;;
             m) warp_domains_menu || true ;;
+            g)
+                warp_manage gemini-family || true
+                read -rp '输入 auto、ipv4 或 ipv6（更改需要短暂重启 WARP，回车返回）: ' profile || return 0
+                if [[ -n "$profile" ]]; then warp_manage gemini-family "$profile" || true; fi
+                ;;
             0|"") return 0 ;;
             *) echo "选项无效，请重新选择。" ;;
         esac

@@ -185,7 +185,7 @@ warp_config wgcf.conf domains 1.13.0 > split.json
         dns_rule = config["dns"]["rules"][0]
         domains = set(dns_rule["domain_suffix"])
         for host in ("play.google.com", "scholar.google.co.uk", "gemini.google.com", "www.youtube.com",
-                     "video.googlevideo.com"):
+                     "video.googlevideo.com", "gemini.app.google", "notebooklm.google", "antigravity.google"):
             self.assertTrue(any(host == d or host.endswith("." + d) for d in domains), host)
         for host in ("x.com", "github.com", "google.com.example.org", "chatgpt.com", "openai.com",
                      "cdn.oaistatic.com", "api.anthropic.com", "claude.ai", "claude.com"):
@@ -251,6 +251,51 @@ test ! -s domains
         if os.environ.get("BUDS_TEST_SING_BOX"):
             subprocess.run([os.environ["BUDS_TEST_SING_BOX"], "check", "-c", "config.json"],
                            cwd=root, check=True, capture_output=True)
+
+    def test_warp_gemini_family_only_changes_selected_names_and_requires_tunnel_family(self):
+        python = shlex.quote(Path(sys.executable).as_posix())
+        self.shell(f'python3() {{ {python} -X utf8 "$@"; }}\n' + """
+cd "$SANDBOX"
+warp_policy_tool > policy.py
+cat > fixture.conf <<'WG'
+[Interface]
+Address=172.16.0.2/32, fd42::2/128
+PrivateKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+[Peer]
+PublicKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=
+Endpoint=192.0.2.1:2408
+AllowedIPs=0.0.0.0/0, ::/0
+WG
+printf '%s\\n' google.com gstatic.com > selected
+printf '%s\\n' ipv6 > family
+warp_config fixture.conf selected 1.13.0 > base.json
+python3 policy.py render base.json selected . family
+cp config.json restricted.json
+printf '%s\\n' gstatic.com > selected
+python3 policy.py render base.json selected . family
+cp config.json excluded.json
+sed 's/, ::\\/0//' fixture.conf > ipv4.conf
+printf '%s\\n' google.com > selected
+warp_config ipv4.conf selected 1.13.0 > ipv4.json
+if python3 policy.py render ipv4.json selected . family; then exit 9; fi
+""")
+        config = json.loads((self.directory / "restricted.json").read_text())
+        route = config["route"]["rules"]
+        resolves = [rule for rule in route if rule["action"] == "resolve"]
+        self.assertEqual(resolves[0]["strategy"], "ipv6_only")
+        self.assertEqual(set(resolves[0]["domain_suffix"]), {"gemini.google.com", "geminiweb-pa.clients6.google.com"})
+        self.assertEqual(resolves[1]["strategy"], "prefer_ipv4")
+        self.assertEqual(route[route.index(resolves[0]) + 1], {
+            "domain_suffix": resolves[0]["domain_suffix"], "action": "route", "outbound": "warp"})
+        self.assertEqual(config["dns"]["rules"][0], {
+            "inbound": "split", "domain_suffix": resolves[0]["domain_suffix"], "query_type": ["A"],
+            "action": "predefined", "rcode": "NOERROR"})
+        self.assertEqual(resolves[1]["domain_suffix"], ["google.com", "gstatic.com"])
+        excluded = json.loads((self.directory / "excluded.json").read_text())["route"]["rules"]
+        self.assertFalse(any(rule.get("strategy") == "ipv6_only" for rule in excluded))
+        if os.environ.get("BUDS_TEST_SING_BOX"):
+            subprocess.run([os.environ["BUDS_TEST_SING_BOX"], "check", "-c", "restricted.json"],
+                           cwd=self.directory, check=True, capture_output=True)
 
     def test_warp_checks_competing_resolved_domains(self):
         python = shlex.quote(Path(sys.executable).as_posix())
@@ -603,7 +648,7 @@ DOMAIN=node.example.com; CLIENT_PORT_STR=19957; AUTH_PASSWORD=pass; OBFS_PASSWOR
 setup_cli
 """, "install.sh")
         installed_cli = (self.directory / "usr/local/bin/buds").read_text(encoding="utf-8")
-        self.assertIn('SCRIPT_VERSION="1.6.0"', installed_cli)
+        self.assertIn('SCRIPT_VERSION="1.6.1"', installed_cli)
         self.assertNotIn("unsigned sibling", installed_cli)
 
     def test_init_detection_requires_commands_and_runtime(self):
