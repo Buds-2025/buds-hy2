@@ -13,6 +13,10 @@ start = text.index(start_marker) + len(start_marker)
 end = text.index(end_marker, start)
 buds_content = (root / "buds").read_text(encoding="utf-8").rstrip("\n")
 updated = text[:start] + buds_content + text[end:]
+shared = buds_content[buds_content.index("record_firewall_rule() {"):buds_content.index("cleanup_firewall() {")]
+left = updated.index("record_firewall_rule() {")
+right = updated.index("start_service() {", left)
+updated = updated[:left] + shared + updated[right:]
 
 if "--check" in sys.argv:
     if text != updated:

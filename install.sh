@@ -16,7 +16,7 @@ OVERRIDE_DIR="/etc/systemd/system/hysteria-server.service.d"
 OVERRIDE_FILE="${OVERRIDE_DIR}/override.conf"
 SERVICE_FILE="/etc/systemd/system/hysteria-server.service"
 SYSCTL_FILE="/etc/sysctl.d/99-hysteria-performance.conf"
-SCRIPT_VERSION="1.6.3"
+SCRIPT_VERSION="1.7.0"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 
@@ -160,7 +160,7 @@ install_dependencies() {
         apt-get update -qq || true
         apt-get install -y -qq curl openssl ca-certificates procps >/dev/null 2>&1 || true
         apt-get install -y -qq wget ufw iptables iproute2 dnsutils libcap2-bin >/dev/null 2>&1 || true
-        apt-get install -y -qq python3 util-linux >/dev/null 2>&1 || true
+        apt-get install -y -qq python3 python3-yaml util-linux >/dev/null 2>&1 || true
         apt-get install -y -qq certbot python3-certbot-nginx >/dev/null 2>&1 || true
     elif command -v apk >/dev/null 2>&1; then
         apk update >/dev/null 2>&1 || true
@@ -173,14 +173,14 @@ install_dependencies() {
         manager=$(command -v dnf || command -v yum)
         "$manager" install -y -q curl openssl ca-certificates procps-ng >/dev/null 2>&1 || true
         "$manager" install -y -q wget iptables iproute bind-utils libcap >/dev/null 2>&1 || true
-        "$manager" install -y -q python3 util-linux >/dev/null 2>&1 || true
+        "$manager" install -y -q python3 python3-pyyaml util-linux >/dev/null 2>&1 || true
         "$manager" install -y -q epel-release >/dev/null 2>&1 || true
         "$manager" install -y -q certbot python3-certbot-nginx >/dev/null 2>&1 || true
     elif command -v pacman >/dev/null 2>&1; then
         # 不刷新索引后仅升级部分软件，也不自动升级整机。
         pacman -S --needed --noconfirm curl openssl ca-certificates procps-ng >/dev/null 2>&1 || true
         pacman -S --needed --noconfirm wget iptables iproute2 bind libcap >/dev/null 2>&1 || true
-        pacman -S --needed --noconfirm python util-linux >/dev/null 2>&1 || true
+        pacman -S --needed --noconfirm python python-yaml util-linux >/dev/null 2>&1 || true
         pacman -S --needed --noconfirm certbot certbot-nginx >/dev/null 2>&1 || true
     else
         warn "未识别到主流包管理器，检查现有系统工具。"
@@ -1224,7 +1224,7 @@ set -e
 CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
-SCRIPT_VERSION="1.6.3"
+SCRIPT_VERSION="1.7.0"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 UPDATE_REPO_URL="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates"
@@ -1852,6 +1852,84 @@ remove_ufw_rule() {
             [[ "$has_other" == false ]] || return 1
             ufw --force delete allow in proto "$proto" from ::/0 to any port "$port" comment buds-hy2 >/dev/null 2>&1 || return 1
         fi
+    fi
+}
+
+record_firewall_rule() {
+    # 仅记录本次成功新增的规则：后端|区域/链|运行时/永久|端口协议。
+    (umask 077; printf '%s|%s|%s|%s\n' "$@" >> "${CONFIG_DIR}/.firewall_rule")
+    chmod 600 "${CONFIG_DIR}/.firewall_rule"
+}
+
+add_ufw_rule() {
+    local rule="$1" rules family source
+    if ! rules=$(LC_ALL=C ufw status 2>/dev/null); then
+        warn "无法读取 UFW 规则，未自动修改 ${rule}。"
+        return 0
+    fi
+    local families=(4)
+    if grep -Eq "^[[:space:]]*IPV6=[\"']?yes" /etc/default/ufw 2>/dev/null; then
+        families+=(6)
+    fi
+    for family in "${families[@]}"; do
+        if echo "$rules" | awk -v rule="$rule" -v family="$family" '
+            {is6=($0 ~ /\(v6\)/); gsub(/ \(v6\)/, "")}
+            is6==(family==6) && $1==rule && $2=="ALLOW" &&
+                ($3=="Anywhere" || ($3=="IN" && $4=="Anywhere")) {found=1}
+            END {exit !found}'; then
+            continue
+        fi
+        source=0.0.0.0/0
+        [[ "$family" != 6 ]] || source=::/0
+        if ufw allow in proto "${rule#*/}" from "$source" to any port "${rule%/*}" comment buds-hy2 >/dev/null 2>&1; then
+            record_firewall_rule ufw "$family" runtime "$rule"
+        else
+            warn "UFW IPv${family} 放行 ${rule} 失败，请检查服务器或服务商端口规则。"
+        fi
+    done
+}
+
+configure_firewall() {
+    info "配置防火墙端口规则: ${UFW_PORT_RULE}..."
+    if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
+        add_ufw_rule "$UFW_PORT_RULE"
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        local zone rule mode result
+        zone=$(firewall-cmd --get-default-zone) || return 1
+        rule="${UFW_PORT_RULE//:/-}"
+        for mode in runtime permanent; do
+            local options=(--zone="$zone")
+            [[ "$mode" != permanent ]] || options+=(--permanent)
+            if firewall-cmd "${options[@]}" --query-port="$rule" >/dev/null 2>&1; then
+                continue
+            else
+                result=$?
+            fi
+            if [[ "$result" == 1 ]] && firewall-cmd "${options[@]}" --add-port="$rule" >/dev/null 2>&1; then
+                record_firewall_rule firewalld "$zone" "$mode" "$rule"
+            else
+                warn "firewalld ${mode} 放行 ${rule} 失败，请检查防火墙权限。"
+            fi
+        done
+    elif command -v iptables >/dev/null 2>&1; then
+        local port="${UFW_PORT_RULE%/*}" result
+        if iptables -C INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1 ||
+           iptables -C INPUT -p udp --dport "$port" -m comment --comment buds-hy2 -j ACCEPT >/dev/null 2>&1; then
+            return 0
+        else
+            result=$?
+        fi
+        if [[ "$result" == 1 ]] && iptables -I INPUT -p udp --dport "$port" -m comment --comment buds-hy2 -j ACCEPT >/dev/null 2>&1; then
+            record_firewall_rule iptables INPUT runtime "$UFW_PORT_RULE"
+            if [[ -x /etc/init.d/iptables ]]; then
+                /etc/init.d/iptables save >/dev/null 2>&1 || true
+                rc-update add iptables default >/dev/null 2>&1 || true
+            fi
+        else
+            warn "当前环境无法自动放行 UDP ${UFW_PORT_RULE}，请在服务器或服务商面板检查。"
+        fi
+    else
+        info "未检测到可管理的防火墙，请确保服务商已放行 UDP ${UFW_PORT_RULE}。"
     fi
 }
 
@@ -3092,7 +3170,22 @@ def domain_name(value):
     return value
 
 
+def masquerade_url(value):
+    from urllib.parse import urlsplit
+    url = urlsplit(value)
+    if (len(value) > 2048 or any(ch.isspace() or ord(ch) < 32 for ch in value)
+            or url.scheme != "https" or not url.hostname or url.username is not None
+            or url.password is not None or url.fragment):
+        raise ValueError("请输入完整 HTTPS 网址，例如 https://www.example.org/，请去掉用户名、密码和 # 片段。")
+    domain_name(url.hostname)
+    if url.port == 0:
+        raise ValueError("网址端口须为 1–65535。")
+    return value
+
+
 def unit_name(name):
+    if name == "main":
+        return "hysteria-server.service"
     return f"buds-hy2-node-{name}.service"
 
 
@@ -3168,9 +3261,9 @@ def port_conflicts(name):
         raise ValueError("请先配置主节点，再新增节点。")
     primary = PRIMARY_LISTEN.partition("#")[0].strip() or "443"
     configured_public = PRIMARY_PUBLIC.partition("#")[0].strip() or primary
-    reserves = [(ports(p), "主节点监听范围") for p in primary.split(",")]
-    public = [(ports(p), "主节点公网范围") for p in configured_public.split(",")]
-    own_span = None
+    reserves = [] if name == "main" else [(ports(p), "主节点监听范围") for p in primary.split(",")]
+    public = [] if name == "main" else [(ports(p), "主节点公网范围") for p in configured_public.split(",")]
+    own_span = ports(primary) if name == "main" else None
     for node in nodes():
         if node["name"] != name:
             reserves.append((ports(node["ports"]), node["name"]))
@@ -3192,6 +3285,19 @@ def port_conflicts(name):
 
 def overlaps(span, other):
     return span[0] <= other[1] and other[0] <= span[1]
+
+
+def port_guide(reservations):
+    first, last = 20000, 60999
+    free = []
+    for (start, end), _ in sorted(reservations + [((last + 1, last + 1), "")]):
+        if first < start and first <= last:
+            free.append((first, min(last, start - 1)))
+        first = max(first, end + 1)
+    print("UDP 端口可填 1–65535。单端口示例 24443；连续跳跃示例 40000-40031（也可用冒号）。")
+    print("自动分配可填 auto；auto:32 表示自动选 32 个连续端口。")
+    print("本机当前可选高位范围（最多列出五段）：" + ("、".join(port_text(s) for s in free[:5]) or "没有空闲段"))
+    print("提交时会再次检查。云安全组须放行实际使用的 UDP 端口；NAT 服务器还需核对服务商映射。")
 
 
 def choose_ports(value, reservations):
@@ -3253,6 +3359,8 @@ def apply_preferences(args, old):
     data["auth"] = secret(args.auth, old.get("auth"), "认证密码")
     data["obfs"] = secret(args.obfs, old.get("obfs"), "混淆密码")
     data["tls"] = args.tls or (old.get("tls") if data["domain"] == old.get("domain") else None) or "auto"
+    if getattr(args, "masquerade", None) or old.get("masquerade"):
+        data["masquerade"] = masquerade_url(args.masquerade or old["masquerade"])
     return data
 
 
@@ -3316,7 +3424,8 @@ def write_files(data, old, stage, path):
         '  maxStreamReceiveWindow: 16777216\n'
         '  initConnReceiveWindow: 41943040\n'
         '  maxConnReceiveWindow: 41943040\n'
-        'masquerade:\n  type: proxy\n  proxy:\n    url: https://news.ycombinator.com/\n'
+        'masquerade:\n  type: proxy\n  proxy:\n'
+        f'    url: {json.dumps(data.get("masquerade", "https://news.ycombinator.com/"))}\n'
         '    rewriteHost: true\n')
     client_tls = "  insecure: false\n"
     if data["tls"] == "self":
@@ -3549,6 +3658,220 @@ def save_node(args):
     print(f"查看连接信息：buds hy2 nodes link {args.name}")
 
 
+def patch_yaml(text, changes):
+    try:
+        import yaml
+    except ImportError:
+        raise ValueError("主节点编辑需要 PyYAML。Debian/Ubuntu 执行 apt install python3-yaml，Fedora/RHEL 执行 dnf install python3-pyyaml，Arch 执行 pacman -S python-yaml，然后重试。")
+    try:
+        root = yaml.compose(text, Loader=yaml.SafeLoader)
+        if any(getattr(event, "anchor", None) for event in yaml.parse(text, Loader=yaml.SafeLoader)):
+            raise ValueError("配置使用了 YAML 锚点，请先独立展开要修改的设置。")
+    except yaml.YAMLError:
+        raise ValueError("配置文件 YAML 格式异常，请先在节点菜单查看客户端配置并核对文件。") from None
+    edits = []
+    for keys, value in changes.items():
+        node = root
+        for key in keys:
+            hits = [v for k, v in node.value if k.value == key] if isinstance(node, yaml.MappingNode) else []
+            if len(hits) != 1:
+                raise ValueError("配置缺少唯一的字段 " + ".".join(keys) + "，已停止修改。")
+            node = hits[0]
+        if not isinstance(node, yaml.ScalarNode):
+            raise ValueError("不支持自动修改复合字段 " + ".".join(keys))
+        if node.value != value:
+            edits.append((node.start_mark.index, node.end_mark.index, json.dumps(value, ensure_ascii=False)))
+    for start, end, value in sorted(edits, reverse=True):
+        text = text[:start] + value + text[end:]
+    return text
+
+
+def primary_capabilities(path, span):
+    text = path.read_text()
+    # 仅调整本脚本模板声明的权限；其他服务文件和管理员的 drop-in 继续生效。
+    for key in ("CapabilityBoundingSet", "AmbientCapabilities"):
+        pattern = r"^" + key + r"=([A-Z_0-9 ]*)$"
+        lines = re.findall(pattern, text, re.M)
+        if len(lines) != 1:
+            continue
+        caps = lines[0].split()
+        for cap, needed in (("CAP_NET_ADMIN", span[0] != span[1]), ("CAP_NET_BIND_SERVICE", span[0] < 1024)):
+            if needed and cap not in caps:
+                caps.append(cap)
+            if not needed and cap in caps:
+                caps.remove(cap)
+        text = re.sub(pattern, key + "=" + " ".join(caps), text, flags=re.M)
+    return text
+
+
+def atomic_text(path, text):
+    if path.is_symlink():
+        raise ValueError(f"请先核对符号链接 {path}，已停止修改。")
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + "-")
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(text)
+            if path.exists():
+                stat = path.stat()
+                os.fchown(stream.fileno(), stat.st_uid, stat.st_gid)
+                os.fchmod(stream.fileno(), stat.st_mode & 0o777)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def primary_firewall(action, directory, port):
+    result = run("bash", os.environ["BUDS_NODE_CLI"], "_node-firewall", action, str(directory), port)
+    if result.stdout.strip():
+        print(result.stdout.strip())
+
+
+def edit_primary(args):
+    if args.tls:
+        raise ValueError("主节点证书可能被其他节点复用。请通过原证书管理方式续签，节点菜单可执行模拟续签。")
+    server, client = BASE / "config.yaml", BASE / "client.yaml"
+    if not server.is_file() or not client.is_file():
+        raise ValueError("主节点配置不完整。请先在节点菜单查看客户端配置，生成 client.yaml。")
+    if server.is_symlink() or client.is_symlink():
+        raise ValueError("主节点使用外部配置链接，请在其管理工具中修改。")
+    unit = unit_name("main")
+    command = run("systemctl", "show", unit, "-p", "ExecStart", "--value").stdout
+    if not re.search(r"argv\[\]=" + re.escape(CORE) + r" server (?:-c |--config[= ])" +
+                     re.escape(str(server)) + r"(?:[ ;]|$)", command):
+        raise ValueError("主节点服务未直接使用本脚本的配置文件，请先核对 systemctl cat hysteria-server。")
+    local = port_text(ports(PRIMARY_LISTEN))
+    public = port_text(ports(PRIMARY_PUBLIC or local))
+    requested = local
+    external = public
+    if args.ports or args.public_ports:
+        reserved, published = port_conflicts("main")
+        if args.ports:
+            requested = port_text(choose_ports(args.ports, reserved + published if args.ports.startswith("auto") else reserved))
+            if requested != local:
+                check_hopping(ports(requested))
+        mapped = args.public_ports or ("same" if public == local else public)
+        external = port_text(choose_ports(requested if mapped == "same" else mapped, published))
+    domain = domain_name(args.domain) if args.domain else PRIMARY_DOMAIN
+    if args.domain and domain != PRIMARY_DOMAIN:
+        flag = "-checkip" if re.fullmatch(r"[0-9.]+", domain) else "-checkhost"
+        # 某些 OpenSSL 版本的 x509 -checkhost 在不匹配时仍返回零。
+        check = run("openssl", "x509", "-in", str(BASE / "server.crt"), "-noout", flag, domain)
+        if "does match certificate" not in check.stdout:
+            raise ValueError("当前主节点证书未覆盖新地址。请先配置覆盖该地址的证书，或新增使用独立证书的节点。")
+    server_changes, client_changes = {}, {}
+    if args.masquerade:
+        server_changes[("masquerade", "proxy", "url")] = masquerade_url(args.masquerade)
+    if requested != local:
+        match = re.search(r'''^listen:\s*["']?(:[0-9]+(?:[-:][0-9]+)?)["']?\s*(?:#.*)?$''', server.read_text(), re.M)
+        if not match:
+            raise ValueError("主节点使用了自定义监听地址，保留原绑定；请在原配置中调整。")
+        server_changes[("listen",)] = ":" + requested
+    if (domain, external) != (PRIMARY_DOMAIN, public):
+        client_changes[("server",)] = domain + ":" + external
+    if domain != PRIMARY_DOMAIN:
+        client_changes[("tls", "sni")] = domain
+    for action, keys, client_keys, label in (
+            (args.auth, ("auth", "password"), ("auth",), "认证密码"),
+            (args.obfs, ("obfs", "salamander", "password"), ("obfs", "salamander", "password"), "混淆密码")):
+        if action != "keep":
+            server_changes[keys] = client_changes[client_keys] = secret(action, None, label)
+    updates = {}
+    for path, changes in ((server, server_changes), (client, client_changes)):
+        if changes:
+            updates[path] = patch_yaml(path.read_text(), changes)
+    if external != public:
+        updates[BASE / ".public_port"] = external + "\n"
+    if requested != local:
+        fragment = UNITS / unit
+        if fragment.is_file() and not fragment.is_symlink():
+            updates[fragment] = primary_capabilities(fragment, ports(requested))
+    original = {}
+    for path in list(updates):
+        if path.is_symlink():
+            raise ValueError(f"请先核对符号链接 {path}。")
+        old = path.read_text() if path.exists() else None
+        if old == updates[path]:
+            del updates[path]
+        else:
+            original[path] = old
+    if not updates:
+        print("设置与当前配置相同。")
+        return
+    ledger = BASE / ".firewall_rule"
+    if ledger.is_symlink():
+        raise ValueError("防火墙记录是符号链接，请先核对。")
+    registered = ledger.read_text().splitlines() if ledger.exists() else []
+    work = Path(tempfile.mkdtemp(prefix=".main-edit-", dir=str(BASE)))
+    pending = work / ".firewall_rule"
+    touched = []
+    running = active(unit)
+    changed_port = local != requested
+    restarting = server in updates and running
+    stopped = False
+    cleanup = True
+    try:
+        for path, old in original.items():
+            if old is not None:
+                (work / path.name).write_text(old)
+        if changed_port:
+            primary_firewall("open", work, requested)
+        if restarting:
+            run("systemctl", "stop", unit)
+            stopped = True
+        for path, value in updates.items():
+            atomic_text(path, value)
+            touched.append(path)
+        if UNITS / unit in touched:
+            run("systemctl", "daemon-reload")
+        if restarting:
+            start_node({"name": "main", "ports": requested})
+        added = pending.read_text().splitlines() if pending.exists() else []
+        if added:
+            atomic_text(ledger, "\n".join(registered + added) + "\n")
+    except (Exception, KeyboardInterrupt):
+        try:
+            if stopped:
+                run("systemctl", "stop", unit)
+            for path in reversed(touched):
+                if original[path] is None:
+                    path.unlink()
+                else:
+                    atomic_text(path, original[path])
+            if UNITS / unit in touched:
+                run("systemctl", "daemon-reload")
+            if stopped:
+                start_node({"name": "main", "ports": local})
+            if pending.exists():
+                primary_firewall("close", work, requested)
+        except (Exception, KeyboardInterrupt):
+            cleanup = False
+            print(f"自动恢复未完成，原文件和防火墙记录保存在 {work}。", file=sys.stderr)
+            raise
+        raise
+    else:
+        if changed_port:
+            # 仅回收安装记录中归属明确的旧 UDP 规则。网站和用户自建规则保留。
+            stale = [line for line in registered if len(line.split("|")) == 4 and
+                     line.split("|")[0] in ("ufw", "iptables", "firewalld") and
+                     line.split("|")[-1].replace(":", "-") == local + "/udp"]
+            if stale:
+                pending.write_text("\n".join(stale) + "\n")
+                try:
+                    primary_firewall("close", work, local)
+                    keep = [line for line in registered if line not in stale] + added
+                    atomic_text(ledger, "".join(line + "\n" for line in keep))
+                except (OSError, subprocess.SubprocessError):
+                    print("新端口已保存。部分旧防火墙记录未清理，请核对 .firewall_rule。", file=sys.stderr)
+            print(f"请确认服务商已放行公网 UDP {external}。管理员自行添加的旧端口规则须自行核对。")
+    finally:
+        if cleanup:
+            shutil.rmtree(work)
+    print(f"主节点已保存 · 本地 UDP {requested} · 公网 UDP {external}。请重新导入连接链接或客户端配置。")
+
+
 def quick_add_preferences(name):
     node_name(name)
     path = ROOT / name
@@ -3569,6 +3892,7 @@ def quick_add_preferences(name):
     local_main = PRIMARY_LISTEN.partition("#")[0].strip() or "443"
     public_main = PRIMARY_PUBLIC.partition("#")[0].strip() or local_main
     mapped = (BASE / ".nat-mode").is_file() or public_main.replace(":", "-") != local_main.replace(":", "-")
+    port_guide(reserved + public)
     while True:
         requested = input("本地 UDP 端口（回车自动；单端口、范围或 auto:32）：").strip() or "auto"
         try:
@@ -3606,12 +3930,13 @@ def main():
         command = actions.add_parser(verb)
         command.add_argument("name")
         command.add_argument("--domain")
+        command.add_argument("--masquerade")
         command.add_argument("--ports")
         command.add_argument("--public-ports")
         command.add_argument("--auth", choices=("keep", "random", "custom"), default="keep")
         command.add_argument("--obfs", choices=("keep", "random", "custom"), default="keep")
         command.add_argument("--tls", choices=("auto", "self", "shared"))
-    for verb in ("detail", "status", "start", "stop", "restart", "log", "delete"):
+    for verb in ("detail", "port-guide", "status", "start", "stop", "restart", "log", "delete"):
         command = actions.add_parser(verb)
         command.add_argument("name")
         if verb == "delete":
@@ -3622,6 +3947,8 @@ def main():
     if args.action in ("list", "names"):
         entries = list(nodes())
         if args.action == "names":
+            if (BASE / "config.yaml").is_file():
+                print("main")
             for data in entries:
                 print(data["name"])
             return
@@ -3641,6 +3968,20 @@ def main():
         for name, state, local, public, domain in rows:
             print(f"{name:<{width}}  {state}  {local:<13}  {public:<13}  {domain}")
         return
+    if args.action == "port-guide":
+        if args.name != "main":
+            node_name(args.name)
+        local, published = port_conflicts(args.name)
+        port_guide(local + published)
+        return
+    if args.action == "edit" and args.name == "main":
+        import signal
+        def cancel(signum, frame):
+            raise KeyboardInterrupt
+        for signum in (signal.SIGHUP, signal.SIGTERM):
+            signal.signal(signum, cancel)
+        edit_primary(args)
+        return
     if args.action in ("add", "edit", "quick-add"):
         if pwd.getpwnam("hysteria").pw_gid != grp.getgrnam("hysteria").gr_gid:
             raise ValueError("请检查现有 hysteria 服务账户和用户组。")
@@ -3652,7 +3993,7 @@ def main():
         save_node(args)
         return
     if args.name == "main":
-        raise ValueError("请在主菜单管理原有主节点。")
+        raise ValueError("主节点卸载和维护请使用节点区中的主节点菜单。")
     name = node_name(args.name)
     path = ROOT / name
     data = load_node(path)
@@ -3700,19 +4041,39 @@ PY
 }
 
 nodes_tool() {
-    python3 -I -c "$(nodes_source)" "$CONFIG_DIR" "$(get_listen)" "$(get_public_ports)" "$(get_domain)" "$@"
+    BUDS_NODE_CLI="${BASH_SOURCE[0]}" python3 -I -c "$(nodes_source)" "$CONFIG_DIR" "$(get_listen)" "$(get_public_ports)" "$(get_domain)" "$@"
 }
 
 nodes_manage() (
     local action=${1:-list} name=${2:-}
-    if [[ "$name" == main && ( "$action" == link || "$action" == client || "$action" == status ) ]]; then
-        "$action"
-        return
+    if [[ "$name" == main ]]; then
+        case "$action" in
+            detail) printf '主节点 main · %s · 本地 UDP %s · 公网 UDP %s\n' "$(get_domain)" "$(get_listen)" "$(get_public_ports)"; return ;;
+            status) status; return ;;
+            log) if has_systemd; then journalctl -u hysteria-server -n 50 --no-pager; else tail -n 50 /var/log/hysteria.log; fi; return ;;
+            start|stop|restart|client|link)
+                if command -v flock >/dev/null; then exec 9>/run/buds-hy2-nodes.lock && flock -x 9 || return 1; fi
+                "$action"; return ;;
+        esac
     fi
-    has_systemd || { echo "多节点管理需要 systemd。原有节点可继续在主菜单管理。" >&2; return 1; }
+    if ! has_systemd; then
+        case "$action" in
+            names) [[ ! -f "$CONFIG_FILE" ]] || echo main; return 0 ;;
+            list) [[ ! -f "$CONFIG_FILE" ]] || nodes_manage detail main; return 0 ;;
+        esac
+        echo "当前系统未使用 systemd。可管理主节点的运行、链接、配置和日志；自动编辑和新增节点需要 systemd。" >&2
+        return 1
+    fi
     local dependency
     for dependency in python3 flock ss openssl; do
-        command -v "$dependency" >/dev/null || { echo "多节点管理缺少 $dependency。" >&2; return 1; }
+        if ! command -v "$dependency" >/dev/null; then
+            echo "多节点管理缺少 $dependency，可先管理主节点或用系统包管理器安装该工具。" >&2
+            case "$action" in
+                names) [[ ! -f "$CONFIG_FILE" ]] || echo main; return 0 ;;
+                list) [[ ! -f "$CONFIG_FILE" ]] || nodes_manage detail main; return 0 ;;
+            esac
+            return 1
+        fi
     done
     exec 9>/run/buds-hy2-nodes.lock || return 1
     if [[ "$action" != quick-add ]]; then flock -x 9 || return 1; fi
@@ -3760,18 +4121,43 @@ nodes_quick_add() {
 }
 
 nodes_edit_menu() {
-    local name=$1 choice flag value prompt
+    local name=$1 choice flag value prompt confirm
+    local -a packages
+    if [[ "$name" == main ]] && has_systemd && command -v python3 >/dev/null && ! python3 -I -c 'import yaml' 2>/dev/null; then
+        if command -v apt-get >/dev/null; then packages=(apt-get install -y python3-yaml)
+        elif command -v dnf >/dev/null; then packages=(dnf install -y python3-pyyaml)
+        elif command -v yum >/dev/null; then packages=(yum install -y python3-pyyaml)
+        elif command -v pacman >/dev/null; then packages=(pacman -S --needed --noconfirm python-yaml)
+        else echo '编辑主节点需要系统 Python 3 的 PyYAML 包。'; panel_pause '节点菜单' || true; return 0; fi
+        echo "编辑主节点需要 PyYAML 读取现有配置。将执行：${packages[*]}"
+        read -rp '现在安装此依赖？[y/N] ' confirm || return 0
+        [[ "${confirm,,}" == y ]] || return 0
+        if ! "${packages[@]}" || ! python3 -I -c 'import yaml'; then
+            echo '依赖尚未就绪，请核对软件源后重试。'; panel_pause '节点菜单' || true; return 0
+        fi
+    fi
     while true; do
         panel_clear
         printf '\n编辑节点 %s\n\n' "$name"
+        nodes_manage detail "$name" || return 0
+        echo '改端口或密码会短暂重启这个运行中的节点。完成后请重新导入它的链接。'
         printf '%s\n' '1. 访问地址      2. 本地 UDP 端口' \
             '3. 公网端口映射  4. 重新生成认证和混淆密码' \
-            '5. 自定义密码    6. TLS 证书' '0. 返回节点菜单'
+            '5. 单独更换认证或混淆密码'
+        if [[ "$name" != main ]]; then echo '6. 选择 TLS 证书'; fi
+        echo '7. 更换伪装网站'
+        echo '0. 返回节点菜单'
         read -rp '请选择要修改的设置：' choice || return 0
         case "$choice" in
-            1) flag=--domain; prompt='新域名或 IPv4 地址（回车取消）：' ;;
-            2) flag=--ports; prompt='新本地 UDP 单端口、范围或 auto:32（回车取消）：' ;;
-            3) flag=--public-ports; prompt='公网 UDP 端口或范围（same 与本地相同，回车取消）：' ;;
+            1) flag=--domain; prompt='输入已指向这台服务器的域名或 IPv4，如 hy.example.com（回车取消）：'
+               if [[ "$name" == main ]]; then echo '新地址须在当前主节点证书覆盖范围内。'; fi ;;
+            2) flag=--ports
+               nodes_manage port-guide "$name" || { panel_pause '编辑菜单' || return 0; continue; }
+               prompt='输入本地 UDP 单端口、跳跃范围、auto 或 auto:32（回车取消）：' ;;
+            3) flag=--public-ports
+               echo '普通 VPS 输入 same 即可。NAT 用户请照抄服务商分给你的公网 UDP 端口或范围。'
+               echo '例如公网 31000 转发到本机 24443，这里填 31000。本机无法检测服务商分配了哪些端口。'
+               prompt='输入 1–65535 的端口、连续范围（如 31000-31031）或 same（回车取消）：' ;;
             4)
                 read -rp '替换两种密码后需重新导入客户端配置。确认？[y/N] ' value || return 0
                 if [[ "${value,,}" == y ]]; then
@@ -3780,22 +4166,41 @@ nodes_edit_menu() {
                 fi
                 continue ;;
             5)
-                read -rp '1. 认证密码  2. 混淆密码  0. 取消：' value || return 0
+                echo '认证密码用于登录节点；混淆密码须与客户端的 Salamander 设置一致。'
+                echo '输入时屏幕不会显示字符。支持 8–128 位字母、数字和 _.@+!%*=-，需输入两次。'
+                read -rp '1. 自定认证密码  2. 自定混淆密码  3. 随机认证密码  4. 随机混淆密码  0. 取消：' value || return 0
                 case "$value" in
                     1) nodes_manage edit "$name" --auth custom || echo '密码更新未完成。' ;;
                     2) nodes_manage edit "$name" --obfs custom || echo '密码更新未完成。' ;;
+                    3|4)
+                        flag=--auth; [[ "$value" != 4 ]] || flag=--obfs
+                        read -rp '确认生成新密码？旧客户端需重新导入。[y/N] ' confirm || return 0
+                        [[ "${confirm,,}" == y ]] || continue
+                        nodes_manage edit "$name" "$flag" random || echo '密码更新未完成。' ;;
                     *) continue ;;
                 esac
                 panel_pause '编辑菜单' || return 0
                 continue ;;
-            6) flag=--tls; prompt='auto 自动 / self 自签名 / shared 复用主证书（回车取消）：' ;;
+            6) if [[ "$name" == main ]]; then continue; fi
+               echo '建议填 auto 自动选择。self 会生成带指纹的自签名证书；shared 需要主证书覆盖这个地址。'
+               flag=--tls; prompt='输入 auto、self 或 shared（回车取消）：' ;;
+            7) echo '伪装网站用于回应普通 HTTPS 访问。它不会改变节点地址或 WARP 规则。'
+               flag=--masquerade; prompt='输入完整 HTTPS 网址，如 https://www.example.org/（回车取消）：' ;;
             0|'') return 0 ;;
             *) echo '请输入有效编号。'; panel_pause '编辑菜单' || return 0; continue ;;
         esac
-        read -rp "$prompt" value || return 0
-        if [[ -z "$value" ]]; then continue; fi
-        nodes_manage edit "$name" "$flag" "$value" || echo '修改未完成，请检查提示。'
-        panel_pause '编辑菜单' || return 0
+        while true; do
+            read -rp "$prompt" value || return 0
+            [[ -n "$value" ]] || break
+            read -rp "将把节点 $name 的这项设置改为 $value。确认提交？[y/N] " confirm || return 0
+            [[ "${confirm,,}" == y ]] || break
+            if nodes_manage edit "$name" "$flag" "$value"; then
+                echo '请在节点菜单选 1 或 2 获取最新链接或配置。'
+                panel_pause '编辑菜单' || return 0
+                break
+            fi
+            echo '修改未完成。请按上方提示处理，或重新输入；回车返回。'
+        done
     done
 }
 
@@ -3809,7 +4214,13 @@ nodes_selected_menu() {
             return 0
         fi
         printf '\n%s\n' '1. 连接链接  2. 客户端配置  3. 运行状态  4. 最近日志'
-        printf '%s\n' '5. 启动  6. 停止  7. 重启  8. 编辑设置  9. 删除' '0. 返回多节点管理'
+        printf '%s\n' '5. 启动  6. 停止  7. 重启  8. 修改端口、密码和其他设置'
+        if [[ "$name" == main ]]; then
+            echo 'r. 模拟证书续签  l. 实时日志  u. 卸载整套 HY2 服务'
+        else
+            echo '9. 删除这个附加节点'
+        fi
+        echo '0. 返回节点区'
         read -rp '请选择节点操作：' choice || return 0
         case "$choice" in
             1) action=link ;;
@@ -3817,10 +4228,23 @@ nodes_selected_menu() {
             3) action=status ;;
             4) action=log ;;
             5) action=start ;;
-            6) action=stop ;;
-            7) action=restart ;;
+            6|7)
+                action=stop
+                [[ "$choice" != 7 ]] || action=restart
+                read -rp "此操作会中断节点 $name 的现有连接。确认继续？[y/N] " confirm || return 0
+                [[ "${confirm,,}" == y ]] || continue ;;
             8) nodes_edit_menu "$name"; continue ;;
+            r|l|u)
+                if [[ "$name" == main ]]; then
+                    case "$choice" in
+                        r) renew_test || echo '模拟续签未成功，请检查上方日志。' ;;
+                        l) (trap 'exit 0' INT; log) || true ;;
+                        u) if uninstall menu; then exit 0; fi ;;
+                    esac
+                else echo '请使用当前菜单列出的选项。'; fi
+                panel_pause '节点菜单' || return 0; continue ;;
             9)
+                if [[ "$name" == main ]]; then echo '主节点的整套卸载入口为 u。'; panel_pause '节点菜单' || return 0; continue; fi
                 read -rp "输入 $name 确认删除（回车取消）：" confirm || return 0
                 if [[ "$confirm" == "$name" ]]; then
                     if nodes_manage delete "$name" --yes; then
@@ -3849,13 +4273,16 @@ nodes_pick() {
         return 0
     fi
     if [[ -z "$listed" ]]; then
-        echo '还没有新增节点。可选择 2 一键新增，原有主节点由主菜单管理。'
+        echo '未找到已配置的主节点，请先使用安装脚本完成首次安装。'
         panel_pause '多节点管理' || true
         return 0
     fi
     mapfile -t names <<< "$listed"
-    printf '\n选择一个新增节点\n\n'
-    for i in "${!names[@]}"; do printf '%s. %s\n' "$((i+1))" "${names[i]}"; done
+    printf '\n选择要管理的节点\n\n'
+    for i in "${!names[@]}"; do
+        if [[ "${names[i]}" == main ]]; then printf '%s. main（主节点）\n' "$((i+1))"
+        else printf '%s. %s\n' "$((i+1))" "${names[i]}"; fi
+    done
     while read -rp '输入节点编号（回车取消）：' choice && [[ -n "$choice" && "$choice" != 0 ]]; do
         if [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && (( choice <= ${#names[@]} )); then
             nodes_selected_menu "${names[choice-1]}"
@@ -3869,8 +4296,9 @@ nodes_menu() {
     local choice
     while true; do
         panel_clear
-        printf '\nHysteria 2 多节点管理\n\n'
-        printf '%s\n' '1. 节点列表' '2. 一键新增节点' '3. 管理已有节点' '0. 返回主菜单'
+        printf '\n节点管理\n\n'
+        printf '%s\n' '1. 查看所有节点和端口' '2. 一键新增节点（地址、端口均可回车自动填写）' \
+            '3. 管理已有节点（含主节点，更改端口、密码或查看链接）' '0. 返回主菜单'
         read -rp '请选择多节点操作：' choice || return 0
         case "$choice" in
             1) nodes_manage list || true ;;
@@ -4093,20 +4521,30 @@ warp_domains_menu() {
     local -a items
     while true; do
         panel_clear
-        printf '\n域名清单：1 查看　2 添加　3 删除　4 修改　5 导入整份清单　6 恢复 Google 默认清单　0 返回\n'
+        printf '\nWARP 域名清单\n'
+        echo '清单中的域名及其子域名经 WARP。对所有节点生效；运行中改清单会短暂重载分流。'
+        printf '%s\n' '1. 查看清单　2. 添加　3. 删除　4. 替换域名' '5. 从文件替换整份清单　6. 恢复 Google 默认清单　0. 返回'
         read -rp "请选择： " choice || return
         case "$choice" in
             1) warp_manage domains list || true ;;
             2|3)
-                read -ra items -p "输入域名，多个域名用空格分隔： " || return
+                read -ra items -p "只填域名，如 example.org，无需 https:// 或路径。多个用空格分隔（回车取消）： " || return
+                if (( ${#items[@]} == 0 )); then continue; fi
                 if [[ "$choice" == 2 ]]; then warp_manage domains add "${items[@]}" || true
                 else warp_manage domains remove "${items[@]}" || true; fi ;;
             4)
-                read -rp "原域名： " old && read -rp "新域名： " new || return
+                read -rp "输入清单中要替换的域名（回车取消）： " old || return
+                [[ -n "$old" ]] || continue
+                read -rp "输入新域名，如 example.org（回车取消）： " new || return
+                [[ -n "$new" ]] || continue
                 warp_manage domains replace "$old" "$new" || true ;;
             5)
-                read -rp "输入用于替换整份清单的文件路径（回车取消）： " file || return
-                if [[ -n "$file" ]]; then warp_manage domains import "$file" || true; fi ;;
+                echo '文件中每行一个域名，空文件会清空清单。可先选 1 查看当前清单。'
+                read -rp "输入服务器上的文件路径，如 /root/domains.txt（回车取消）： " file || return
+                if [[ -n "$file" ]]; then
+                    read -rp '用此文件替换当前清单？[y/N] ' confirm || return 0
+                    if [[ "${confirm,,}" == y ]]; then warp_manage domains import "$file" || true; fi
+                fi ;;
             6)
                 read -rp "用 Google 默认域名替换当前全部条目？[y/N] " confirm || return
                 if [[ "$confirm" =~ ^[Yy]$ ]]; then warp_manage domains reset || true; fi ;;
@@ -4149,15 +4587,20 @@ warp_menu() {
         else
             echo "WARP 分流未启用。首次使用可选择 a 按提示完成，也可分步操作。"
         fi
-        printf '%s\n' 'a  引导安装并启用' \
-            'p  启用前诊断    s  准备依赖      i  安装独立内核' \
-            'n  迁移 DNS      r  恢复 DNS' \
-            'e  启用分流      c  检测出口      d  关闭分流' \
-            'm  管理域名      g  Gemini 出口地址族      0  返回主菜单'
+        echo '这份设置由所有节点共用。首次使用选 a；想确认哪些网站走 WARP，选 c。'
+        printf '\n%s\n' '常用操作'
+        printf '%s\n' 'a. 一键准备并启用    c. 验证分流和出口    m. 编辑分流域名' \
+            'g. 选择 Gemini 的 IPv4 / IPv6 出口    d. 关闭分流'
+        printf '\n%s\n' '分步设置与故障排查'
+        printf '%s\n' 'p. 启用前诊断    t. 服务状态和日志    s. 准备依赖    i. 安装独立内核' \
+            'w. 准备 WARP 配置    n. 迁移系统 DNS    r. 恢复原 DNS    e. 使用已有配置启用' '0. 返回主菜单'
         read -rp "请选择： " choice || return 0
         case "${choice,,}" in
             a) warp_menu_begin || echo "引导未完成，可选择 p 检查并按提示重试。" ;;
             p) warp_manage doctor || true ;;
+            t) warp_manage status || true ;;
+            w) echo '已有可用的专用配置时会沿用它。需要注册时会提示确认。'
+               warp_manage setup --new-profile || echo '配置未就绪，请查看上方提示。' ;;
             s) warp_manage setup || echo "准备依赖未完成，请参照上方提示。" ;;
             i) warp_manage setup --managed-core || echo "独立内核准备未完成，请参照上方提示。" ;;
             n|r)
@@ -4178,14 +4621,18 @@ warp_menu() {
                 fi
                 ;;
             e)
-                read -rp "WireGuard 配置路径（回车自动查找）： " profile || return 0
+                read -rp "输入服务器上的 WireGuard .conf 路径；已有配置直接回车自动查找： " profile || return 0
                 warp_manage enable "$profile" || echo "启用未完成，可选择 p 查看启用条件。"
                 ;;
             c) warp_manage check || true ;;
-            d) warp_manage disable || echo "关闭未完成，请参照上方提示。" ;;
+            d)
+                read -rp '关闭后所有节点的目标域名都将回到原有出口。确认关闭？[y/N] ' confirm || return 0
+                if [[ "${confirm,,}" == y ]]; then warp_manage disable || echo "关闭未完成，请参照上方提示。"
+                else echo '已取消关闭。'; fi ;;
             m) warp_domains_menu; continue ;;
             g)
                 warp_manage gemini-family || true
+                echo '通常选 auto。若 c 检测到只有一个入口地区合适，输入对应的 ipv4 或 ipv6。'
                 read -rp '输入 auto、ipv4 或 ipv6（更改需要短暂重启 WARP，回车返回）: ' profile || return 0
                 if [[ -n "$profile" ]]; then warp_manage gemini-family "$profile" || true; fi
                 ;;
@@ -4238,53 +4685,24 @@ show_menu() {
         echo -e "  ${C_ORANGE_BOLD}▀▀▀▀ ▀▀▀▀ ▀▀▀  ▀▀▀▀${C_RESET}   ${C_GRAY_LIGHT}▀  ▀   ▀  ▀▀▀▀${C_RESET}"
         echo -e "  ${C_GRAY_MID}Hysteria 2 High-Performance Protocol Suite${C_RESET}  ${C_CYAN}v${SCRIPT_VERSION}${C_RESET}\n"
 
-        echo -e "  ${C_BAR}  ${C_WHITE}节点状态${C_RESET}  ${status_badge}    ${C_WHITE}监听端口${C_RESET}  ${C_CYAN}${listen}${C_RESET}"
+        echo -e "  ${C_BAR}  ${C_WHITE}主节点状态${C_RESET}  ${status_badge}    ${C_WHITE}监听端口${C_RESET}  ${C_CYAN}${listen}${C_RESET}"
         echo -e "  ${C_BAR}  ${C_GRAY_MID}解析域名${C_RESET}  ${C_GRAY_LIGHT}${domain}${C_RESET}    ${C_GRAY_MID}协议混淆${C_RESET}  ${C_AMBER}Salamander${C_RESET}"
         if [[ "$has_update" == "true" ]]; then
             echo -e "  ${C_BAR}  ${C_SPARK}✦ 发现脚本新版本  v${remote_ver} (当前: v${SCRIPT_VERSION})  ▶ 输入 8 或 u 即可一键更新${C_RESET}"
         fi
         echo ""
 
-        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}核心业务${C_RESET} ${C_GRAY_MID}· CORE ACTIONS${C_RESET}"
-        echo -e "     ${C_ORANGE_BOLD}1.${C_RESET} ${C_WHITE}运行状态${C_RESET}      ${C_GRAY_MID}Service Status & UDP Socket${C_RESET}"
-        echo -e "     ${C_ORANGE_BOLD}2.${C_RESET} ${C_WHITE}节点链接${C_RESET}      ${C_GRAY_MID}Connection URIs & v2rayN Link${C_RESET}"
-        echo -e "     ${C_ORANGE_BOLD}3.${C_RESET} ${C_WHITE}客户端配置${C_RESET}    ${C_GRAY_MID}Client Config (client.yaml)${C_RESET}"
-        echo -e "     ${C_ORANGE_BOLD}4.${C_RESET} ${C_WHITE}实时日志${C_RESET}      ${C_GRAY_MID}Live Journal Log (Ctrl+C 退出)${C_RESET}\n"
-
-        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}服务控制${C_RESET} ${C_GRAY_MID}· SERVICE CONTROL${C_RESET}"
-        echo -e "     ${C_ORANGE_BOLD}5.${C_RESET} ${C_WHITE}重启服务${C_RESET}      ${C_GRAY_MID}Restart Hysteria 2${C_RESET}"
-        echo -e "     ${C_ORANGE_BOLD}6.${C_RESET} ${C_WHITE}启动服务${C_RESET}      ${C_GRAY_MID}Start Hysteria 2${C_RESET}"
-        echo -e "     ${C_ORANGE_BOLD}7.${C_RESET} ${C_WHITE}停止服务${C_RESET}      ${C_GRAY_MID}Stop Hysteria 2${C_RESET}\n"
-
-        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}系统维护${C_RESET} ${C_GRAY_MID}· MAINTENANCE${C_RESET}"
-        if [[ "$has_update" == "true" ]]; then
-            echo -e "     ${C_ORANGE_BOLD}8.${C_RESET} ${C_SPARK}更新脚本${C_RESET}      ${C_GRAY_MID}Update buds CLI to Latest${C_RESET} ${C_SPARK}(新版本: v${remote_ver})${C_RESET}"
-        else
-            echo -e "     ${C_ORANGE_BOLD}8.${C_RESET} ${C_WHITE}更新脚本${C_RESET}      ${C_GRAY_MID}Update buds CLI to Latest${C_RESET}"
-        fi
-        echo -e "     ${C_ORANGE_BOLD}9.${C_RESET} ${C_WHITE}模拟续签${C_RESET}      ${C_GRAY_MID}Let's Encrypt SSL Dry-Run${C_RESET}"
-        echo -e "    ${C_ORANGE_BOLD}10.${C_RESET} ${C_WHITE}卸载节点${C_RESET}      ${C_GRAY_MID}Uninstall & Clean Firewall${C_RESET}"
-        echo -e "    ${C_ORANGE_BOLD}11.${C_RESET} ${C_WHITE}WARP 定向分流${C_RESET}"
-        echo -e "    ${C_ORANGE_BOLD}12.${C_RESET} ${C_WHITE}新增节点 / 多节点管理${C_RESET}"
-        echo -e "     ${C_GRAY_MID}0.${C_RESET} ${C_GRAY_MID}退出脚本${C_RESET}      ${C_GRAY_MID}Exit${C_RESET}\n"
-
-        read -rp "$(echo -e "  ${C_ORANGE_BOLD}❯${C_RESET} ${C_WHITE}请选择操作编号 [0-12]: ${C_RESET}")" choice || return 0
+        printf '%s\n' '12. 节点管理    查看、新增、修改主节点或附加节点' \
+            '11. WARP 分流   引导启用、管理域名、检测出口'
+        printf '\n%s\n' '8. 更新脚本     0. 退出'
+        read -rp '请选择入口（12 / 11 / 8 / 0）：' choice || return 0
         case "$choice" in
-            1) status || true ;;
-            2) link || true ;;
-            3) client || true ;;
-            4) log || true ;;
-            5) restart || echo -e "  ${C_RED}✖ 重启服务失败，请检查状态或日志。${C_RESET}" ;;
-            6) start || echo -e "  ${C_RED}✖ 启动服务失败，请检查状态或日志。${C_RESET}" ;;
-            7) stop || echo -e "  ${C_RED}✖ 停止服务失败，请检查进程状态。${C_RESET}" ;;
             8|[uU]|update)
                 if update_script && [[ -x "$BUDS_CLI" ]]; then
                     panel_pause '主菜单' || return 0
                     exec "$BUDS_CLI" hy2
                 fi
                 ;;
-            9) renew_test || echo -e "  ${C_RED}✖ 证书续签模拟失败，请检查日志。${C_RESET}" ;;
-            10) if uninstall menu; then break; fi ;;
             11) warp_menu; continue ;;
             12) nodes_menu; continue ;;
             0) exit 0 ;;
@@ -4297,13 +4715,21 @@ show_menu() {
 check_root
 
 case "$1" in
+    _node-firewall)
+        CONFIG_DIR=$3
+        [[ -d "$CONFIG_DIR" && "$CONFIG_DIR" == */.main-edit-* && "$4" =~ ^[0-9]+(-[0-9]+)?$ ]] || exit 2
+        case "$2" in
+            open)
+                UFW_PORT_RULE="${4//-/:}/udp"
+                info() { echo "$*"; }
+                warn() { echo "$*" >&2; exit 1; }
+                configure_firewall ;;
+            close) cleanup_firewall ;;
+            *) exit 2 ;;
+        esac ;;
     status) status ;;
     log) log ;;
-    restart) restart ;;
-    stop) stop ;;
-    start) start ;;
-    link) link ;;
-    client) client ;;
+    restart|stop|start|link|client) nodes_manage "$1" main ;;
     warp) shift; warp_manage "$@" ;;
     nodes|node) shift; nodes_manage "$@" ;;
     renew-test) renew_test ;;

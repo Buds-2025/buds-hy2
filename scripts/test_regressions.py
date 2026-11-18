@@ -115,18 +115,23 @@ alpha
 5
 
 6
+y
 
 7
+y
 
 8
 1
 proxy.example.org
+y
 
 2
 3443:3474
+y
 
 3
 same
+y
 
 4
 y
@@ -136,6 +141,7 @@ y
 
 6
 self
+y
 
 0
 9
@@ -153,7 +159,7 @@ INPUT
         self.assertIn("节点列表结果\n按回车返回多节点管理…\n<刷新>", result)
         actions = self.actions().splitlines()
         self.assertEqual(actions[:6], ["list", "quick-add failed", "quick-add taken", "quick-add alpha", "link alpha", "names"])
-        self.assertEqual([action for action in actions[6:] if not action.startswith("detail ")], [
+        self.assertEqual([action for action in actions[6:] if not action.startswith("detail ") and not action.startswith("port-guide ")], [
             "link alpha", "client alpha", "status alpha", "log alpha", "start alpha", "stop alpha", "restart alpha",
             "edit alpha --domain proxy.example.org", "edit alpha --ports 3443:3474", "edit alpha --public-ports same",
             "edit alpha --auth random --obfs random", "edit alpha --obfs custom", "edit alpha --tls self", "delete alpha --yes",
@@ -199,6 +205,80 @@ INPUT
         manager["check_hopping"]((30003, 30003))
         with self.assertRaisesRegex(ValueError, "2.12.3"):
             manager["check_hopping"]((30003, 30005))
+
+    def test_primary_edit_rolls_back_and_preserves_custom_settings_and_stopped_state(self):
+        self.node_config(public="443", local="443")
+        server = self.config / "config.yaml"
+        client = self.config / "client.yaml"
+        server.write_text(server.read_text() + '# keep local policy\nacl:\n  inline: ["reject(127.0.0.1)"]\n')
+        client.write_text(client.read_text() + 'auth: "test-password"\nobfs:\n  salamander:\n    password: "test-obfs"\n')
+        manager = self.node_manager()
+        unit = self.directory / "hysteria-server.service"
+        unit.write_text("[Service]\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\nAmbientCapabilities=CAP_NET_BIND_SERVICE\n")
+        manager["UNITS"] = self.directory
+        changes = []
+        def run(*args, **kwargs):
+            changes.append(args)
+            return SimpleNamespace(stdout="argv[]=/usr/local/bin/hysteria server --config " + str(server) + " ;")
+        manager.update(run=run, active=lambda _: True, check_hopping=lambda _: None,
+                       port_conflicts=lambda _: ([((45000, 45031), "其他节点")], []),
+                       primary_firewall=lambda *args: changes.append((args[0], args[-1])))
+        args = SimpleNamespace(tls=None, domain=None, masquerade=None, ports="45000", public_ports=None, auth="random", obfs="random")
+        with self.assertRaisesRegex(ValueError, "其他节点"):
+            manager["edit_primary"](args)
+        args.ports = "41000:41031"
+        def start(data):
+            changes.append(("start", data["ports"]))
+            if data["ports"] != "443":
+                raise ValueError("启动验证失败")
+        manager["start_node"] = start
+        before = [p.read_bytes() for p in (server, client, unit)]
+        with patch.object(os, "fchown", create=True), patch.object(os, "fchmod", create=True):
+            with self.assertRaisesRegex(ValueError, "启动验证失败"):
+                manager["edit_primary"](args)
+            self.assertEqual(before, [p.read_bytes() for p in (server, client, unit)])
+            self.assertFalse((self.config / ".public_port").exists())
+            self.assertIn(("start", "443"), changes)
+            changes.clear()
+            manager["active"] = lambda _: False
+            with redirect_stdout(StringIO()):
+                manager["edit_primary"](args)
+            self.assertNotIn(("start", "41000-41031"), changes)
+            self.assertIn('"CAP_NET_ADMIN"', json.dumps(unit.read_text().split("=")[-1].split()))
+            self.assertIn('# keep local policy\nacl:', server.read_text())
+            self.assertIn('server: "proxy.example.com:41000-41031"', client.read_text())
+            self.assertNotIn('test-password', client.read_text())
+            self.assertEqual((self.config / ".public_port").read_text().strip(), "41000-41031")
+            manager.update(PRIMARY_LISTEN="41000-41031", PRIMARY_PUBLIC="41000-41031", active=lambda _: True)
+            args.ports, args.public_ports, args.auth, args.obfs = None, "42000-42031", "keep", "keep"
+            changes.clear()
+            with redirect_stdout(StringIO()):
+                manager["edit_primary"](args)
+            self.assertFalse(any("stop" in call or "start" in call or "open" in call for call in changes))
+            self.assertEqual((self.config / ".public_port").read_text().strip(), "42000-42031")
+
+    def test_primary_appears_in_node_picker_and_can_show_ports_without_applying(self):
+        output = self.shell('''
+nodes_manage() {
+    echo "$*" >> "$ACTION_FILE"
+    case "$1" in names) printf '%s\\n' main work ;; port-guide) echo '本机可选范围' ;; esac
+}
+nodes_menu <<'INPUT'
+3
+1
+8
+2
+auto:32
+n
+0
+0
+0
+INPUT
+''')
+        self.assertIn("main（主节点）", output)
+        self.assertIn("本机可选范围", output)
+        self.assertIn("port-guide main", self.actions())
+        self.assertNotIn("edit main", self.actions())
 
     def test_uninstall_preserves_existing_secondary_nodes(self):
         node = self.config / "nodes/personal"
@@ -423,6 +503,7 @@ y
 e
 
 d
+y
 r
 y
 m
