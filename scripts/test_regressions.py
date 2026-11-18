@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 BASH = shutil.which("bash")
@@ -33,6 +35,7 @@ class Regressions(unittest.TestCase):
             ).strip()
         self.config = self.directory / "etc/hysteria"
         self.config.mkdir(parents=True)
+        (self.directory / "run").mkdir()
         self.sources = {}
         for name in ("buds", "install.sh"):
             source = (ROOT / name).read_text(encoding="utf-8")
@@ -73,6 +76,97 @@ sleep() {{ :; }}
 
     def actions(self):
         return (self.directory / "actions").read_text(encoding="utf-8")
+
+    def test_nodes_menu_dispatches_all_actions_and_requires_matching_delete_confirmation(self):
+        result = self.shell(r'''nodes_manage() {
+    printf '%s\n' "$*" >> "$ACTION_FILE"
+    [[ "$2" != failed ]]
+}
+nodes_menu <<'INPUT'
+2
+failed
+
+
+
+
+
+
+2
+alpha
+proxy.example.org
+auto:32
+44000-44031
+self
+random
+custom
+3
+alpha
+
+
+
+
+random
+
+4
+alpha
+wrong-name
+5
+alpha
+6
+alpha
+7
+alpha
+8
+alpha
+9
+alpha
+10
+alpha
+11
+alpha
+4
+alpha
+alpha
+1
+0
+INPUT
+''')
+        self.assertIn("新增未完成", result)
+        self.assertIn("已取消删除", result)
+        self.assertEqual(self.actions().splitlines(), [
+            "list", "add failed --auth keep --obfs keep",
+            "add alpha --domain proxy.example.org --ports auto:32 --public-ports 44000-44031 --tls self --auth random --obfs custom",
+            "edit alpha --auth random --obfs keep", "link alpha", "client alpha", "status alpha",
+            "log alpha", "start alpha", "stop alpha", "restart alpha", "delete alpha --yes", "list",
+        ])
+
+    def test_nodes_reserve_the_entire_range_and_reject_unsafe_hopping_versions(self):
+        source = (ROOT / "buds").read_text(encoding="utf-8")
+        source = source.split("nodes_source() {\n    cat <<'PY'\n", 1)[1].split("\ntry:\n    main()", 1)[0]
+        manager = {}
+        with patch.object(sys, "argv", ["nodes", str(self.config), "443", "443", "proxy.example.com"]):
+            with patch.dict(sys.modules, {name: ModuleType(name) for name in ("grp", "pwd")}):
+                exec(compile(source, "buds:nodes_source", "exec"), manager)
+        choose_ports = manager["choose_ports"]
+        reservations = [((20000, 30002), "first node"), ((30006, 60999), "second node")]
+        self.assertEqual(choose_ports("auto:3", reservations), (30003, 30005))
+        with self.assertRaisesRegex(ValueError, "second node"):
+            choose_ports("30003-30006", reservations)
+        with self.assertRaisesRegex(ValueError, "未找到可用端口"):
+            choose_ports("auto:4", reservations)
+        manager["run"] = lambda *args: SimpleNamespace(stdout="Version:\tv2.12.2\n")
+        manager["check_hopping"]((30003, 30003))
+        with self.assertRaisesRegex(ValueError, "2.12.3"):
+            manager["check_hopping"]((30003, 30005))
+
+    def test_uninstall_preserves_existing_secondary_nodes(self):
+        node = self.config / "nodes/personal"
+        node.mkdir(parents=True)
+        metadata = node / "node.json"
+        metadata.write_text('{}', encoding="utf-8")
+        self.shell("uninstall <<<'y'\n", expected=1)
+        self.assertEqual(metadata.read_text(encoding="utf-8"), '{}')
+        self.assertEqual(self.actions(), "")
 
     def test_warp_domain_policy_and_profile_import(self):
         profile = self.directory / "wgcf.conf"
@@ -509,7 +603,7 @@ DOMAIN=node.example.com; CLIENT_PORT_STR=19957; AUTH_PASSWORD=pass; OBFS_PASSWOR
 setup_cli
 """, "install.sh")
         installed_cli = (self.directory / "usr/local/bin/buds").read_text(encoding="utf-8")
-        self.assertIn('SCRIPT_VERSION="1.5.2"', installed_cli)
+        self.assertIn('SCRIPT_VERSION="1.6.0"', installed_cli)
         self.assertNotIn("unsigned sibling", installed_cli)
 
     def test_init_detection_requires_commands_and_runtime(self):

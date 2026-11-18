@@ -74,6 +74,28 @@ buds hy2 uninstall   # 安全卸载服务
 
 从 v1.5.1 起，菜单第8项从仓库 `updates` 分支读取签名版本清单，再按版本下载并验签脚本。更新需要 `curl`、`openssl`、`flock` 和可信公钥。v1.5.0 及更早版本需先按下文「从旧管理脚本迁移」进行一次验签迁移。
 
+### 新增和管理多个节点
+
+在已安装主节点的 systemd 服务器上，打开 `buds hy2`，选 **12. 新增节点 / 多节点管理 → 2. 新增节点**。输入一个节点名称，其余选项可直接回车，沿用主节点地址并生成可用的 UDP 端口、认证密码和 Salamander 混淆密码。端口可以指定单个值、指定一段连续范围，或输入 `auto:32` 自动选择 32 个连续端口。选择 **5. 连接链接** 或 **6. 客户端配置**即可导出这个节点的配置。
+
+每个新增节点有独立的进程和配置。可逐个编辑、启动、停止、重启和删除；编辑运行中的节点会重启该节点。删除需再次输入节点名称确认。已有节点在列表中显示为 `main`，继续由主菜单管理。整套卸载前需先删除附加节点。
+
+```bash
+buds hy2 nodes list
+buds hy2 nodes add work --ports auto:32
+buds hy2 nodes add personal --ports 41000 --tls self
+buds hy2 nodes edit work --auth random --obfs random
+buds hy2 nodes link work
+buds hy2 nodes client personal
+buds hy2 nodes delete personal --yes
+```
+
+`--auth custom` 和 `--obfs custom` 会提示在终端中隐藏输入密码。自动 TLS 会复用覆盖该地址的主节点受信任证书，否则为新节点生成独立的自签名证书。自签名节点需使用支持证书或公钥指纹校验的客户端。
+
+脚本检查托管节点的端口、正在监听的 UDP 套接字和可识别的本机 UDP 转发规则。启用 UFW 的服务器会自动添加节点所需的 UDP 入站规则。其他防火墙及服务商安全组由管理员放行。NAT VPS 用 `--public-ports` 填写实际映射后的公网端口或范围。新增本地端口跳跃需要 Hysteria 2.12.3 或更新版本，以及配置本机转发规则的权限。2.12.3 修复了旧版跳跃规则会误重定向其它出站 UDP 流量的问题。[端口跳跃文档](https://v2.hysteria.network/docs/advanced/Port-Hopping/)、[Hysteria 2 更新日志](https://v2.hysteria.network/docs/Changelog/)
+
+多节点管理需要 systemd、Python 3.6 或更新版本、`ss`、`flock` 和 OpenSSL。OpenRC 和无 systemd 的环境继续使用主节点管理功能。
+
 ### WARP 系统级域名分流
 
 菜单第11项管理分流，默认关闭。首次使用可选 `a` 引导安装并启用。脚本会检查环境、准备 sing-box 和独立 WireGuard 配置，并在需要时确认是否迁移 DNS。启用后会验证选路和实际 WARP 出口。之后可留在同一菜单选 `c` 检测、`m` 管理域名、`d` 关闭，或选 `r` 恢复迁移前的 DNS。分步操作也可以使用同一菜单。

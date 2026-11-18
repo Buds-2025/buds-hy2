@@ -4,7 +4,7 @@ set -e
 CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
-SCRIPT_VERSION="1.5.2"
+SCRIPT_VERSION="1.6.0"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 UPDATE_REPO_URL="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates"
@@ -367,7 +367,7 @@ link() {
         return 1
     fi
 
-    local domain password obfs_pwd listen public_ports base_port
+    local domain password obfs_pwd listen public_ports base_port label
     domain=$(get_domain)
     password=$(get_password)
     obfs_pwd=$(get_obfs_pwd)
@@ -375,6 +375,8 @@ link() {
     public_ports=$(get_public_ports)
     base_port=$(echo "$public_ports" | grep -o '^[0-9]\+' || echo "443")
     [[ -n "$base_port" ]] || base_port=443
+    label="$domain"
+    [[ -z "${NODE_LABEL:-}" ]] || label="$domain-$NODE_LABEL"
 
     local enc_password enc_obfs_pwd
     enc_password=$(urlencode "$password")
@@ -412,12 +414,12 @@ link() {
         [[ -z "$pin" ]] || native_tls+="&insecure=1"
         printf '  Hysteria 2 原生链接（用作客户端的 server，自签名请用 2.6.4 或更新版本）\n'
         printf '     hysteria2://%s@%s:%s/?sni=%s%s%s#%s-Hy2\n\n' \
-            "$enc_password" "$domain" "$public_ports" "$domain" "$native_tls" "$obfs_param" "$domain"
+            "$enc_password" "$domain" "$public_ports" "$domain" "$native_tls" "$obfs_param" "$label"
     fi
 
     if [[ "$public_ports" == *-* ]]; then
-        local link_hop="hysteria2://${enc_password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}&mport=${public_ports}#${domain}-Hy2"
-        local link_single="hysteria2://${enc_password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}#${domain}-Hy2-Single"
+        local link_hop="hysteria2://${enc_password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}&mport=${public_ports}#${label}-Hy2"
+        local link_single="hysteria2://${enc_password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}#${label}-Hy2-Single"
 
         echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}第三方导入链接（需确认客户端支持 mport）${C_RESET}"
         echo -e "     ${C_YELLOW}${link_hop}${C_RESET}\n"
@@ -425,7 +427,7 @@ link() {
         echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 2 · 基准单端口链接${C_RESET} ${C_GRAY_MID}(固定单端口 · 固定端口备用)${C_RESET}"
         echo -e "     ${C_YELLOW}${link_single}${C_RESET}\n"
     else
-        local link_main="hysteria2://${enc_password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}#${domain}-Hy2"
+        local link_main="hysteria2://${enc_password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}#${label}-Hy2"
 
         echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}节点连接链接${C_RESET}"
         echo -e "     ${C_YELLOW}${link_main}${C_RESET}\n"
@@ -533,7 +535,7 @@ CLIENT_YAML_EOF
     fi
 
     echo -e "  ${C_BAR}  ${C_WHITE}配置 3 · Mihomo 节点配置片段${C_RESET}\n"
-    echo -e "  ${C_YELLOW}- name: \"Hy2-${domain}\""
+    echo -e "  ${C_YELLOW}- name: \"Hy2-${domain}${NODE_LABEL:+-$NODE_LABEL}\""
     echo -e "    type: hysteria2"
     echo -e "    server: ${domain}"
     echo -e "    port: ${base_port}"
@@ -1673,10 +1675,716 @@ warp_manage() (
     echo "WARP 分流已启用，当前清单选路检查通过。"
 )
 
-uninstall() {
+nodes_source() {
+    cat <<'PY'
+import argparse
+import getpass
+import grp
+import ipaddress
+import json
+import os
+import pwd
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+BASE = Path(sys.argv[1])
+PRIMARY_LISTEN, PRIMARY_PUBLIC, PRIMARY_DOMAIN = sys.argv[2:5]
+ROOT = BASE / "nodes"
+UNITS = Path("/etc/systemd/system")
+CORE = "/usr/local/bin/hysteria"
+NODE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,30}")
+FIREWALL_PREFIX = "buds-hy2-node-"
+
+
+def run(*args, check=True):
+    return subprocess.run(args, check=check, universal_newlines=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=40, env={**os.environ, "LC_ALL": "C"})
+
+
+def active(unit):
+    return run("systemctl", "is-active", "--quiet", unit, check=False).returncode == 0
+
+
+def ports(text):
+    found = re.fullmatch(r"([0-9]{1,5})(?:-([0-9]{1,5}))?", text)
+    if found:
+        start = int(found[1])
+        end = int(found[2] or found[1])
+        if 1 <= start <= end <= 65535:
+            return start, end
+    raise ValueError(f"无效 UDP 端口或范围：{text}")
+
+
+def port_text(span):
+    return str(span[0]) if span[0] == span[1] else f"{span[0]}-{span[1]}"
+
+
+def node_name(value):
+    if not NODE_NAME.fullmatch(value) or value == "main":
+        raise ValueError("节点名称须使用 1–31 位小写字母、数字、下划线或短横线，main 为主节点。")
+    return value
+
+
+def domain_name(value):
+    value = value.rstrip(".").encode("idna").decode("ascii").lower()
+    try:
+        address = ipaddress.ip_address(value)
+        if address.version == 4:
+            return str(address)
+        raise ValueError("此入口请为 IPv6 主机填入域名。")
+    except ValueError:
+        if ":" in value:
+            raise ValueError("此入口请为 IPv6 主机填入域名。")
+    labels = value.split(".")
+    if (len(value) > 253 or len(labels) < 2 or labels[-1].isdigit() or
+            any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels)):
+        raise ValueError("请输入有效域名或 IPv4 地址。")
+    return value
+
+
+def unit_name(name):
+    return f"buds-hy2-node-{name}.service"
+
+
+def load_node(path):
+    if ROOT.is_symlink() or path.is_symlink() or not (path / "node.json").is_file():
+        raise ValueError(f"找不到托管节点 {path.name}。")
+    data = json.loads((path / "node.json").read_text())
+    if data.get("name") != path.name:
+        raise ValueError(f"节点记录与目录不匹配：{path.name}")
+    return data
+
+
+def nodes():
+    if ROOT.is_symlink():
+        raise ValueError("节点目录不能是符号链接。")
+    if ROOT.is_dir():
+        for path in sorted(ROOT.iterdir()):
+            if path.is_dir() and NODE_NAME.fullmatch(path.name):
+                yield load_node(path)
+
+
+def listeners():
+    for line in run("ss", "-H", "-lunp").stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 5:
+            port = fields[3].rsplit(":", 1)[-1]
+            if port.isdigit():
+                yield int(port), set(re.findall(r"\bpid=([0-9]+)", line))
+
+
+def nft_ports(value):
+    if isinstance(value, int):
+        yield value, value
+    elif isinstance(value, dict) and "range" in value and len(value["range"]) == 2:
+        if all(isinstance(n, int) for n in value["range"]):
+            yield tuple(value["range"])
+    elif isinstance(value, dict) and "set" in value:
+        for item in value["set"]:
+            yield from nft_ports(item)
+
+
+def udp_redirects():
+    if shutil.which("nft"):
+        result = run("nft", "-j", "list", "ruleset", check=False)
+        if result.returncode == 0:
+            for item in json.loads(result.stdout).get("nftables", []):
+                rule = item.get("rule", {})
+                expressions = rule.get("expr", [])
+                if not any("redirect" in expr or "dnat" in expr for expr in expressions):
+                    continue
+                for expr in expressions:
+                    match = expr.get("match", {})
+                    if match.get("op") in ("==", "in") and match.get("left", {}).get("payload") == {
+                            "protocol": "udp", "field": "dport"}:
+                        for span in nft_ports(match.get("right")):
+                            yield span, rule.get("table", "")
+    for command in ("iptables-save", "ip6tables-save"):
+        if shutil.which(command):
+            result = run(command, "-t", "nat", check=False)
+            for line in result.stdout.splitlines():
+                if " -p udp " not in line:
+                    continue
+                target = re.search(r" -j (DNAT|REDIRECT|HYSTERIA-PR-[a-f0-9]+)(?: |$)", line)
+                match = re.search(r" --dports? ([0-9:,]+)(?: |$)", line)
+                if target and match and " ! --dport" not in line:
+                    for span in match[1].split(","):
+                        first, separator, last = span.partition(":")
+                        yield ports(f"{first or 1}-{last or 65535}" if separator else first), target[1]
+
+
+def port_conflicts(name):
+    if not (BASE / "config.yaml").is_file():
+        raise ValueError("请先配置主节点，再新增节点。")
+    primary = PRIMARY_LISTEN.partition("#")[0].strip() or "443"
+    configured_public = PRIMARY_PUBLIC.partition("#")[0].strip() or primary
+    reserves = [(ports(p), "主节点监听范围") for p in primary.split(",")]
+    public = [(ports(p), "主节点公网范围") for p in configured_public.split(",")]
+    own_span = None
+    for node in nodes():
+        if node["name"] != name:
+            reserves.append((ports(node["ports"]), node["name"]))
+            public.append((ports(node["public_ports"]), node["name"]))
+        else:
+            own_span = ports(node["ports"])
+
+    own_pid = run("systemctl", "show", unit_name(name), "-p", "MainPID", "--value", check=False).stdout.strip()
+    for port, pids in listeners():
+        if not own_pid or own_pid == "0" or pids != {own_pid}:
+            reserves.append(((port, port), f"已监听 UDP {port}"))
+    for span, table in udp_redirects():
+        if (own_span and re.fullmatch(r"hysteria_[a-f0-9]{8}|HYSTERIA-PR-[a-f0-9]{8}", table) and
+                own_span[0] < span[0] <= span[1] <= own_span[1]):
+            continue
+        reserves.append((span, "现有 UDP 转发规则"))
+    return reserves, public
+
+
+def overlaps(span, other):
+    return span[0] <= other[1] and other[0] <= span[1]
+
+
+def choose_ports(value, reservations):
+    auto = re.fullmatch(r"auto(?::([0-9]{1,3}))?", value)
+    if auto:
+        count = int(auto[1] or "1")
+        if not 1 <= count <= 512:
+            raise ValueError("自动跳跃范围长度应为 1–512。")
+        first, last = 20000, 60999
+        choices = []
+        for (start, end), _ in sorted(reservations + [((last + 1, last + 1), "")]):
+            if min(start - 1, last) - first + 1 >= count:
+                choices.append((first, min(start - count, last - count + 1)))
+            first = max(first, end + 1)
+        candidates = sum(end - start + 1 for start, end in choices)
+        if candidates:
+            offset = secrets.randbelow(candidates)
+            for start, end in choices:
+                if offset <= end - start:
+                    return start + offset, start + offset + count - 1
+                offset -= end - start + 1
+        raise ValueError("未找到可用端口范围，请手动指定。")
+    span = ports(value)
+    for used, owner in reservations:
+        if overlaps(span, used):
+            raise ValueError(f"端口 {port_text(span)} 与 {owner}（{port_text(used)}）重叠。")
+    return span
+
+
+def secret(action, previous, label):
+    if action == "keep" and previous:
+        return previous
+    if action == "custom":
+        if not sys.stdin.isatty():
+            raise ValueError("输入自定义密码需要交互终端。")
+        value = getpass.getpass(f"{label}（至少 8 个字符）：")
+        if not re.fullmatch(r"[A-Za-z0-9_.@+!%*=-]{8,128}", value):
+            raise ValueError("密码长度 8–128，支持字母、数字和 _.@+!%*=-。")
+        if value != getpass.getpass(f"再次输入{label}："):
+            raise ValueError("两次输入不一致。")
+        return value
+    return secrets.token_hex(16)
+
+
+def apply_preferences(args, old):
+    data = {"name": args.name}
+    domain = args.domain or old.get("domain") or PRIMARY_DOMAIN
+    if domain == "your.domain.com" and not args.domain:
+        raise ValueError("未识别到主节点地址，请为此节点指定域名或 IPv4 地址。")
+    data["domain"] = domain_name(domain)
+    reserved, public = port_conflicts(args.name)
+    requested = args.ports or old.get("ports") or "auto"
+    # 自动选择时同时排除公网映射端口；固定端口分别核查本地监听和公网映射。
+    local_span = choose_ports(requested, reserved + public if requested.startswith("auto") else reserved)
+    previous_public = old.get("public_ports")
+    mapped = args.public_ports or (previous_public if previous_public != old.get("ports") else None)
+    public_span = choose_ports(port_text(local_span) if mapped in (None, "same") else mapped, public)
+    data["ports"], data["public_ports"] = port_text(local_span), port_text(public_span)
+    data["auth"] = secret(args.auth, old.get("auth"), "认证密码")
+    data["obfs"] = secret(args.obfs, old.get("obfs"), "混淆密码")
+    data["tls"] = args.tls or old.get("tls") or "auto"
+    return data
+
+
+def make_certificate(data, old, stage, path):
+    domain = data["domain"]
+    old_data = load_node(old) if old else {}
+    if data["tls"] == "auto":
+        cert = BASE / "server.crt"
+        key = BASE / "server.key"
+        is_ip = bool(re.fullmatch(r"[0-9.]+", domain))
+        verification = run("openssl", "verify", "-purpose", "sslserver",
+                           "-verify_ip" if is_ip else "-verify_hostname", domain,
+                           "-untrusted", str(cert), str(cert), check=False)
+        data["tls"] = "shared" if verification.returncode == 0 and key.is_file() else "self"
+    if data["tls"] == "shared":
+        cert, key = BASE / "server.crt", BASE / "server.key"
+        verify = run("openssl", "verify", "-purpose", "sslserver",
+                     "-verify_ip" if re.fullmatch(r"[0-9.]+", domain) else "-verify_hostname", domain,
+                     "-untrusted", str(cert), str(cert), check=False)
+        if verify.returncode or not key.is_file():
+            raise ValueError("主节点的 CA 证书未覆盖此地址，或证书文件不可用。请选择自签名。")
+        (stage / "server.crt").symlink_to(cert)
+        return cert, key
+    if old_data.get("tls") == "self" and old_data.get("domain") == domain:
+        for name in ("server.crt", "server.key"):
+            shutil.copyfile(old / name, stage / name)
+    else:
+        san = ("IP:" if re.fullmatch(r"[0-9.]+", domain) else "DNS:") + domain
+        openssl_config = stage / "openssl.cnf"
+        openssl_config.write_text("[req]\nprompt=no\ndistinguished_name=subject\n"
+                                  "x509_extensions=extensions\n[subject]\n"
+                                  f"CN={domain}\n[extensions]\nsubjectAltName={san}\n")
+        run("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+            "-nodes", "-days", "3650", "-config", str(openssl_config),
+            "-keyout", str(stage / "server.key"), "-out", str(stage / "server.crt"))
+        openssl_config.unlink()
+    return path / "server.crt", path / "server.key"
+
+
+def check_hopping(span):
+    if span[0] == span[1]:
+        return
+    version = run(CORE, "version").stdout
+    match = re.search(r"^Version:\s*v?(\d+)\.(\d+)\.(\d+)\s*$", version, re.M)
+    if not match or tuple(map(int, match.groups())) < (2, 12, 3):
+        raise ValueError("新增端口跳跃需要 Hysteria 2.12.3 或更新版本，以免本机其他 UDP 流量被重定向。可先选用单端口。")
+    if not (shutil.which("nft") or shutil.which("iptables")):
+        raise ValueError("端口跳跃需要 nftables 或 iptables。")
+
+
+def write_files(data, old, stage, path):
+    cert, key = make_certificate(data, old, stage, path)
+    (stage / "node.json").write_text(json.dumps(data, indent=2) + "\n")
+    (stage / "config.yaml").write_text(
+        f'listen: :{data["ports"]}\n'
+        f'tls:\n  cert: "{cert}"\n  key: "{key}"\n'
+        f'auth:\n  type: password\n  password: "{data["auth"]}"\n'
+        f'obfs:\n  type: salamander\n  salamander:\n    password: "{data["obfs"]}"\n'
+        'masquerade:\n  type: proxy\n  proxy:\n    url: https://news.ycombinator.com/\n'
+        '    rewriteHost: true\n')
+    client_tls = "  insecure: false\n"
+    if data["tls"] == "self":
+        fingerprint = run("openssl", "x509", "-in", str(stage / "server.crt"),
+                          "-noout", "-sha256", "-fingerprint").stdout.split("=", 1)[-1].strip()
+        if not re.fullmatch(r"(?:[0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}", fingerprint):
+            raise ValueError("无法读取节点证书的 SHA-256 指纹。")
+        client_tls = f'  insecure: true\n  pinSHA256: "{fingerprint.replace(":", "")}"\n'
+    (stage / "client.yaml").write_text(
+        f'server: {data["domain"]}:{data["public_ports"]}\n'
+        f'auth: "{data["auth"]}"\ntls:\n  sni: {data["domain"]}\n'
+        f'{client_tls}'
+        f'obfs:\n  type: salamander\n  salamander:\n    password: "{data["obfs"]}"\n'
+        'socks5:\n  listen: 127.0.0.1:1080\n')
+    start, end = ports(data["ports"])
+    caps = []
+    if start < 1024:
+        caps.append("CAP_NET_BIND_SERVICE")
+    if start != end:
+        caps.append("CAP_NET_ADMIN")
+    capabilities = " ".join(caps)
+    (stage / unit_name(data["name"])).write_text(f"""[Unit]
+Description=Buds Hysteria 2 node {data['name']}
+After=network.target buds-hysteria-egress.service
+
+[Service]
+Type=simple
+ExecStart={CORE} server --config {path}/config.yaml
+WorkingDirectory={path}
+User=hysteria
+Group=hysteria
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet={capabilities}
+AmbientCapabilities={capabilities}
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+""")
+    gid = grp.getgrnam("hysteria").gr_gid
+    for filename in ("config.yaml", "server.crt", "server.key"):
+        file = stage / filename
+        if file.exists() and not file.is_symlink():
+            os.chown(file, 0, gid)
+            file.chmod(0o640)
+    os.chown(stage, 0, gid)
+    stage.chmod(0o750)
+
+
+def ufw_rules():
+    if not shutil.which("ufw"):
+        return None
+    result = run("ufw", "status", "numbered").stdout
+    if "Status: active" not in result:
+        return None
+    for line in result.splitlines():
+        match = re.fullmatch(r"\[\s*(\d+)\]\s+(\d+(?::\d+)?/udp)( \(v6\))?\s+ALLOW(?: IN)?\s+Anywhere(?: \(v6\))?\s*(?:#\s*(.*))?", line)
+        if match:
+            yield int(match[1]), match[2], 6 if match[3] else 4, (match[4] or "").strip()
+
+
+def ufw_active():
+    return bool(shutil.which("ufw")) and "Status: active" in run("ufw", "status").stdout
+
+
+def firewall_port(port):
+    return port.replace("-", ":") + "/udp"
+
+
+def open_firewall(name, port):
+    if not ufw_active():
+        print(f"请确认主机防火墙和服务商面板已放行 UDP {port}。")
+        return
+    tag = FIREWALL_PREFIX + name
+    requested = firewall_port(port)
+    ufw_default = Path("/etc/default/ufw")
+    ipv6 = ufw_default.is_file() and re.search(r'^\s*IPV6=["\x27]?yes', ufw_default.read_text(), re.M)
+    for family, source in [(4, "0.0.0.0/0")] + ([(6, "::/0")] if ipv6 else []):
+        if not any(rule == requested and f == family for _, rule, f, _ in ufw_rules()):
+            run("ufw", "allow", "in", "proto", "udp", "from", source,
+                "to", "any", "port", requested.split("/")[0], "comment", tag)
+            if not any(rule == requested and f == family and owner == tag for _, rule, f, owner in ufw_rules()):
+                raise ValueError(f"UFW 未确认 IPv{family} 入站规则 {requested}，请检查现有规则。")
+
+
+def clean_firewall(name, keep=None):
+    if not shutil.which("ufw"):
+        return
+    tag = FIREWALL_PREFIX + name
+    if not ufw_active():
+        if f"comment '{tag}'" in run("ufw", "show", "added").stdout:
+            raise ValueError("UFW 已停用。请启用 UFW 后重试清除此节点的规则。")
+        return
+    for number, port, _, owner in sorted(ufw_rules(), reverse=True):
+        if owner == tag and port != keep:
+            run("ufw", "--force", "delete", str(number))
+
+
+def unit_link(path):
+    return UNITS / unit_name(path.name)
+
+
+def check_unit_link(path):
+    link = unit_link(path)
+    if not link.is_symlink() or os.readlink(link) != str(path / link.name):
+        raise ValueError(f"{unit_name(path.name)} 不属于此节点，请检查服务文件。")
+
+
+def start_node(data):
+    unit = unit_name(data["name"])
+    port = ports(data["ports"])[0]
+    run("systemctl", "start", unit)
+    for _ in range(30):
+        pid = run("systemctl", "show", unit, "-p", "MainPID", "--value").stdout.strip()
+        if pid and pid != "0" and any(port == current and pid in pids for current, pids in listeners()):
+            if active(unit):
+                return
+        time.sleep(0.2)
+    raise ValueError(f"节点未开始监听 UDP {port}。请查看 journalctl -u {unit}。")
+
+
+def add_node(args, path, data, stage):
+    link = unit_link(path)
+    if path.exists() or path.is_symlink() or link.exists() or link.is_symlink():
+        raise ValueError(f"节点或服务已存在：{args.name}")
+    stage.rename(path)
+    unit = unit_name(args.name)
+    try:
+        link.symlink_to(path / link.name)
+    except (OSError, KeyboardInterrupt):
+        shutil.rmtree(path)
+        raise
+    try:
+        run("systemctl", "daemon-reload")
+        open_firewall(args.name, data["ports"])
+        run("systemctl", "enable", unit)
+        start_node(data)
+    except (Exception, KeyboardInterrupt):
+        try:
+            remove_node(path)
+        except Exception as error:
+            raise ValueError(f"新增失败，清理中断，已保留 {args.name} 的配置以便重试删除。{error}") from error
+        raise
+
+
+def remove_node(path):
+    unit = unit_name(path.name)
+    link = unit_link(path)
+    if link.exists() or link.is_symlink():
+        check_unit_link(path)
+        run("systemctl", "stop", unit)
+        clean_firewall(path.name)
+        run("systemctl", "disable", unit)
+        if link.is_symlink():
+            check_unit_link(path)
+            link.unlink()
+    else:
+        run("systemctl", "daemon-reload")
+        if run("systemctl", "show", unit, "-p", "LoadState", "--value", check=False).stdout.strip() != "not-found":
+            raise ValueError(f"无法确认 {unit} 已移除，请检查系统服务。")
+        clean_firewall(path.name)
+    run("systemctl", "daemon-reload")
+    shutil.rmtree(path)
+
+
+def edit_node(data, old, path, stage, previous):
+    check_unit_link(path)
+    unit = unit_name(path.name)
+    was_active = active(unit)
+    if data == old:
+        open_firewall(path.name, data["ports"])
+        clean_firewall(path.name, firewall_port(data["ports"]))
+        return
+    run("systemctl", "stop", unit)
+    try:
+        path.rename(previous)
+        stage.rename(path)
+        run("systemctl", "daemon-reload")
+        open_firewall(path.name, data["ports"])
+        if was_active:
+            start_node(data)
+    except (Exception, KeyboardInterrupt):
+        run("systemctl", "stop", unit)
+        if previous.exists():
+            if path.exists():
+                path.rename(stage)
+            previous.rename(path)
+        run("systemctl", "daemon-reload")
+        if was_active:
+            start_node(old)
+        clean_firewall(path.name, firewall_port(old["ports"]))
+        raise
+    shutil.rmtree(previous)
+    clean_firewall(path.name, firewall_port(data["ports"]))
+
+
+def save_node(args):
+    node_name(args.name)
+    path = ROOT / args.name
+    old = load_node(path) if args.action == "edit" else {}
+    data = apply_preferences(args, old)
+    check_hopping(ports(data["ports"]))
+    ROOT.mkdir(exist_ok=True)
+    if ROOT.is_symlink():
+        raise ValueError("节点目录不能是符号链接。")
+    gid = grp.getgrnam("hysteria").gr_gid
+    os.chown(ROOT, 0, gid)
+    ROOT.chmod(0o750)
+    work = Path(tempfile.mkdtemp(prefix=f".{args.name}-", dir=ROOT))
+    stage = work / "next"
+    previous = work / "previous"
+    stage.mkdir()
+    try:
+        write_files(data, path if old else None, stage, path)
+        if old:
+            edit_node(data, old, path, stage, previous)
+        else:
+            add_node(args, path, data, stage)
+    finally:
+        if not previous.exists():
+            shutil.rmtree(work)
+        else:
+            print(f"原配置保存在 {previous}，请核对服务后再清理。", file=sys.stderr)
+    print(f"节点 {args.name} 已保存 · 本地 UDP {data['ports']} · 公网 UDP {data['public_ports']}")
+    print(f"查看连接信息：buds hy2 nodes link {args.name}")
+
+
+def main():
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(prog="buds hy2 nodes")
+    actions = parser.add_subparsers(dest="action")
+    actions.add_parser("list")
+    for verb in ("add", "edit"):
+        command = actions.add_parser(verb)
+        command.add_argument("name")
+        command.add_argument("--domain")
+        command.add_argument("--ports")
+        command.add_argument("--public-ports")
+        command.add_argument("--auth", choices=("keep", "random", "custom"), default="keep")
+        command.add_argument("--obfs", choices=("keep", "random", "custom"), default="keep")
+        command.add_argument("--tls", choices=("auto", "self", "shared"))
+    for verb in ("detail", "status", "start", "stop", "restart", "log", "delete"):
+        command = actions.add_parser(verb)
+        command.add_argument("name")
+        if verb == "delete":
+            command.add_argument("--yes", action="store_true")
+    args = parser.parse_args(sys.argv[5:])
+    if not args.action:
+        parser.error("请选择一个多节点命令，或使用 --help 查看帮助。")
+    if args.action == "list":
+        print("名称\t状态\t本地 UDP\t公网 UDP\t地址")
+        if (BASE / "config.yaml").is_file():
+            state = "运行中" if active("hysteria-server.service") else "已停止"
+            print(f"main\t{state}\t{PRIMARY_LISTEN}\t{PRIMARY_PUBLIC}\t{PRIMARY_DOMAIN}")
+        for data in nodes():
+            state = "运行中" if active(unit_name(data["name"])) else "已停止"
+            print(f"{data['name']}\t{state}\t{data['ports']}\t{data['public_ports']}\t{data['domain']}")
+        return
+    if args.action in ("add", "edit"):
+        if pwd.getpwnam("hysteria").pw_gid != grp.getgrnam("hysteria").gr_gid:
+            raise ValueError("请检查现有 hysteria 服务账户和用户组。")
+        save_node(args)
+        return
+    if args.name == "main":
+        raise ValueError("请在主菜单管理原有主节点。")
+    name = node_name(args.name)
+    path = ROOT / name
+    data = load_node(path)
+    unit = unit_name(name)
+    if args.action == "detail":
+        print(f"{name} · {data['domain']} · 本地 UDP {data['ports']} · 公网 UDP {data['public_ports']} · TLS {data['tls']}")
+        return
+    if args.action == "delete":
+        if not args.yes:
+            raise ValueError("删除节点须加 --yes。")
+        remove_node(path)
+        print(f"已删除节点 {name}。")
+        return
+    check_unit_link(path)
+    if args.action == "log":
+        subprocess.run(["journalctl", "-u", unit, "-n", "50", "--no-pager"], check=True)
+    elif args.action == "status":
+        r = run("systemctl", "status", unit, "--no-pager", check=False)
+        print(r.stdout, end="")
+    elif args.action == "stop":
+        run("systemctl", "stop", unit)
+        print(f"已停止节点 {name}。")
+    else:
+        reserved, public = port_conflicts(name)
+        check_hopping(choose_ports(data["ports"], reserved))
+        choose_ports(data["public_ports"], public)
+        open_firewall(name, data["ports"])
+        if args.action == "restart":
+            run("systemctl", "stop", unit)
+        start_node(data)
+        print(f"节点 {name} 正在运行。")
+
+
+try:
+    main()
+except (ValueError, OSError, KeyError) as error:
+    sys.exit(str(error))
+except subprocess.CalledProcessError as error:
+    sys.exit((error.stderr or error.stdout or "系统命令执行失败。").strip())
+except subprocess.TimeoutExpired:
+    sys.exit("系统命令超时，请检查节点和防火墙状态。")
+except KeyboardInterrupt:
+    sys.exit("操作已取消。")
+PY
+}
+
+nodes_tool() {
+    python3 -I -c "$(nodes_source)" "$CONFIG_DIR" "$(get_listen)" "$(get_public_ports)" "$(get_domain)" "$@"
+}
+
+nodes_manage() (
+    local action=${1:-list} name=${2:-}
+    if [[ "$name" == main && ( "$action" == link || "$action" == client || "$action" == status ) ]]; then
+        "$action"
+        return
+    fi
+    has_systemd || { echo "多节点管理需要 systemd。原有节点可继续在主菜单管理。" >&2; return 1; }
+    local dependency
+    for dependency in python3 flock ss openssl; do
+        command -v "$dependency" >/dev/null || { echo "多节点管理缺少 $dependency。" >&2; return 1; }
+    done
+    exec 9>/run/buds-hy2-nodes.lock && flock -x 9 || return 1
+    if [[ "$action" == link || "$action" == client ]]; then
+        nodes_tool detail "$name" || return 1
+        CONFIG_DIR="$CONFIG_DIR/nodes/$name"
+        CONFIG_FILE="$CONFIG_DIR/config.yaml"
+        CLIENT_CONFIG_FILE="$CONFIG_DIR/client.yaml"
+        NODE_LABEL="$name"
+        "$action"
+    elif (( $# )); then
+        nodes_tool "$@"
+    else
+        nodes_tool list
+    fi
+)
+
+nodes_form() {
+    local action=$1 name domain ports public tls auth obfs
+    local -a options=()
+    if [[ "$action" == add ]]; then
+        echo '直接回车可沿用主节点地址，自动生成端口、认证密码和混淆密码。'
+    else
+        echo '直接回车可保留现有值。保存更改时，运行中的选定节点会短暂重启。'
+    fi
+    read -rp '节点名称（回车取消）: ' name && [[ -n "$name" ]] || return 0
+    read -rp '访问域名或 IPv4 地址: ' domain || return 0
+    read -rp '本地 UDP 端口（如 3443、3443-3474 或 auto:32）: ' ports || return 0
+    read -rp '公网 UDP 端口（NAT 映射时填写，same 表示同本地）: ' public || return 0
+    read -rp 'TLS 证书（auto 自动 / self 自签名 / shared 复用主节点）: ' tls || return 0
+    read -rp '认证密码（random 重新生成 / custom 手动输入）: ' auth || return 0
+    read -rp '混淆密码（random 重新生成 / custom 手动输入）: ' obfs || return 0
+    [[ -z "$domain" ]] || options+=(--domain "$domain")
+    [[ -z "$ports" ]] || options+=(--ports "$ports")
+    [[ -z "$public" ]] || options+=(--public-ports "$public")
+    [[ -z "$tls" ]] || options+=(--tls "$tls")
+    nodes_manage "$action" "$name" "${options[@]}" --auth "${auth:-keep}" --obfs "${obfs:-keep}"
+}
+
+nodes_menu() {
+    local choice action name confirm
+    if ! nodes_manage list; then return 0; fi
+    while true; do
+        echo
+        echo '1. 列出节点   2. 新增节点   3. 编辑节点   4. 删除节点'
+        echo '5. 连接链接   6. 客户端配置 7. 节点状态   8. 最近日志'
+        echo '9. 启动节点  10. 停止节点  11. 重启节点   0. 返回主菜单'
+        read -rp '请选择多节点操作: ' choice || return 0
+        case "$choice" in
+            1) nodes_manage list || true; continue ;;
+            2) nodes_form add || echo '新增未完成，请检查上方提示。'; continue ;;
+            3) nodes_form edit || echo '修改未完成，请检查上方提示。'; continue ;;
+            4) action=delete ;;
+            5) action=link ;;
+            6) action=client ;;
+            7) action=status ;;
+            8) action=log ;;
+            9) action=start ;;
+            10) action=stop ;;
+            11) action=restart ;;
+            0|'') return 0 ;;
+            *) echo '输入无效，请重新选择。'; continue ;;
+        esac
+        read -rp '节点名称（回车取消）: ' name && [[ -n "$name" ]] || continue
+        if [[ "$action" == delete ]]; then
+            read -rp "再次输入 $name 确认删除: " confirm && [[ "$confirm" == "$name" ]] || {
+                echo '已取消删除。'; continue;
+            }
+            nodes_manage delete "$name" --yes || echo '删除未完成，请检查上方提示。'
+        else
+            nodes_manage "$action" "$name" || echo '操作未完成，请检查上方提示。'
+        fi
+    done
+}
+
+uninstall() (
     echo -e "\n  ${C_RED}⚠ 警告: 即将卸载 Hysteria 2 服务！${C_RESET}"
     read -rp "  确认彻底卸载吗？(y/N): " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        if command -v flock >/dev/null; then
+            exec 9>/run/buds-hy2-nodes.lock && flock -x 9 || return 1
+        fi
+        if [[ -L "$CONFIG_DIR/nodes" ]] ||
+            { [[ -d "$CONFIG_DIR/nodes" ]] && [[ -n "$(find "$CONFIG_DIR/nodes" -mindepth 1 -maxdepth 1 -print -quit)" ]]; }; then
+            echo "还有附加节点或待恢复的节点配置。请在多节点管理中逐个处理后再卸载。" >&2
+            return 1
+        fi
         if [[ -f "$WARP_DIR/.buds-managed" ]]; then warp_manage disable || return 1; fi
         if ! cleanup_renewal; then
             echo "  卸载已停止：续签任务未能清理，请处理后重试。" >&2
@@ -1719,7 +2427,7 @@ uninstall() {
     else
         echo -e "\n  已取消卸载。\n"
     fi
-}
+)
 
 is_version_newer() {
     local remote="$1" current="$2"
@@ -2032,9 +2740,10 @@ show_menu() {
         echo -e "     ${C_ORANGE_BOLD}9.${C_RESET} ${C_WHITE}模拟续签${C_RESET}      ${C_GRAY_MID}Let's Encrypt SSL Dry-Run${C_RESET}"
         echo -e "    ${C_ORANGE_BOLD}10.${C_RESET} ${C_WHITE}卸载节点${C_RESET}      ${C_GRAY_MID}Uninstall & Clean Firewall${C_RESET}"
         echo -e "    ${C_ORANGE_BOLD}11.${C_RESET} ${C_WHITE}WARP 定向分流${C_RESET}"
+        echo -e "    ${C_ORANGE_BOLD}12.${C_RESET} ${C_WHITE}新增节点 / 多节点管理${C_RESET}"
         echo -e "     ${C_GRAY_MID}0.${C_RESET} ${C_GRAY_MID}退出脚本${C_RESET}      ${C_GRAY_MID}Exit${C_RESET}\n"
 
-        read -rp "$(echo -e "  ${C_ORANGE_BOLD}❯${C_RESET} ${C_WHITE}请选择操作编号 [0-11]: ${C_RESET}")" choice
+        read -rp "$(echo -e "  ${C_ORANGE_BOLD}❯${C_RESET} ${C_WHITE}请选择操作编号 [0-12]: ${C_RESET}")" choice || return 0
         case "$choice" in
             1) status || true; read -rp "按回车键返回主菜单..." ;;
             2) link || true; read -rp "按回车键返回主菜单..." ;;
@@ -2054,8 +2763,9 @@ show_menu() {
                 fi
                 ;;
             9) renew_test || echo -e "  ${C_RED}✖ 证书续签模拟失败，请检查日志。${C_RESET}"; read -rp "按回车键返回主菜单..." ;;
-            10) uninstall || true; break ;;
+            10) if uninstall; then break; fi; read -rp "按回车键返回主菜单..." || return 0 ;;
             11) warp_menu ;;
+            12) nodes_menu ;;
             0) exit 0 ;;
             *) echo "输入无效，请重新选择。" ;;
         esac
@@ -2073,6 +2783,7 @@ case "$1" in
     link) link ;;
     client) client ;;
     warp) shift; warp_manage "$@" ;;
+    nodes|node) shift; nodes_manage "$@" ;;
     renew-test) renew_test ;;
     uninstall) uninstall ;;
     update) update_script ;;
