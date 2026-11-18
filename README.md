@@ -20,7 +20,7 @@ install -m 0644 -o root -g root update.pub /etc/buds-hy2/update.pub
 ```bash
 (
   set -e
-  version=1.5.1
+  version=1.5.2
   base="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates/releases/$version"
   work=$(mktemp -d)
   trap 'rm -rf -- "$work"' EXIT
@@ -76,7 +76,9 @@ buds hy2 uninstall   # 安全卸载服务
 
 ### WARP 系统级域名分流
 
-菜单第11项管理分流，默认关闭。已有节点可在取得包含此功能的签名版本后升级CLI。直接使用可信源码时，将下文的`buds hy2 warp`换为`bash "/源码绝对路径/buds" hy2 warp`，并填入本机实际路径。使用同一份脚本即可查看状态、关闭分流或卸载节点。
+菜单第11项管理分流，默认关闭。首次使用可选 `a` 引导安装并启用。脚本会检查环境、准备 sing-box 和独立 WireGuard 配置，并在需要时确认是否迁移 DNS。启用后会验证选路和实际 WARP 出口。之后可留在同一菜单选 `c` 检测、`m` 管理域名、`d` 关闭，或选 `r` 恢复迁移前的 DNS。分步操作也可以使用同一菜单。
+
+已有节点可先从菜单第8项升级。直接使用可信源码时，将下文的`buds hy2 warp`换为`bash "/源码绝对路径/buds" hy2 warp`，并填入本机实际路径。
 
 适用于使用systemd和systemd-resolved的Linux VPS。`/etc/resolv.conf`中的有效`nameserver`必须全部指向本机存根`127.0.0.53`。混用外部DNS可能导致同一目标有时走WARP、有时走原出口。需要内核TUN、iproute2、Python 3、curl、flock，以及包含WireGuard和gVisor的sing-box 1.12或更高1.x版本。VPS的公网可以只有IPv4。内核关闭IPv6时只建立IPv4虚拟路由。sing-box可按[官方软件包说明](https://sing-box.sagernet.org/installation/package-manager/)安装。
 
@@ -91,6 +93,8 @@ buds hy2 warp disable          # 关闭分流
 ```
 
 `setup`在 x86_64 和 ARM64 上可按固定 SHA-256 校验下载 sing-box 和 wgcf，保存在`/etc/buds-hy2/warp-tools`。其他架构可先安装适配的内核和 wgcf，或用`buds hy2 warp enable /实际路径/warp.conf`导入独立配置。wgcf 是社区工具，首次注册需在服务器终端阅读并确认条款。不要重复使用正在运行的 WireGuard 私钥；如需为 buds-HY2 单独注册，执行`buds hy2 warp setup --new-profile`。脚本会检查常见 sing-box 配置中的重复身份。
+
+服务器另有 sing-box 服务时，可以选 `i` 或运行 `buds hy2 warp setup --managed-core` 下载独立内核。新启用的 buds-HY2 分流优先使用这个内核，原有 sing-box 实例继续用自己的配置运行。若分流已经启用，先选 `d` 停止专用分流，再选 `e` 启用，即可切换内核。
 
 如果诊断发现`/etc/resolv.conf`是只含公网 nameserver 的静态文件，可在服务器终端以 root 执行`buds hy2 warp dns-switch`。脚本备份原文件、保留原上游并短暂重启解析服务。查询验证失败时会尝试恢复原配置。以后需要撤销时先执行`buds hy2 warp disable`，再执行`buds hy2 warp dns-restore`。带搜索域、解析选项、容器挂载或其他 DNS 管理器的主机，请按本机管理方式配置 systemd-resolved。OpenRC 或无 systemd 的环境仍可使用 HY2 基础功能。容器启用 WARP 需由宿主机提供 TUN 和网络管理权限。
 内置清单只包含Google系列服务，覆盖搜索、Play、谷歌学术、YouTube、Gemini及相关资源域名。ChatGPT、Claude、GitHub和x.com默认沿用原有出口。列入清单的域名由专用解析器分配虚拟IPv4或IPv6地址，sing-box通过WARP查询真实地址并转发TCP或UDP。
@@ -114,7 +118,7 @@ buds hy2 warp domains reset                        # 用内置 Google 清单替�
 
 该策略覆盖VPS本机和交给HY2服务端按域名连接的请求。客户端提前解析后只交给HY2一个真实IP、应用自带DoH、独立网络命名空间、自定义HY2解析器或已有DNS缓存，都可能绕过分流。已有全局VPN的机器会沿用其原有出口。新启用或关闭后请重连客户端，必要时清除应用DNS缓存。
 
-启动前会检查专用地址段及已有DNS路由。其他解析链路若已接管相同或更具体的目标后缀，脚本会拒绝启用有冲突的清单。WireGuard的`Endpoint`使用域名时，也应将它及覆盖它的父域名留在清单之外，否则建立隧道本身就会依赖该隧道。
+启动前会检查专用地址段及已有DNS路由，并使用系统DNS解析WireGuard端点，再建立分流链路。其他解析链路若已接管相同或更具体的目标后缀，脚本会拒绝启用有冲突的清单。WireGuard的`Endpoint`使用域名时，也应将它及覆盖它的父域名留在清单之外，否则建立隧道本身就会依赖该隧道。
 
 启用时会抽查样本域名、GitHub和x.com的选路。清单非空时，还会通过隧道请求Cloudflare Trace并核对WARP出口标记。诊断失败会撤销本次启用。可用`journalctl -u buds-warp-split.service -b`查看日志。关闭分流或卸载节点时会清理专用服务，保留输入的WireGuard配置。Google Play内容、YouTube Premium权益和AI服务可用性仍取决于出口地区、账号及各平台策略，需登录相应服务验证。
 
@@ -125,7 +129,7 @@ buds hy2 warp domains reset                        # 用内置 Google 清单替�
 ```bash
 (
   set -e
-  version=1.5.1
+  version=1.5.2
   base="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates/releases/$version"
   work=$(mktemp -d /usr/local/bin/.buds_upgrade.XXXXXX)
   trap 'rm -rf -- "$work"' EXIT

@@ -222,6 +222,56 @@ echo google.com > "$WARP_DIR/domains"
 warp_trace
 """)
 
+    def test_warp_menu_keeps_options_available_after_cancellation_and_failure(self):
+        output = self.shell(r"""
+systemctl() { return 1; }
+warp_manage() {
+    printf '%s\n' "$*" >> "$ACTION_FILE"
+    if [[ "$1" == check ]]; then return 1; fi
+}
+warp_menu_begin() { echo wizard >> "$ACTION_FILE"; }
+warp_domains_menu() { echo domains-menu >> "$ACTION_FILE"; }
+warp_menu <<'INPUT'
+c
+p
+s
+i
+n
+n
+n
+y
+e
+
+d
+r
+y
+m
+a
+0
+INPUT
+""")
+        self.assertIn("已取消 DNS 迁移", output)
+        self.assertEqual(self.actions().splitlines(),
+                         ["check", "doctor", "setup", "setup --managed-core", "dns-switch",
+                          "enable ", "disable", "dns-restore", "domains-menu", "wizard"])
+
+    def test_warp_wizard_reverts_only_dns_it_changed_for_this_attempt(self):
+        self.shell(r"""
+systemctl() { return 1; }
+warp_requirements() { [[ "$1" == before-dns ]]; }
+warp_check_stub() { return "$STUB_STATUS"; }
+warp_manage() {
+    echo "$*" >> "$ACTION_FILE"
+    if [[ "$1" == enable ]]; then return 1; fi
+}
+STUB_STATUS=1
+if warp_menu_begin <<< y; then exit 9; fi
+STUB_STATUS=0
+if warp_menu_begin; then exit 9; fi
+""")
+        self.assertEqual(self.actions().splitlines(),
+                         ["setup", "dns-switch", "enable", "dns-restore", "setup", "enable"])
+
     def test_warp_requires_exclusive_stub(self):
         self.shell("""
 resolv="$SANDBOX/etc/resolv.conf"
@@ -459,7 +509,7 @@ DOMAIN=node.example.com; CLIENT_PORT_STR=19957; AUTH_PASSWORD=pass; OBFS_PASSWOR
 setup_cli
 """, "install.sh")
         installed_cli = (self.directory / "usr/local/bin/buds").read_text(encoding="utf-8")
-        self.assertIn('SCRIPT_VERSION="1.5.1"', installed_cli)
+        self.assertIn('SCRIPT_VERSION="1.5.2"', installed_cli)
         self.assertNotIn("unsigned sibling", installed_cli)
 
     def test_init_detection_requires_commands_and_runtime(self):

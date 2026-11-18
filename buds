@@ -4,7 +4,7 @@ set -e
 CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
-SCRIPT_VERSION="1.5.1"
+SCRIPT_VERSION="1.5.2"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 UPDATE_REPO_URL="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates"
@@ -741,7 +741,7 @@ warp_find_binary() {
     local pid live candidate path version
     pid=$(systemctl show -p MainPID --value sing-box.service 2>/dev/null) || pid=
     if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then live=$(readlink -e "/proc/$pid/exe") || live=; fi
-    for candidate in "${BUDS_SING_BOX_BIN:-}" "$live" /etc/s-box/sing-box "$WARP_TOOLS/sing-box" "$(type -P sing-box || true)" \
+    for candidate in "${BUDS_SING_BOX_BIN:-}" "$WARP_TOOLS/sing-box" "$live" /etc/s-box/sing-box "$(type -P sing-box || true)" \
         /usr/local/bin/sing-box /usr/bin/sing-box; do
         [[ -n "$candidate" && -f "$candidate" && -x "$candidate" ]] || continue
         path=$(readlink -e -- "$candidate") || continue
@@ -820,6 +820,9 @@ warp_setup() (
     local detected profile wgcf
     umask 077
     [[ ! -L "$WARP_TOOLS" ]] && mkdir -p -- "$WARP_TOOLS" && warp_exec_safe "$WARP_TOOLS" || return 1
+    if [[ "${1:-}" == --managed-core && ! -x "$WARP_TOOLS/sing-box" ]]; then
+        warp_download_tool sing-box || return 1
+    fi
     detected=$(warp_find_binary 2>/dev/null) || {
         warp_download_tool sing-box || return 1
         detected=$(warp_find_binary) || return 1
@@ -833,18 +836,21 @@ warp_setup() (
         cd "$WARP_TOOLS" || return 1
         if [[ ! -s wgcf-account.toml ]]; then
             [[ -t 0 ]] || { echo "请在服务器终端运行此命令并阅读 wgcf 的条款提示。" >&2; return 1; }
-            "$wgcf" register || return 1
+            if ! "$wgcf" register; then
+                echo "WARP 注册未完成。可重新选择「准备依赖」，已有注册记录会自动复用。" >&2
+                return 1
+            fi
         fi
-        "$wgcf" generate || return 1
+        "$wgcf" generate || { echo "生成 WireGuard 配置失败，请检查上方 wgcf 输出。" >&2; return 1; }
         profile=$(warp_find_profile) || return 1
         chmod 600 "$profile" || return 1
     fi
     printf 'WARP 配置：%s\n' "$profile"
-    warp_check_stub || {
-        echo "依赖已准备。静态 DNS 主机可先运行 buds hy2 warp dns-switch，再启用分流。"
-        return 1
-    }
-    echo "依赖已准备。运行 buds hy2 warp doctor 完成启用前检查。"
+    if warp_check_stub 2>/dev/null; then
+        echo "依赖已准备。可以选择「启用」。"
+    else
+        echo "依赖已准备。静态 DNS 主机请选择「迁移 DNS」，再启用分流。"
+    fi
 )
 
 warp_dns_replace() (
@@ -884,7 +890,7 @@ warp_dns_switch() (
     [[ -f /etc/resolv.conf && ! -L /etc/resolv.conf && ! -e "$WARP_DNS_STATE" &&
         ! -e "$WARP_DNS_DROPIN" && ! -L "$WARP_DNS_DROPIN" ]] ||
         { echo "检测到已有的 DNS 管理或迁移状态，请先检查 /etc/resolv.conf。" >&2; return 1; }
-    local upstream
+    local upstream dropin_dir mode
     upstream=$(python3 -I - /etc/resolv.conf <<'PY'
 from ipaddress import ip_address
 import sys
@@ -908,8 +914,15 @@ except ValueError:
 print(" ".join(dict.fromkeys(servers)))
 PY
     ) || return 1
+    dropin_dir=$(dirname "$WARP_DNS_DROPIN") || return 1
+    mkdir -p -m 0755 -- "$dropin_dir" || return 1
+    mode=$(stat -Lc %a -- "$dropin_dir") || return 1
+    if (( (8#$mode & 001) == 0 )); then
+        echo "解析服务可能无法读取 $dropin_dir。请检查目录是否允许 systemd-resolved 访问。" >&2
+        return 1
+    fi
     umask 077
-    mkdir -p -- "$(dirname "$WARP_DNS_STATE")" "$(dirname "$WARP_DNS_DROPIN")" &&
+    mkdir -p -- "$(dirname "$WARP_DNS_STATE")" &&
         mkdir -- "$WARP_DNS_STATE" || return 1
     if ! cp -a -- /etc/resolv.conf "$WARP_DNS_STATE/resolv.conf" ||
         ! printf '[Resolve]\nDNS=\nDNS=%s\n' "$upstream" > "$WARP_DNS_STATE/resolved.conf"; then
@@ -973,9 +986,12 @@ DOMAINS
 warp_policy_tool() {
     cat <<'PY'
 import json
+from ipaddress import ip_address
 import os
 from pathlib import Path
 import re
+import socket
+import subprocess
 import sys
 import tempfile
 
@@ -1061,6 +1077,34 @@ def check_resolved_domains(path):
     if scope is None:
         raise ValueError("无法读取 systemd-resolved 的 DNS 路由域")
 
+def resolve_endpoints(path):
+    path = Path(path)
+    cfg = json.loads(path.read_text())
+    for endpoint in cfg["endpoints"]:
+        for peer in endpoint["peers"]:
+            host = peer["address"]
+            try:
+                ip_address(host)
+                continue
+            except ValueError:
+                pass
+            try:
+                infos = socket.getaddrinfo(host, peer["port"], type=socket.SOCK_DGRAM)
+            except socket.gaierror:
+                raise ValueError(f"无法使用当前系统 DNS 解析 WireGuard 端点：{host}")
+            candidates = dict.fromkeys(info[4][0] for info in infos)
+            for ip in candidates:
+                result = subprocess.run(["ip", "-j", "route", "get", ip],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if result.returncode == 0:
+                    routes = json.loads(result.stdout)
+                    if routes and routes[0].get("dev") not in (None, "buds-warp0"):
+                        peer["address"] = ip
+                        break
+            else:
+                raise ValueError(f"WireGuard 端点没有可用的原有网络路由：{host}")
+    atomic(path, json.dumps(cfg))
+
 def edit(action, current, args):
     if action == "import" and len(args) == 1:
         return names(args[0])
@@ -1089,6 +1133,8 @@ try:
         render(*args)
     elif action == "check-resolved":
         check_resolved_domains(*args)
+    elif action == "resolve-endpoints":
+        resolve_endpoints(*args)
     else:
         for item in sorted(edit(action, args[0], args[1:])):
             print(item)
@@ -1386,6 +1432,7 @@ warp_preflight_file() {
 warp_check_stub
 warp_check_routes
 python3 -I policy.py render base.json ../warp-domains .
+python3 -I policy.py resolve-endpoints config.json
 if [[ -s domains ]]; then
     set -o pipefail
     LC_ALL=C SYSTEMD_COLORS=0 resolvectl --no-pager domain | python3 -I policy.py check-resolved domains
@@ -1403,8 +1450,10 @@ warp_requirements() {
         { echo "无法访问 /dev/net/tun。容器需要宿主机映射 TUN 并授予 CAP_NET_ADMIN。" >&2; failed=1; }
     systemctl is-active --quiet systemd-resolved ||
         { echo "systemd-resolved 未运行。请先检查发行版的 DNS 管理方式。" >&2; failed=1; }
-    warp_check_stub ||
-        { echo "静态公网 DNS 可用 buds hy2 warp dns-switch 迁移。其他 DNS 布局请按 README 配置。" >&2; failed=1; }
+    if [[ "${1:-}" != before-dns ]] && ! warp_check_stub; then
+        echo "静态公网 DNS 可用 buds hy2 warp dns-switch 迁移。其他 DNS 布局请按 README 配置。" >&2
+        failed=1
+    fi
     return "$failed"
 }
 
@@ -1565,7 +1614,7 @@ warp_manage() (
     flock -x 9 || return 1
     case "$action" in
         setup)
-            [[ -z "$profile" || "$profile" == --new-profile ]] || return 2
+            [[ -z "$profile" || "$profile" == --new-profile || "$profile" == --managed-core ]] || return 2
             warp_setup "$profile"; return ;;
         dns-switch)
             [[ ! -d "$WARP_DIR" ]] || { echo "请先运行 buds hy2 warp disable。" >&2; return 1; }
@@ -1575,16 +1624,29 @@ warp_manage() (
             warp_dns_restore; return ;;
         disable) warp_remove && echo "WARP 分流已关闭。" ; return ;;
         check)
-            systemctl is-active --quiet "$WARP_UNIT" && warp_verify && warp_trace || return 1
+            if ! systemctl is-active --quiet "$WARP_UNIT"; then
+                if [[ -d "$WARP_DIR" ]]; then
+                    echo "WARP 服务未运行。请用 buds hy2 warp status 查看状态和启动日志。" >&2
+                else
+                    echo "WARP 分流未启用。请先选择「启用」，再检测实际出口。" >&2
+                fi
+                return 1
+            fi
+            warp_verify && warp_trace || return 1
             if grep -Fq '"198.18.240.3/32"' "$WARP_DIR/config.json" || [[ ! -s "$WARP_DIR/domains" ]]; then
-                warp_tunnel_probe
+                warp_tunnel_probe || return 1
+                if [[ -s "$WARP_DIR/domains" ]]; then
+                    echo "检测通过。当前分流规则和 WARP 出口正常。"
+                else
+                    echo "检测通过。域名清单为空，当前流量使用原有出口。"
+                fi
             else
                 echo "旧版运行配置没有专用出口探针；隧道出口尚未验证。" >&2
                 return 1
             fi
             return ;;
         enable) ;;
-        *) echo "用法：buds hy2 warp {doctor|setup [--new-profile]|dns-switch|dns-restore|enable [配置路径]|status|check|disable|domains}"; return 2 ;;
+        *) echo "用法：buds hy2 warp {doctor|setup [--new-profile|--managed-core]|dns-switch|dns-restore|enable [配置路径]|status|check|disable|domains}"; return 2 ;;
     esac
     if [[ -d "$WARP_DIR" ]]; then
         systemctl is-active --quiet "$WARP_UNIT" && { echo "WARP 分流已启用。"; return 0; }
@@ -1600,8 +1662,14 @@ warp_manage() (
     touch "$WARP_DIR/.buds-managed" || { rmdir "$WARP_DIR"; return 1; }
     trap 'rc=$?; if ((rc)); then warp_remove || echo "清理未完成，请运行 buds hy2 warp disable。" >&2; fi' EXIT
     warp_files "$profile" "$binary" "$version" || return 1
-    systemctl enable "$WARP_DIR/$WARP_UNIT" && systemctl start "$WARP_UNIT" || return 1
-    warp_verify && warp_tunnel_probe && warp_trace || return 1
+    if ! systemctl enable "$WARP_DIR/$WARP_UNIT" || ! systemctl start "$WARP_UNIT"; then
+        echo "WARP 服务启动失败。正在撤销本次启用，可用 journalctl -u $WARP_UNIT 查看原因。" >&2
+        return 1
+    fi
+    if ! { warp_verify && warp_tunnel_probe && warp_trace; }; then
+        echo "选路或出口验证失败，正在撤销本次启用。" >&2
+        return 1
+    fi
     echo "WARP 分流已启用，当前清单选路检查通过。"
 )
 
@@ -1823,6 +1891,78 @@ warp_domains_menu() {
     done
 }
 
+warp_menu_begin() {
+    local confirm switched=false
+    if systemctl is-active --quiet "$WARP_UNIT" 2>/dev/null; then
+        echo "WARP 分流已经启用，开始检测。"
+        warp_manage check
+        return
+    fi
+    warp_requirements before-dns && warp_manage setup || return 1
+    if ! warp_check_stub 2>/dev/null; then
+        read -rp "首次启用需迁移 DNS，会短暂重启解析服务。确认？[y/N] " confirm || return 1
+        if [[ "${confirm,,}" != y ]]; then echo "已取消启用，已准备的依赖可下次复用。"; return 0; fi
+        warp_manage dns-switch || return 1
+        switched=true
+    fi
+    if ! warp_manage enable; then
+        if [[ "$switched" == true ]]; then warp_manage dns-restore || true; fi
+        return 1
+    fi
+}
+
+warp_menu() {
+    local choice profile confirm
+    while true; do
+        printf '\nWARP 定向分流\n'
+        if systemctl is-active --quiet "$WARP_UNIT" 2>/dev/null; then
+            echo "WARP 分流正在运行。"
+        elif [[ -d "$WARP_DIR" ]]; then
+            echo "WARP 服务未运行，可选择 p 检查或用 buds hy2 warp status 查看日志。"
+        else
+            echo "WARP 分流未启用。首次使用可选择 a 按提示完成，也可分步操作。"
+        fi
+        printf '%s\n' 'a  引导安装并启用' \
+            'p  启用前诊断    s  准备依赖      i  安装独立内核' \
+            'n  迁移 DNS      r  恢复 DNS' \
+            'e  启用分流      c  检测出口      d  关闭分流' \
+            'm  管理域名      0  返回主菜单'
+        read -rp "请选择： " choice || return 0
+        case "${choice,,}" in
+            a) warp_menu_begin || echo "引导未完成，可选择 p 检查并按提示重试。" ;;
+            p) warp_manage doctor || true ;;
+            s) warp_manage setup || echo "准备依赖未完成，请参照上方提示。" ;;
+            i) warp_manage setup --managed-core || echo "独立内核准备未完成，请参照上方提示。" ;;
+            n|r)
+                if [[ "${choice,,}" == n ]]; then
+                    read -rp "迁移系统 DNS 到本机存根，会短暂重启解析服务。确认？[y/N] " confirm || return 0
+                    if [[ "${confirm,,}" == y ]]; then
+                        warp_manage dns-switch || echo "DNS 迁移未完成，请参照上方提示。"
+                    else
+                        echo "已取消 DNS 迁移。"
+                    fi
+                else
+                    read -rp "恢复迁移前的 DNS，会短暂重启解析服务。确认？[y/N] " confirm || return 0
+                    if [[ "${confirm,,}" == y ]]; then
+                        warp_manage dns-restore || echo "DNS 恢复未完成，请参照上方提示。"
+                    else
+                        echo "已取消 DNS 恢复。"
+                    fi
+                fi
+                ;;
+            e)
+                read -rp "WireGuard 配置路径（回车自动查找）： " profile || return 0
+                warp_manage enable "$profile" || echo "启用未完成，可选择 p 查看启用条件。"
+                ;;
+            c) warp_manage check || true ;;
+            d) warp_manage disable || echo "关闭未完成，请参照上方提示。" ;;
+            m) warp_domains_menu || true ;;
+            0|"") return 0 ;;
+            *) echo "选项无效，请重新选择。" ;;
+        esac
+    done
+}
+
 show_menu() {
     local remote_ver
     remote_ver=$(check_remote_version 2>/dev/null) || remote_ver=""
@@ -1915,21 +2055,7 @@ show_menu() {
                 ;;
             9) renew_test || echo -e "  ${C_RED}✖ 证书续签模拟失败，请检查日志。${C_RESET}"; read -rp "按回车键返回主菜单..." ;;
             10) uninstall || true; break ;;
-            11)
-                warp_manage status || true
-                read -rp "启用前诊断(p)、准备依赖(s)、迁移 DNS(n)、启用(e)、关闭(d)、检测(c)、管理域名(m)、返回(回车)： " op
-                case "$op" in
-                    p) warp_manage doctor || true ;;
-                    s) warp_manage setup || true ;;
-                    n) read -rp "迁移系统 DNS 到本机存根，会短暂重启解析服务。确认？[y/N] " op
-                       if [[ "$op" =~ ^[Yy]$ ]]; then warp_manage dns-switch || true; fi ;;
-                    e) read -rp "WARP WireGuard 配置路径（回车自动查找）： " profile
-                       warp_manage enable "$profile" || true ;;
-                    d) warp_manage disable || true ;;
-                    c) warp_manage check || true ;;
-                    m) warp_domains_menu || true ;;
-                esac
-                read -rp "按回车键返回主菜单..." ;;
+            11) warp_menu ;;
             0) exit 0 ;;
             *) echo "输入无效，请重新选择。" ;;
         esac
