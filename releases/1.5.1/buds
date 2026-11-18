@@ -1,0 +1,1975 @@
+#!/usr/bin/env bash
+set -e
+
+CONFIG_DIR="/etc/hysteria"
+CONFIG_FILE="${CONFIG_DIR}/config.yaml"
+CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
+SCRIPT_VERSION="1.5.1"
+BUDS_CLI="/usr/local/bin/buds"
+HY2_CLI="/usr/local/bin/hy2"
+UPDATE_REPO_URL="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates"
+UPDATE_PUBLIC_KEY="/etc/buds-hy2/update.pub"
+VERSION_CACHE_FILE="${CONFIG_DIR}/.version_cache"
+PROCESS_PATTERN='/usr/local/bin/hysteria server (-c|--config) /etc/hysteria/config[.]yaml'
+
+# 优雅终端色彩 · MiMo Code 极客调色盘
+C_RESET="\033[0m"
+C_BOLD="\033[1m"
+C_DIM="\033[2m"
+C_ORANGE="\033[38;5;208m"       # MiMo 标志性暖橙
+C_ORANGE_BOLD="\033[1;38;5;208m"
+C_AMBER="\033[38;5;215m"        # 柔和琥珀黄
+C_SPARK="\033[38;5;222m"        # 星芒香槟金
+C_WHITE="\033[38;5;254m"        # 珍珠白文本
+C_GRAY_LIGHT="\033[38;5;250m"   # 亮灰文本
+C_GRAY_MID="\033[38;5;244m"     # 哑光灰注释
+C_GRAY_DARK="\033[38;5;238m"    # 极暗分界
+C_GREEN="\033[38;5;114m"        # 薄荷绿 (运行中)
+C_RED="\033[38;5;203m"          # 珊瑚红 (已停止)
+C_CYAN="\033[38;5;153m"         # 冰青色 (端口/参数)
+C_YELLOW="\033[38;5;221m"       # 浅金黄 (链接)
+C_BAR="${C_ORANGE_BOLD}▌${C_RESET}"
+C_SUBBAR="${C_ORANGE}▎${C_RESET}"
+
+if [[ "$1" == "hy2" ]]; then
+    shift
+fi
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "\n  ${C_RED}✖ 请以 root 权限运行此命令 (例如: sudo buds hy2)${C_RESET}\n"
+        exit 1
+    fi
+}
+
+get_domain() {
+    local domain=""
+    if [[ -f "$CLIENT_CONFIG_FILE" ]]; then
+        domain=$(awk -F': *' '/^[[:space:]]*sni:/ {gsub(/^["'\'' ]+|["'\'' \r]+$/, "", $2); print $2; exit}' "$CLIENT_CONFIG_FILE" 2>/dev/null)
+    fi
+    if [[ -z "$domain" ]]; then
+        domain=$(grep -o 'live/[^/]*' /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh 2>/dev/null | cut -d'/' -f2 | head -1)
+    fi
+    if [[ -z "$domain" && -f "${CONFIG_DIR}/server.crt" ]]; then
+        domain=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -subject -nameopt RFC2253 2>/dev/null |
+            sed -n 's/^subject=.*CN=\([^,]*\).*$/\1/p' || true)
+    fi
+    [[ -z "$domain" ]] && domain="your.domain.com"
+    echo "$domain"
+}
+
+get_password() {
+    local pwd=""
+    if [[ -f "$CONFIG_FILE" ]]; then
+        pwd=$(awk '
+          /^[[:space:]]*auth:/ { in_auth=1; in_obfs=0 }
+          /^[[:space:]]*obfs:/ { in_auth=0; in_obfs=1 }
+          in_auth && /^[[:space:]]*password:/ {
+            sub(/^[[:space:]]*password:[[:space:]]*/, "");
+            gsub(/^["'\'' ]+|["'\'' \r]+$/, "");
+            print;
+            exit;
+          }
+        ' "$CONFIG_FILE" 2>/dev/null)
+    fi
+    if [[ -z "$pwd" && -f "$CLIENT_CONFIG_FILE" ]]; then
+        pwd=$(awk '
+          /^[[:space:]]*auth:/ {
+            sub(/^[[:space:]]*auth:[[:space:]]*/, "");
+            gsub(/^["'\'' ]+|["'\'' \r]+$/, "");
+            print;
+            exit;
+          }
+        ' "$CLIENT_CONFIG_FILE" 2>/dev/null)
+    fi
+    echo "$pwd"
+}
+
+get_obfs_pwd() {
+    local obfs=""
+    if [[ -f "$CONFIG_FILE" ]]; then
+        obfs=$(awk '
+          /^[[:space:]]*obfs:/ { in_obfs=1; in_auth=0 }
+          /^[[:space:]]*auth:/ { in_obfs=0 }
+          in_obfs && /^[[:space:]]*password:/ {
+            sub(/^[[:space:]]*password:[[:space:]]*/, "");
+            gsub(/^["'\'' ]+|["'\'' \r]+$/, "");
+            print;
+            exit;
+          }
+        ' "$CONFIG_FILE" 2>/dev/null)
+    fi
+    if [[ -z "$obfs" && -f "$CLIENT_CONFIG_FILE" ]]; then
+        obfs=$(awk '
+          /^[[:space:]]*obfs:/ { in_obfs=1 }
+          in_obfs && /^[[:space:]]*password:/ {
+            sub(/^[[:space:]]*password:[[:space:]]*/, "");
+            gsub(/^["'\'' ]+|["'\'' \r]+$/, "");
+            print;
+            exit;
+          }
+        ' "$CLIENT_CONFIG_FILE" 2>/dev/null)
+    fi
+    echo "$obfs"
+}
+
+get_listen() {
+    local listen=""
+    if [[ -f "$CONFIG_FILE" ]]; then
+        listen=$(sed -n 's/^[[:space:]]*listen:[[:space:]]*\(.*\)/\1/p' "$CONFIG_FILE" 2>/dev/null | tr -d ' "\047\r' | head -1)
+        if [[ "$listen" == :* ]]; then
+            listen="${listen#:}"
+        elif [[ "$listen" =~ ^\[[^]]+\]:(.*)$ ]]; then
+            listen="${BASH_REMATCH[1]}"
+        elif [[ "$listen" =~ ^[^:]+:([0-9]+(-[0-9]+)?)$ ]]; then
+            listen="${BASH_REMATCH[1]}"
+        fi
+    fi
+    if [[ -z "$listen" && -f "$CLIENT_CONFIG_FILE" ]]; then
+        listen=$(sed -n 's/^[[:space:]]*server:[[:space:]]*\(.*\)/\1/p' "$CLIENT_CONFIG_FILE" 2>/dev/null | tr -d ' "\047\r' | head -1)
+        if [[ "$listen" =~ ^\[[^]]+\]:(.*)$ ]]; then
+            listen="${BASH_REMATCH[1]}"
+        else
+            listen="${listen##*:}"
+        fi
+    fi
+    echo "$listen"
+}
+
+get_public_ports() {
+    local ports=""
+    if [[ -f "$CLIENT_CONFIG_FILE" ]]; then
+        ports=$(sed -n 's/^[[:space:]]*server:[[:space:]]*\(.*\)/\1/p' "$CLIENT_CONFIG_FILE" 2>/dev/null | tr -d ' "\047\r' | head -1)
+        if [[ "$ports" =~ ^\[[^]]+\]:(.*)$ ]]; then
+            ports="${BASH_REMATCH[1]}"
+        elif [[ "$ports" == *:* ]]; then
+            ports="${ports##*:}"
+        else
+            ports=""
+        fi
+    fi
+    if [[ -z "$ports" && -f "${CONFIG_DIR}/.public_port" ]]; then
+        ports=$(cat "${CONFIG_DIR}/.public_port")
+    fi
+    [[ -n "$ports" ]] || ports=$(get_listen)
+    echo "$ports"
+}
+
+get_masquerade_url() {
+    local url=""
+    if [[ -f "$CONFIG_FILE" ]]; then
+        url=$(awk '
+          /^[[:space:]]*masquerade:/ { in_masq=1; next }
+          in_masq && /^[^[:space:]#]/ { in_masq=0 }
+          in_masq && /^[[:space:]]*url:[[:space:]]*/ {
+            sub(/^[[:space:]]*url:[[:space:]]*/, "");
+            gsub(/^["\047 ]+|["\047 \r]+$/, "");
+            print;
+            exit;
+          }
+        ' "$CONFIG_FILE" 2>/dev/null)
+    fi
+    [[ -n "$url" ]] || url="https://news.ycombinator.com/"
+    echo "$url"
+}
+
+urlencode() {
+    local s="$1" out="" i c hex
+    local LC_ALL=C
+    for ((i=0; i<${#s}; i++)); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out+="$c" ;;
+            *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'	'/\\t}"
+    printf '%s' "$s"
+}
+
+has_systemd() {
+    command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
+}
+
+has_openrc() {
+    command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1 &&
+        command -v openrc-run >/dev/null 2>&1 && [[ -f /run/openrc/softlevel ]]
+}
+
+is_cert_self_signed() {
+    if [[ -f "${CONFIG_DIR}/server.crt" ]]; then
+        local issuer subject
+        issuer=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -issuer -nameopt RFC2253 2>/dev/null | sed 's/^issuer=[[:space:]]*//' || true)
+        subject=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -subject -nameopt RFC2253 2>/dev/null | sed 's/^subject=[[:space:]]*//' || true)
+        if [[ -n "$issuer" && "$issuer" == "$subject" ]]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+get_cert_pin() {
+    local pin
+    pin=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -fingerprint -sha256 2>/dev/null |
+        sed 's/^[^=]*=//' | tr -d ':\r\n' | tr 'A-F' 'a-f') || return 1
+    [[ "$pin" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$pin"
+}
+
+get_spki_pin() (
+    set -o pipefail
+    [[ -f "${CONFIG_DIR}/server.crt" ]] || return 1
+    local spki
+    spki=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -pubkey -noout 2>/dev/null |
+        openssl pkey -pubin -outform der 2>/dev/null |
+        openssl dgst -sha256 -binary 2>/dev/null |
+        openssl enc -base64 2>/dev/null | tr -d '\r\n') || return 1
+    [[ -n "$spki" ]] || return 1
+    printf '%s\n' "$spki"
+)
+
+status() {
+    echo -e "\n  ${C_BAR}  ${C_WHITE}服务运行状态与 UDP 端口监听 · SERVICE STATUS${C_RESET}\n"
+    local is_running=false
+    if has_systemd; then
+        systemctl status hysteria-server --no-pager || true
+        systemctl is-active --quiet hysteria-server 2>/dev/null && is_running=true
+    elif has_openrc; then
+        rc-service hysteria-server status || true
+        rc-service hysteria-server status 2>/dev/null | grep -q "started" && is_running=true
+    elif [[ -x /usr/local/bin/hysteria-service ]]; then
+        /usr/local/bin/hysteria-service status || true
+        pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1 && is_running=true
+    else
+        local pids
+        pids=$(pgrep -fx "$PROCESS_PATTERN" 2>/dev/null || true)
+        if [[ -n "$pids" ]]; then
+            is_running=true
+            echo -e "     ${C_GREEN}● 运行中 (Running)${C_RESET} - PID: ${C_CYAN}${pids}${C_RESET}"
+            ps aux 2>/dev/null | grep -E "hysteria (server|-c)" | grep -v grep || true
+        else
+            echo -e "     ${C_RED}● 已停止 (Stopped)${C_RESET}"
+        fi
+    fi
+
+    echo -e "\n  ${C_SUBBAR}  ${C_ORANGE_BOLD}证书信息与有效期 · CERTIFICATE INFO${C_RESET}"
+    if [[ -f "${CONFIG_DIR}/server.crt" ]]; then
+        local cert_subject cert_enddate
+        cert_subject=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -subject 2>/dev/null | sed 's/subject=//' || echo "未知")
+        cert_enddate=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -enddate 2>/dev/null | sed 's/notAfter=//' || echo "未知")
+        if is_cert_self_signed; then
+            echo -e "     ${C_GRAY_MID}证书类型:${C_RESET} ${C_CYAN}自签名 ECC 证书 (SHA-256 指纹固定)${C_RESET}"
+        else
+            echo -e "     ${C_GRAY_MID}证书类型:${C_RESET} ${C_GREEN}CA 签发证书${C_RESET}"
+        fi
+        echo -e "     ${C_GRAY_MID}证书主题:${C_RESET} ${cert_subject}"
+        echo -e "     ${C_GRAY_MID}有效期限:${C_RESET} ${cert_enddate}"
+    else
+        echo -e "     ${C_GRAY_MID}未检测到活动证书文件${C_RESET}"
+    fi
+
+    echo -e "\n  ${C_SUBBAR}  ${C_ORANGE_BOLD}UDP 端口监听详情 · UDP LISTEN DETAILS${C_RESET}"
+    local udp_found=false
+    if command -v ss >/dev/null 2>&1; then
+        if ss -ulpn 2>/dev/null | grep -q hysteria; then
+            ss -ulpn 2>/dev/null | grep hysteria
+            udp_found=true
+        fi
+    elif command -v netstat >/dev/null 2>&1; then
+        if netstat -ulpn 2>/dev/null | grep -q hysteria; then
+            netstat -ulpn 2>/dev/null | grep hysteria
+            udp_found=true
+        fi
+    fi
+    if [[ "$udp_found" != "true" ]]; then
+        echo -e "     ${C_GRAY_MID}暂无活动 UDP 监听 (若刚启动请稍候 1-2 秒刷新)${C_RESET}"
+    fi
+    echo ""
+}
+
+log() {
+    echo -e "\n  ${C_BAR}  ${C_ORANGE_BOLD}跟踪实时运行日志 · LIVE LOG${C_RESET} ${C_GRAY_MID}(按 Ctrl+C 可退出)...${C_RESET}\n"
+    if command -v journalctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        journalctl -u hysteria-server -f -o cat
+    elif [[ -f "/var/log/hysteria.log" ]]; then
+        tail -f -n 50 /var/log/hysteria.log
+    else
+        echo -e "  ${C_GRAY_MID}未检测到活动日志 (journalctl 或 /var/log/hysteria.log)${C_RESET}\n"
+    fi
+}
+
+restart() {
+    if has_systemd; then
+        systemctl restart hysteria-server || return 1
+    elif has_openrc; then
+        rc-service hysteria-server restart || return 1
+    elif [[ -x /usr/local/bin/hysteria-service ]]; then
+        /usr/local/bin/hysteria-service restart || return 1
+    else
+        stop || return 1
+        start || return 1
+    fi
+    echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已成功重启。${C_RESET}\n"
+}
+
+stop() {
+    if has_systemd; then
+        systemctl stop hysteria-server || return 1
+    elif has_openrc; then
+        rc-service hysteria-server stop || return 1
+    elif [[ -x /usr/local/bin/hysteria-service ]]; then
+        /usr/local/bin/hysteria-service stop || return 1
+    else
+        if pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; then
+            pkill -fx "$PROCESS_PATTERN"
+            sleep 1
+            if pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; then
+                echo "Hysteria 2 尚未停止，请检查进程。" >&2
+                return 1
+            fi
+        fi
+    fi
+    echo -e "\n  ${C_BAR}  ${C_AMBER}✔ Hysteria 2 服务已停止。${C_RESET}\n"
+}
+
+start() {
+    if has_systemd; then
+        systemctl start hysteria-server || return 1
+    elif has_openrc; then
+        rc-service hysteria-server start || return 1
+    elif [[ -x /usr/local/bin/hysteria-service ]]; then
+        /usr/local/bin/hysteria-service start || return 1
+    else
+        if ! pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; then
+            nohup /usr/local/bin/hysteria server -c "${CONFIG_FILE}" >/var/log/hysteria.log 2>&1 &
+            sleep 1
+        fi
+        if ! pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; then
+            echo "Hysteria 2 启动失败，请检查 /var/log/hysteria.log。" >&2
+            return 1
+        fi
+    fi
+    echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已启动。${C_RESET}\n"
+}
+
+link() {
+    if [[ ! -f "$CONFIG_FILE" && ! -f "$CLIENT_CONFIG_FILE" ]]; then
+        echo -e "\n  ${C_RED}✖ 未检测到 Hysteria 2 配置文件。${C_RESET}\n"
+        return 1
+    fi
+
+    local domain password obfs_pwd listen public_ports base_port
+    domain=$(get_domain)
+    password=$(get_password)
+    obfs_pwd=$(get_obfs_pwd)
+    listen=$(get_listen)
+    public_ports=$(get_public_ports)
+    base_port=$(echo "$public_ports" | grep -o '^[0-9]\+' || echo "443")
+    [[ -n "$base_port" ]] || base_port=443
+
+    local enc_password enc_obfs_pwd
+    enc_password=$(urlencode "$password")
+    enc_obfs_pwd=$(urlencode "$obfs_pwd")
+    local obfs_param=""
+    if [[ -n "$obfs_pwd" ]]; then
+        obfs_param="&obfs=salamander&obfs-password=${enc_obfs_pwd}"
+    fi
+
+    local pin_param=""
+    local cert_badge="${C_GREEN}CA 权威证书 (标准安全校验)${C_RESET}"
+    local pin=""
+    if is_cert_self_signed; then
+        pin=$(get_cert_pin) || { echo "无法计算证书指纹，停止导出。"; return 1; }
+        pin_param="&pinSHA256=${pin}"
+        cert_badge="${C_CYAN}自签名 ECC 证书 (SHA-256 指纹锁定 · 免 80 端口)${C_RESET}"
+    fi
+
+    echo -e "\n  ${C_BAR}  ${C_WHITE}节点连接凭据 · CONNECTION CREDENTIALS${C_RESET}"
+    echo -e "     ${C_GRAY_MID}域名 (SNI)  :${C_RESET} ${C_WHITE}${domain}${C_RESET}"
+    echo -e "     ${C_GRAY_MID}证书类型    :${C_RESET} ${cert_badge}"
+    if is_cert_self_signed && [[ -n "$pin" ]]; then
+        echo -e "     ${C_GRAY_MID}证书指纹    :${C_RESET} ${C_YELLOW}${pin}${C_RESET}"
+    fi
+    echo -e "     ${C_GRAY_MID}监听端口    :${C_RESET} ${C_CYAN}${listen}${C_RESET}"
+    echo -e "     ${C_GRAY_MID}公网端口    :${C_RESET} ${C_CYAN}${public_ports}${C_RESET} ${C_GRAY_MID}(连接基准端口: ${base_port})${C_RESET}"
+    echo -e "     ${C_GRAY_MID}认证密码    :${C_RESET} ${C_WHITE}${password}${C_RESET}"
+    echo -e "     ${C_GRAY_MID}协议混淆    :${C_RESET} ${C_AMBER}salamander${C_RESET}"
+    echo -e "     ${C_GRAY_MID}混淆密钥    :${C_RESET} ${C_WHITE}${obfs_pwd}${C_RESET}"
+    local masq_url; masq_url=$(get_masquerade_url)
+    echo -e "     ${C_GRAY_MID}伪装反代    :${C_RESET} ${C_GRAY_LIGHT}${masq_url}${C_RESET}\n"
+
+    if [[ -n "$pin" || "$public_ports" == *-* ]]; then
+        local native_tls="$pin_param"
+        [[ -z "$pin" ]] || native_tls+="&insecure=1"
+        printf '  Hysteria 2 原生链接（用作客户端的 server，自签名请用 2.6.4 或更新版本）\n'
+        printf '     hysteria2://%s@%s:%s/?sni=%s%s%s#%s-Hy2\n\n' \
+            "$enc_password" "$domain" "$public_ports" "$domain" "$native_tls" "$obfs_param" "$domain"
+    fi
+
+    if [[ "$public_ports" == *-* ]]; then
+        local link_hop="hysteria2://${enc_password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}&mport=${public_ports}#${domain}-Hy2"
+        local link_single="hysteria2://${enc_password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}#${domain}-Hy2-Single"
+
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}第三方导入链接（需确认客户端支持 mport）${C_RESET}"
+        echo -e "     ${C_YELLOW}${link_hop}${C_RESET}\n"
+
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}格式 2 · 基准单端口链接${C_RESET} ${C_GRAY_MID}(固定单端口 · 固定端口备用)${C_RESET}"
+        echo -e "     ${C_YELLOW}${link_single}${C_RESET}\n"
+    else
+        local link_main="hysteria2://${enc_password}@${domain}:${base_port}?sni=${domain}${pin_param}${obfs_param}#${domain}-Hy2"
+
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}节点连接链接${C_RESET}"
+        echo -e "     ${C_YELLOW}${link_main}${C_RESET}\n"
+    fi
+
+    if [[ -n "$pin" ]]; then
+        echo "     自签名节点仅用于能强制验证指纹的客户端。可用 buds hy2 client 获取对应配置。"
+    fi
+}
+
+client() {
+    if [[ ! -f "$CONFIG_FILE" && ! -f "$CLIENT_CONFIG_FILE" ]]; then
+        echo -e "\n  ${C_RED}✖ 未检测到服务端配置文件 $CONFIG_FILE。${C_RESET}\n"
+        return 1
+    fi
+
+    local client_insecure="false" client_pin="" pin_line=""
+    if is_cert_self_signed; then
+        client_insecure="true"
+        client_pin=$(get_cert_pin) || { echo "无法计算证书指纹，停止导出。"; return 1; }
+        pin_line="  pinSHA256: ${client_pin}"
+    fi
+
+    local domain password obfs_pwd public_ports base_port
+    domain=$(get_domain)
+    password=$(get_password)
+    obfs_pwd=$(get_obfs_pwd)
+    public_ports=$(get_public_ports)
+    base_port=$(echo "$public_ports" | grep -o '^[0-9]\+' || echo "443")
+    [[ -n "$base_port" ]] || base_port=443
+
+    if [[ ! -f "$CLIENT_CONFIG_FILE" ]]; then
+        cat <<CLIENT_YAML_EOF > "$CLIENT_CONFIG_FILE"
+server: ${domain}:${public_ports}
+auth: "${password}"
+tls:
+  sni: ${domain}
+  insecure: ${client_insecure}
+${pin_line}
+obfs:
+  type: salamander
+  salamander:
+    password: "${obfs_pwd}"
+# 带宽配置（Brutal 拥塞控制）：填入本地实际上下行速率；如在 TUN 模式遇 QoS 偶发断流，可注释此段以平滑走标准 BBR
+bandwidth:
+  up: 100 mbps
+  down: 300 mbps
+CLIENT_YAML_EOF
+        chown root:root "$CLIENT_CONFIG_FILE" 2>/dev/null || true
+        chmod 600 "$CLIENT_CONFIG_FILE"
+    else
+        local updated
+        updated=$(mktemp "${CLIENT_CONFIG_FILE}.XXXXXX") || return 1
+        if ! awk -v insecure="$client_insecure" -v pin="$client_pin" -v domain="$(get_domain)" '
+            function security() {
+                print "  insecure: " insecure
+                if (pin!="") print "  pinSHA256: " pin
+            }
+            /^tls:[[:space:]]*$/ {found=1; in_tls=1; print; security(); next}
+            /^[^[:space:]#]/ {in_tls=0}
+            in_tls && /^[[:space:]]*(insecure|pinSHA256):/ {next}
+            {print}
+            END {if (!found) {print "tls:"; print "  sni: " domain; security()}}
+        ' "$CLIENT_CONFIG_FILE" > "$updated"; then
+            rm -f "$updated"
+            return 1
+        fi
+        mv -f "$updated" "$CLIENT_CONFIG_FILE"
+    fi
+    chown root:root "$CLIENT_CONFIG_FILE" 2>/dev/null || true
+    chmod 600 "$CLIENT_CONFIG_FILE"
+
+    echo -e "\n  ${C_BAR}  ${C_WHITE}配置 1 · Hysteria 2 原生客户端配置 (${CLIENT_CONFIG_FILE})${C_RESET}\n"
+    cat "$CLIENT_CONFIG_FILE"
+    echo ""
+
+    echo -e "  ${C_BAR}  ${C_WHITE}配置 2 · sing-box 1.14+ 原生 Outbound JSON 片段${C_RESET} ${C_GRAY_MID}(适配 v2rayN 自定义配置 / sing-box)${C_RESET}\n"
+    local spki_pin=""
+    if [[ -n "$client_pin" ]]; then
+        spki_pin=$(get_spki_pin 2>/dev/null || true)
+    fi
+
+    local j_domain j_password j_obfs
+    j_domain=$(json_escape "$domain")
+    j_password=$(json_escape "$password")
+    j_obfs=$(json_escape "$obfs_pwd")
+    if [[ -n "$client_pin" && -z "$spki_pin" ]]; then
+        echo "  无法计算公钥指纹，已跳过 sing-box 配置。"
+    else
+        printf '{\n  "type": "hysteria2",\n  "tag": "hy2-out",\n  "server": "%s",\n' "$j_domain"
+        if [[ "$public_ports" == *-* ]]; then
+            printf '  "server_ports": ["%s"],\n  "hop_interval": "30s",\n' "${public_ports//-/:}"
+        else
+            printf '  "server_port": %s,\n' "$base_port"
+        fi
+        printf '  "password": "%s",\n' "$j_password"
+        if [[ -n "$obfs_pwd" ]]; then
+            printf '  "obfs": {"type": "salamander", "password": "%s"},\n' "$j_obfs"
+        fi
+        printf '  "tls": {\n    "enabled": true,\n    "server_name": "%s",\n    "insecure": false' "$j_domain"
+        if [[ -n "$spki_pin" ]]; then
+            printf ',\n    "certificate_public_key_sha256": ["%s"]' "$spki_pin"
+        fi
+        printf '\n  }\n}\n\n'
+    fi
+
+    echo -e "  ${C_BAR}  ${C_WHITE}配置 3 · Mihomo 节点配置片段${C_RESET}\n"
+    echo -e "  ${C_YELLOW}- name: \"Hy2-${domain}\""
+    echo -e "    type: hysteria2"
+    echo -e "    server: ${domain}"
+    echo -e "    port: ${base_port}"
+    if [[ "$public_ports" == *-* ]]; then
+        echo -e "    ports: ${public_ports}"
+    fi
+    printf '    password: "%s"\n' "$j_password"
+    echo -e "    sni: ${domain}"
+    echo -e "    skip-cert-verify: false"
+    if is_cert_self_signed && [[ -n "$client_pin" ]]; then
+        echo -e "    fingerprint: \"${client_pin}\""
+    fi
+    if [[ -n "$obfs_pwd" ]]; then
+        echo -e "    obfs: salamander"
+        printf '    obfs-password: "%s"\n' "$j_obfs"
+    fi
+    echo -e "${C_RESET}"
+}
+
+renew_test() {
+    if is_cert_self_signed; then
+        echo -e "\n  ${C_BAR}  ${C_GREEN}✔ 当前节点使用极速自签名 ECC 证书 (100 年超长有效)，无需执行续签。${C_RESET}\n"
+    elif [[ -f "/etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh" ]] && command -v certbot >/dev/null 2>&1; then
+        echo -e "\n  ${C_BAR}  ${C_ORANGE_BOLD}模拟执行 Let's Encrypt 证书自动续签与挂钩同步...${C_RESET}\n"
+        certbot renew --dry-run --run-deploy-hooks
+    else
+        echo -e "\n  ${C_BAR}  ${C_AMBER}未检测到 Let's Encrypt 自动续签配置。${C_RESET}\n"
+    fi
+}
+
+remove_ufw_rule() {
+    local rule="$1" family="${2:--}" rules numbers number
+    rules=$(LC_ALL=C ufw status numbered 2>/dev/null) || return 1
+    if [[ "$rules" == *"Status: active"* ]]; then
+        # 按编号倒序删除带本项目注释的条目，分别保护 IPv4/IPv6 的其他规则。
+        numbers=$(echo "$rules" | awk -v rule="$rule" -v family="$family" '
+          /# buds-hy2[[:space:]]*$/ {
+            is6=($0 ~ /\(v6\)/)
+            if ((family==4 && is6) || (family==6 && !is6)) next
+            line=$0; sub(/^\[[[:space:]]*[0-9]+\][[:space:]]*/, "", line)
+            split(line, fields, /[[:space:]]+/)
+            if (fields[1]==rule) {sub(/^\[[[:space:]]*/, ""); sub(/\].*$/, ""); print}
+          }' | sort -rn)
+        for number in $numbers; do
+            ufw --force delete "$number" >/dev/null 2>&1 || return 1
+        done
+    else
+        # UFW 停用时，show added 仍可读取持久规则；同时兼容旧格式与带 proto/from 的规则格式。
+        rules=$(LC_ALL=C ufw show added 2>/dev/null) || return 1
+        local port="${rule%/*}" proto="${rule#*/}"
+        local owned_simple="ufw allow ${rule} comment 'buds-hy2'"
+        local owned_v4="ufw allow in proto ${proto} from 0.0.0.0/0 to any port ${port} comment 'buds-hy2'"
+        local owned_v6="ufw allow in proto ${proto} from ::/0 to any port ${port} comment 'buds-hy2'"
+        local has_other=false
+        if echo "$rules" | awk -v rule="$rule" -v port="$port" -v proto="$proto" -v tag="comment 'buds-hy2'" '
+            /^ufw allow / {
+                is_target = ($0 ~ "^ufw allow " rule "([[:space:]]|$)" || ($0 ~ "proto " proto " " && $0 ~ "to any port " port "([[:space:]]|$)"))
+                if (is_target && (length($0) < length(tag) || substr($0, length($0)-length(tag)+1) != tag)) {found=1}
+            }
+            END {exit !found}'; then
+            has_other=true
+        fi
+        if echo "$rules" | grep -Fxq "$owned_simple"; then
+            [[ "$has_other" == false ]] || return 1
+            ufw --force delete allow "$rule" comment buds-hy2 >/dev/null 2>&1 || return 1
+        fi
+        if [[ "$family" != 6 ]] && echo "$rules" | grep -Fxq "$owned_v4"; then
+            [[ "$has_other" == false ]] || return 1
+            ufw --force delete allow in proto "$proto" from 0.0.0.0/0 to any port "$port" comment buds-hy2 >/dev/null 2>&1 || return 1
+        fi
+        if [[ "$family" != 4 ]] && echo "$rules" | grep -Fxq "$owned_v6"; then
+            [[ "$has_other" == false ]] || return 1
+            ufw --force delete allow in proto "$proto" from ::/0 to any port "$port" comment buds-hy2 >/dev/null 2>&1 || return 1
+        fi
+    fi
+}
+
+cleanup_firewall() {
+    local rule_file="${CONFIG_DIR}/.firewall_rule"
+    [[ -f "$rule_file" ]] || return 0
+    local remaining backend zone mode rule result failed=false changed_iptables=false
+    remaining=$(mktemp "${rule_file}.XXXXXX") || return 1
+    while IFS='|' read -r backend zone mode rule; do
+        result=0
+        case "$backend" in
+            ufw)
+                remove_ufw_rule "$rule" "$zone" || result=1
+                ;;
+            firewalld)
+                local options=(--zone="$zone")
+                [[ "$mode" != permanent ]] || options+=(--permanent)
+                if firewall-cmd "${options[@]}" --query-port="$rule" >/dev/null 2>&1; then
+                    firewall-cmd "${options[@]}" --remove-port="$rule" >/dev/null 2>&1 || result=1
+                else
+                    [[ "$?" == 1 ]] || result=1
+                fi
+                ;;
+            iptables)
+                changed_iptables=true
+                if iptables -C "$zone" -p udp --dport "${rule%/*}" -m comment --comment buds-hy2 -j ACCEPT >/dev/null 2>&1; then
+                    iptables -D "$zone" -p udp --dport "${rule%/*}" -m comment --comment buds-hy2 -j ACCEPT >/dev/null 2>&1 || result=1
+                else
+                    [[ "$?" == 1 ]] || result=1
+                fi
+                ;;
+            *)
+                # 旧版本只记端口，无法证明未带注释的规则归属，保留这些规则。
+                if [[ "$backend" =~ ^[0-9]+(:[0-9]+)?/udp$ ]]; then
+                    if command -v ufw >/dev/null 2>&1; then
+                        remove_ufw_rule "$backend" || result=1
+                    fi
+                    if command -v iptables >/dev/null 2>&1 &&
+                       iptables -C INPUT -p udp --dport "${backend%/*}" -m comment --comment buds-hy2 -j ACCEPT >/dev/null 2>&1; then
+                        iptables -D INPUT -p udp --dport "${backend%/*}" -m comment --comment buds-hy2 -j ACCEPT >/dev/null 2>&1 || result=1
+                        changed_iptables=true
+                    fi
+                    echo "  旧版本防火墙记录缺少归属信息，仅清理带 buds-hy2 标记的规则。"
+                else
+                    result=1
+                fi
+                ;;
+        esac
+        if [[ "$result" != 0 ]]; then
+            if ! printf '%s|%s|%s|%s\n' "$backend" "$zone" "$mode" "$rule" >> "$remaining"; then
+                rm -f -- "$remaining"
+                return 1
+            fi
+            failed=true
+        fi
+    done < "$rule_file"
+    if [[ "$changed_iptables" == true && -x /etc/init.d/iptables ]]; then
+        if ! /etc/init.d/iptables save >/dev/null 2>&1; then
+            rm -f "$remaining"
+            echo "  保存 iptables 清理结果失败，已保留规则记录，请重试卸载。"
+            return 1
+        fi
+    fi
+    if ! mv -f "$remaining" "$rule_file"; then
+        rm -f -- "$remaining"
+        return 1
+    fi
+    if [[ "$failed" == true ]]; then
+        echo "  部分防火墙规则未能安全清理，已保留配置和规则记录，请检查权限后重试卸载。"
+        return 1
+    fi
+    rm -f "$rule_file"
+}
+
+read_root_crontab() {
+    local contents
+    if contents=$(LC_ALL=C crontab -l 2>&1); then
+        printf '%s\n' "$contents"
+    elif [[ "$contents" == *"no crontab"* || "$contents" == *"No such file"* ]]; then
+        return 0
+    else
+        echo "无法读取 root 定时任务，未覆盖已有任务。" >&2
+        return 1
+    fi
+}
+
+cleanup_renewal() {
+    if [[ -f /etc/systemd/system/buds-hy2-renew.timer ]]; then
+        if has_systemd; then
+            systemctl disable --now buds-hy2-renew.timer || return 1
+        fi
+        rm -f /etc/systemd/system/buds-hy2-renew.timer /etc/systemd/system/buds-hy2-renew.service || return 1
+        if has_systemd; then systemctl daemon-reload || return 1; fi
+    fi
+    if command -v crontab >/dev/null 2>&1; then
+        local contents
+        contents=$(read_root_crontab) || return 1
+        if printf '%s\n' "$contents" | grep -q '# buds-hy2-renew$'; then
+            printf '%s\n' "$contents" | sed '/# buds-hy2-renew$/d' | crontab - || return 1
+        fi
+    fi
+    if [[ -f /etc/periodic/daily/certbot-renew ]] &&
+       grep -q '^# buds-hy2-renew$' /etc/periodic/daily/certbot-renew; then
+        rm -f /etc/periodic/daily/certbot-renew
+    fi
+}
+
+# 专用虚拟地址与公网 CDN 地址分离，同一公网 IP 可同时承载原生和 WARP 连接。
+WARP_DIR=/etc/buds-hy2/warp-split
+WARP_UNIT=buds-warp-split.service
+WARP_LIST=/etc/buds-hy2/warp-domains
+WARP_TOOLS=/etc/buds-hy2/warp-tools
+WARP_DNS_STATE=/etc/buds-hy2/warp-dns
+WARP_DNS_DROPIN=/etc/systemd/resolved.conf.d/90-buds-warp-static-dns.conf
+WARP_STUB=/run/systemd/resolve/stub-resolv.conf
+
+warp_exec_safe() {
+    local path=$1 info mode
+    while :; do
+        info=$(stat -Lc '%u %a' -- "$path") || return 1
+        mode=${info##* }
+        [[ "$info" == '0 '* && "$mode" =~ ^[0-7]{3,4}$ ]] &&
+            (( (8#$mode & 022) == 0 )) || return 1
+        [[ "$path" == / ]] && return 0
+        path=${path%/*}
+        [[ -n "$path" ]] || path=/
+    done
+}
+
+warp_find_binary() {
+    local pid live candidate path version
+    pid=$(systemctl show -p MainPID --value sing-box.service 2>/dev/null) || pid=
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then live=$(readlink -e "/proc/$pid/exe") || live=; fi
+    for candidate in "${BUDS_SING_BOX_BIN:-}" "$live" /etc/s-box/sing-box "$WARP_TOOLS/sing-box" "$(type -P sing-box || true)" \
+        /usr/local/bin/sing-box /usr/bin/sing-box; do
+        [[ -n "$candidate" && -f "$candidate" && -x "$candidate" ]] || continue
+        path=$(readlink -e -- "$candidate") || continue
+        [[ "$path" =~ ^/[a-zA-Z0-9_./-]+$ ]] && warp_exec_safe "$path" || continue
+        version=$("$path" version 2>/dev/null | awk 'NR==1 && $1=="sing-box" && $2=="version" {print $3}')
+        if [[ "$version" =~ ^1\.([0-9]+)\.[0-9]+$ && ${BASH_REMATCH[1]} -ge 12 ]]; then
+            printf '%s %s\n' "$path" "$version"
+            return 0
+        fi
+    done
+    echo "没有找到可用的 sing-box 1.12+。可运行 buds hy2 warp setup 下载独立内核。" >&2
+    return 1
+}
+
+warp_find_profile() {
+    local path
+    for path in "$WARP_TOOLS/wgcf-profile.conf" /etc/warp/wgcf-profile.conf \
+        /etc/warp-unlock/wgcf-profile.conf /etc/wireguard/warp.conf; do
+        if [[ -f "$path" && -r "$path" ]]; then printf '%s\n' "$path"; return 0; fi
+    done
+    echo "缺少独立的 WARP WireGuard 配置。可运行 buds hy2 warp setup 注册并生成。" >&2
+    return 1
+}
+
+warp_resolve_profile() {
+    if [[ -z "${1:-}" ]]; then warp_find_profile; return; fi
+    [[ -f "$1" && -r "$1" ]] || { echo "无法读取 WireGuard 配置文件：$1" >&2; return 1; }
+    printf '%s\n' "$1"
+}
+
+warp_runtime_binary() {
+    local path
+    path=$(sed -n 's|^ExecStart=\(/[-a-zA-Z0-9_./]*\) run -c .*|\1|p' "$WARP_DIR/$WARP_UNIT") || return 1
+    [[ "$path" =~ ^/[a-zA-Z0-9_./-]+$ && -x "$path" ]] && warp_exec_safe "$(readlink -e -- "$path")" ||
+        { echo "已配置的 sing-box 无法使用，请检查服务定义。" >&2; return 1; }
+    printf '%s\n' "$path"
+}
+
+warp_download_tool() (
+    local tool=$1 arch url digest member dir
+    arch=$(uname -m)
+    case "$tool/$arch" in
+        sing-box/x86_64|sing-box/amd64)
+            arch=amd64; digest=699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968 ;;
+        sing-box/aarch64|sing-box/arm64)
+            arch=arm64; digest=436441f76ee2f7fe21b5b2d426d3cb261a480455a704865789ad533e4273ec26 ;;
+        wgcf/x86_64|wgcf/amd64)
+            arch=amd64; digest=4fb7a136aa470ece11d17949c7db07b040ec9c604742dc8680bcf1889f85d0c8 ;;
+        wgcf/aarch64|wgcf/arm64)
+            arch=arm64; digest=710ab2d8ac145d81a4cf0c11bdb0e05914f77ae2a45f67b87e718d84b4cb7301 ;;
+        *) echo "此架构需要手动安装 $tool，详见 README。" >&2; return 1 ;;
+    esac
+    if [[ "$tool" == sing-box ]]; then
+        member="sing-box-1.14.4-linux-$arch/sing-box"
+        url="https://github.com/SagerNet/sing-box/releases/download/v1.14.4/${member%/*}.tar.gz"
+    else
+        url="https://github.com/ViRb3/wgcf/releases/download/v2.3.1/wgcf_2.3.1_linux_${arch}"
+    fi
+    dir=$(mktemp -d "$WARP_TOOLS/.download.XXXXXX") || return 1
+    trap 'rm -rf -- "$dir"' EXIT
+    curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --max-time 180 \
+        --max-filesize 67108864 "$url" -o "$dir/package" || return 1
+    if ! printf '%s  %s\n' "$digest" "$dir/package" | sha256sum --check --status; then
+        echo "$tool 下载文件校验失败。" >&2
+        return 1
+    fi
+    if [[ "$tool" == sing-box ]]; then
+        tar -xOzf "$dir/package" -- "$member" > "$dir/$tool" || return 1
+    else
+        mv -- "$dir/package" "$dir/$tool" || return 1
+    fi
+    chmod 700 "$dir/$tool" && "$dir/$tool" --help >/dev/null && mv -f -- "$dir/$tool" "$WARP_TOOLS/$tool"
+)
+
+warp_setup() (
+    local detected profile wgcf
+    umask 077
+    [[ ! -L "$WARP_TOOLS" ]] && mkdir -p -- "$WARP_TOOLS" && warp_exec_safe "$WARP_TOOLS" || return 1
+    detected=$(warp_find_binary 2>/dev/null) || {
+        warp_download_tool sing-box || return 1
+        detected=$(warp_find_binary) || return 1
+    }
+    printf 'sing-box：%s\n' "$detected"
+    if [[ "${1:-}" == --new-profile && ! -s "$WARP_TOOLS/wgcf-profile.conf" ]] ||
+        ! profile=$(warp_find_profile 2>/dev/null); then
+        wgcf=$(type -P wgcf) || wgcf="$WARP_TOOLS/wgcf"
+        if [[ ! -x "$wgcf" ]]; then warp_download_tool wgcf || return 1; fi
+        wgcf=$(readlink -e -- "$wgcf") && warp_exec_safe "$wgcf" || return 1
+        cd "$WARP_TOOLS" || return 1
+        if [[ ! -s wgcf-account.toml ]]; then
+            [[ -t 0 ]] || { echo "请在服务器终端运行此命令并阅读 wgcf 的条款提示。" >&2; return 1; }
+            "$wgcf" register || return 1
+        fi
+        "$wgcf" generate || return 1
+        profile=$(warp_find_profile) || return 1
+        chmod 600 "$profile" || return 1
+    fi
+    printf 'WARP 配置：%s\n' "$profile"
+    warp_check_stub || {
+        echo "依赖已准备。静态 DNS 主机可先运行 buds hy2 warp dns-switch，再启用分流。"
+        return 1
+    }
+    echo "依赖已准备。运行 buds hy2 warp doctor 完成启用前检查。"
+)
+
+warp_dns_replace() (
+    local source=$1 work
+    work=$(mktemp -d /etc/.buds-resolv.XXXXXX) || return 1
+    trap 'rm -rf -- "$work"' EXIT
+    cp -a -- "$source" "$work/resolv.conf" && mv -Tf -- "$work/resolv.conf" /etc/resolv.conf
+)
+
+warp_dns_restore() {
+    [[ -d "$WARP_DNS_STATE" ]] || { echo "没有由 buds 切换的 DNS 配置。"; return 0; }
+    local original="$WARP_DNS_STATE/resolv.conf" expected="$WARP_DNS_STATE/resolved.conf"
+    [[ -f "$original" && -f "$expected" ]] || return 1
+    if [[ -L /etc/resolv.conf && $(readlink -- /etc/resolv.conf) == "$WARP_STUB" ]]; then
+        :
+    elif [[ ! -L /etc/resolv.conf ]] && cmp -s -- /etc/resolv.conf "$original"; then
+        :
+    else
+        echo "/etc/resolv.conf 已被其他程序修改，请先检查 $original。" >&2
+        return 1
+    fi
+    if [[ -e "$WARP_DNS_DROPIN" || -L "$WARP_DNS_DROPIN" ]]; then
+        [[ ! -L "$WARP_DNS_DROPIN" ]] && cmp -s -- "$expected" "$WARP_DNS_DROPIN" ||
+            { echo "DNS 配置片段已被修改，请检查 $WARP_DNS_DROPIN。" >&2; return 1; }
+    fi
+    warp_dns_replace "$original" && rm -f -- "$WARP_DNS_DROPIN" &&
+        systemctl restart systemd-resolved &&
+        rm -f -- "$original" "$expected" &&
+        rmdir -- "$WARP_DNS_STATE" || return 1
+    echo "已恢复切换前的 DNS 配置。"
+}
+
+warp_dns_switch() (
+    warp_check_stub 2>/dev/null && { echo "系统已使用 systemd-resolved 存根。"; return 0; }
+    systemctl is-active --quiet systemd-resolved && [[ -f "$WARP_STUB" ]] ||
+        { echo "需要已运行并开启 127.0.0.53 存根的 systemd-resolved。" >&2; return 1; }
+    [[ -f /etc/resolv.conf && ! -L /etc/resolv.conf && ! -e "$WARP_DNS_STATE" &&
+        ! -e "$WARP_DNS_DROPIN" && ! -L "$WARP_DNS_DROPIN" ]] ||
+        { echo "检测到已有的 DNS 管理或迁移状态，请先检查 /etc/resolv.conf。" >&2; return 1; }
+    local upstream
+    upstream=$(python3 -I - /etc/resolv.conf <<'PY'
+from ipaddress import ip_address
+import sys
+servers = []
+try:
+    with open(sys.argv[1]) as source:
+        for line in source:
+            words = line.partition("#")[0].split()
+            if not words:
+                continue
+            if len(words) != 2 or words[0] != "nameserver" or "%" in words[1]:
+                raise ValueError()
+            address = ip_address(words[1])
+            if not address.is_global:
+                raise ValueError()
+            servers.append(str(address))
+    if not servers:
+        raise ValueError()
+except ValueError:
+    sys.exit("自动切换仅支持由公网 nameserver 组成的静态文件；自定义 DNS、search 和 options 需由管理员迁移。")
+print(" ".join(dict.fromkeys(servers)))
+PY
+    ) || return 1
+    umask 077
+    mkdir -p -- "$(dirname "$WARP_DNS_STATE")" "$(dirname "$WARP_DNS_DROPIN")" &&
+        mkdir -- "$WARP_DNS_STATE" || return 1
+    if ! cp -a -- /etc/resolv.conf "$WARP_DNS_STATE/resolv.conf" ||
+        ! printf '[Resolve]\nDNS=\nDNS=%s\n' "$upstream" > "$WARP_DNS_STATE/resolved.conf"; then
+        rm -f -- "$WARP_DNS_STATE"/{resolv.conf,resolved.conf}
+        rmdir -- "$WARP_DNS_STATE"
+        return 1
+    fi
+    trap 'rc=$?; if ((rc)); then warp_dns_restore || echo "DNS 自动恢复失败，备份在 $WARP_DNS_STATE。" >&2; fi' EXIT
+    local work
+    work=$(mktemp -d /etc/.buds-resolv-link.XXXXXX) || return 1
+    if ! install -m 0644 -- "$WARP_DNS_STATE/resolved.conf" "$work/resolved.conf" ||
+        ! ln -- "$work/resolved.conf" "$WARP_DNS_DROPIN" ||
+        ! ln -s -- "$WARP_STUB" "$work/resolv.conf" || ! warp_dns_replace "$work/resolv.conf"; then
+        rm -f -- "$work"/{resolv.conf,resolved.conf}; rmdir -- "$work"
+        return 1
+    fi
+    rm -f -- "$work"/{resolv.conf,resolved.conf}; rmdir -- "$work"
+    systemctl restart systemd-resolved &&
+        warp_check_stub &&
+        timeout 15 getent ahostsv4 github.com >/dev/null ||
+        { echo "切换后 DNS 查询失败，正在恢复原配置。" >&2; return 1; }
+    echo "系统已使用本机存根，原上游已保留：$upstream。可用 buds hy2 warp dns-restore 撤销。"
+)
+
+warp_domains() {
+    cat <<'DOMAINS'
+google.com google.ad google.ae google.com.af google.com.ag google.al google.am google.co.ao
+google.com.ar google.as google.at google.com.au google.az google.ba google.com.bd google.be
+google.bf google.bg google.com.bh google.bi google.bj google.com.bn google.com.bo google.com.br
+google.bs google.bt google.co.bw google.by google.com.bz google.ca google.cd google.cf
+google.cg google.ch google.ci google.co.ck google.cl google.cm google.cn google.com.co
+google.co.cr google.com.cu google.cv google.com.cy google.cz google.de google.dj google.dk
+google.dm google.com.do google.dz google.com.ec google.ee google.com.eg google.es google.com.et
+google.fi google.com.fj google.fm google.fr google.ga google.ge google.gg google.com.gh
+google.com.gi google.gl google.gm google.gr google.com.gt google.gy google.com.hk google.hn
+google.hr google.ht google.hu google.co.id google.ie google.co.il google.im google.co.in
+google.iq google.is google.it google.je google.com.jm google.jo google.co.jp google.co.ke
+google.com.kh google.ki google.kg google.co.kr google.com.kw google.kz google.la google.com.lb
+google.li google.lk google.co.ls google.lt google.lu google.lv google.com.ly google.co.ma
+google.md google.me google.mg google.mk google.ml google.com.mm google.mn google.com.mt
+google.mu google.mv google.mw google.com.mx google.com.my google.co.mz google.com.na google.com.ng
+google.com.ni google.ne google.nl google.no google.com.np google.nr google.nu google.co.nz
+google.com.om google.com.pa google.com.pe google.com.pg google.com.ph google.com.pk google.pl google.pn
+google.com.pr google.ps google.pt google.com.py google.com.qa google.ro google.ru google.rw
+google.com.sa google.com.sb google.sc google.se google.com.sg google.sh google.si google.sk
+google.com.sl google.sn google.so google.sm google.sr google.st google.com.sv google.td
+google.tg google.co.th google.com.tj google.tl google.tm google.tn google.to google.com.tr
+google.tt google.com.tw google.co.tz google.com.ua google.co.ug google.co.uk google.com.uy google.co.uz
+google.com.vc google.co.ve google.co.vi google.com.vn google.vu google.ws google.rs google.co.za
+google.co.zm google.co.zw google.cat
+googleapis.com googleapis.cn gstatic.com gstatic.cn googleusercontent.com ggpht.com
+googleplay.com play.googleapis.cn gvt1.com gvt2.com gvt3.com android.com android.clients.google.com
+gmail.com googlemail.com drive.google docs.google goo.gl chrome.com chromecast.com
+youtube.com youtu.be yt.be googlevideo.com ytimg.com youtube-nocookie.com youtubei.googleapis.com
+youtubekids.com youtubeeducation.com withyoutube.com
+gemini.google deepmind.google ai.google.dev ai.studio
+DOMAINS
+}
+
+# 同一份校验逻辑用于命令行编辑和服务启动。base.json 保留隧道参数。
+warp_policy_tool() {
+    cat <<'PY'
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+
+def domain(value):
+    if value.endswith("."):
+        value = value[:-1]
+    if not value or "*" in value:
+        raise ValueError("请输入域名，子域名会自动匹配")
+    name = value.encode("idna").decode("ascii").lower()
+    labels = name.split(".")
+    if (len(name) > 253 or len(labels) < 2 or labels[-1].isdigit() or
+            not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", x) for x in labels)):
+        raise ValueError("域名格式无效：" + value)
+    return name
+
+def names(path):
+    def parse(lines):
+        return {domain(token) for line in lines for token in line.partition("#")[0].split()}
+    if path == "-":
+        return parse(sys.stdin)
+    with open(path, encoding="utf-8-sig") as source:
+        return parse(source)
+
+def atomic(path, data):
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
+        try:
+            f.write(data)
+            f.close()
+            os.replace(f.name, path)
+        finally:
+            if os.path.exists(f.name):
+                os.unlink(f.name)
+
+def render(template, policy, dest):
+    with open(template, encoding="utf-8") as f:
+        cfg = json.load(f)
+    if os.path.isfile(policy):
+        selected = sorted(names(policy))
+    else:
+        selected = sorted(set(cfg["dns"]["rules"][0]["domain_suffix"]))
+    for peer in cfg["endpoints"][0]["peers"]:
+        host = peer["address"].rstrip(".").lower()
+        if any(host == d or host.endswith("." + d) for d in selected):
+            raise ValueError("清单覆盖了 WireGuard 服务器域名，无法通过原生 DNS 建立隧道：" + host)
+    for section in ("dns", "route"):
+        rules = cfg[section]["rules"]
+        if selected:
+            for rule in rules:
+                if "domain_suffix" in rule:
+                    rule["domain_suffix"] = selected
+        else:
+            cfg[section]["rules"] = [] if section == "dns" else [{"action": "reject"}]
+    if selected:
+        trace_address = next(s["server"] for s in cfg["dns"]["servers"] if s["tag"] == "real")
+        cfg["route"]["rules"].insert(0, {
+            "inbound": "split", "network": "tcp", "ip_cidr": "198.18.240.3/32", "port": 443,
+            "action": "route", "outbound": "warp", "override_address": trace_address})
+    out = Path(dest)
+    atomic(out / "config.json", json.dumps(cfg))
+    atomic(out / "domains", "".join(d + "\n" for d in selected))
+
+def check_resolved_domains(path):
+    selected = names(path)
+    scope = None
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        header = re.fullmatch(r"\s*(Global|Link \d+ \(([^()]+)\)):\s*(.*)", line.rstrip())
+        if header:
+            scope, interface, entries = header.groups()
+        elif scope and line[0].isspace():
+            entries = line.strip()
+        else:
+            raise ValueError("无法识别 resolvectl domain 输出：" + line.strip())
+        if interface == "buds-warp0":
+            continue
+        for entry in entries.split():
+            # 普通搜索域和 ~ 路由域均参与 resolved 的最长后缀匹配。
+            suffix = entry.lstrip("~").rstrip(".").lower()
+            labels = suffix.split(".")
+            if any(".".join(labels[i:]) in selected for i in range(len(labels))):
+                raise ValueError(f"DNS 路由域冲突：{scope} 的 {entry} 会匹配 WARP 清单内的查询")
+    if scope is None:
+        raise ValueError("无法读取 systemd-resolved 的 DNS 路由域")
+
+def edit(action, current, args):
+    if action == "import" and len(args) == 1:
+        return names(args[0])
+    selected = names(current)
+    if action == "add" and args:
+        selected.update(map(domain, args))
+    elif action == "remove" and args:
+        removed = set(map(domain, args))
+        missing = removed - selected
+        if missing:
+            raise ValueError("清单没有此条目：" + ", ".join(sorted(missing)))
+        selected -= removed
+    elif action == "replace" and len(args) == 2:
+        old, new = map(domain, args)
+        if old not in selected:
+            raise ValueError("清单没有此条目：" + old)
+        selected.remove(old)
+        selected.add(new)
+    elif action != "list" or args:
+        raise ValueError("用法：domains list | add 域名… | remove 域名… | replace 旧域名 新域名 | import 文件 | reset")
+    return selected
+
+try:
+    action, *args = sys.argv[1:]
+    if action == "render":
+        render(*args)
+    elif action == "check-resolved":
+        check_resolved_domains(*args)
+    else:
+        for item in sorted(edit(action, args[0], args[1:])):
+            print(item)
+except (ValueError, OSError, UnicodeError) as error:
+    sys.exit(str(error))
+PY
+}
+
+warp_current_domains() {
+    if [[ -f "$WARP_LIST" ]]; then
+        cat -- "$WARP_LIST"
+    elif [[ -f "$WARP_DIR/.buds-managed" && -f "$WARP_DIR/domains" ]]; then
+        cat -- "$WARP_DIR/domains"
+    else
+        warp_domains
+    fi
+}
+
+# v1.4 已安装的单元也运行 preflight 和 link-up，更新这两个文件即可接入域名管理。
+warp_prepare_policy() (
+    local stage
+    stage=$(mktemp -d "${WARP_DIR}.setup.XXXXXX") || return 1
+    trap 'rm -rf -- "$stage"' EXIT
+    if [[ ! -f "$WARP_DIR/base.json" ]]; then
+        cp -- "$WARP_DIR/config.json" "$stage/base.json" &&
+            mv -- "$stage/base.json" "$WARP_DIR/base.json" || return 1
+    fi
+    warp_policy_tool > "$stage/policy.py" &&
+        warp_link_up_file > "$stage/link-up" &&
+        warp_preflight_file > "$stage/preflight" || return 1
+    local file
+    for file in policy.py link-up preflight; do
+        mv -f -- "$stage/$file" "$WARP_DIR/$file" || return 1
+    done
+)
+
+warp_edit_domains() (
+    local action=${1:-list} work binary active=false had_list=false
+    if (( $# )); then shift; fi
+    if [[ "$action" == list ]]; then
+        set -o pipefail
+        warp_current_domains | python3 -I -c "$(warp_policy_tool)" list - "$@"
+        return
+    fi
+    case "$action" in
+        add|remove|replace|import|reset) ;;
+        *) echo "用法：domains {list|add|remove|replace|import|reset}" >&2; return 2 ;;
+    esac
+    umask 077
+    mkdir -p -- "$(dirname "$WARP_LIST")" || return 1
+    work=$(mktemp -d "${WARP_LIST}.XXXXXX") || return 1
+    trap 'rm -rf -- "$work"' EXIT
+    warp_current_domains > "$work/current" || return 1
+    if [[ "$action" == reset && $# == 0 ]]; then
+        warp_domains > "$work/defaults" || return 1
+        python3 -I - list "$work/defaults" < <(warp_policy_tool) > "$work/next" || return 1
+    else
+        python3 -I -c "$(warp_policy_tool)" "$action" "$work/current" "$@" > "$work/next" || return 1
+    fi
+    if [[ -d "$WARP_DIR" ]]; then
+        [[ ! -L "$WARP_DIR" && -f "$WARP_DIR/.buds-managed" &&
+            "$WARP_DIR/$WARP_UNIT" -ef "/etc/systemd/system/$WARP_UNIT" ]] ||
+            { echo "分流服务未完成安装或由其他程序管理，请先检查状态。" >&2; return 1; }
+        warp_prepare_policy || return 1
+        binary=$(warp_runtime_binary) || return 1
+        python3 -I "$WARP_DIR/policy.py" render "$WARP_DIR/base.json" "$work/next" "$work" &&
+            (cd "$work" && "$binary" check -c config.json) || return 1
+        if systemctl is-active --quiet "$WARP_UNIT"; then
+            if cmp -s "$work/next" "$WARP_DIR/domains" && cmp -s "$work/config.json" "$WARP_DIR/config.json"; then
+                mv -f -- "$work/next" "$WARP_LIST" || return 1
+                echo "当前服务已在使用这份域名清单。"
+                return 0
+            fi
+            active=true
+        fi
+    fi
+    if [[ -f "$WARP_LIST" ]]; then
+        cp -- "$WARP_LIST" "$work/previous" || return 1
+        had_list=true
+    fi
+    mv -f -- "$work/next" "$WARP_LIST" || return 1
+    if [[ "$active" == true ]] && ! { systemctl restart "$WARP_UNIT" && warp_tunnel_probe; }; then
+        if [[ "$had_list" == true ]]; then
+            mv -f -- "$work/previous" "$WARP_LIST" || return 1
+        else
+            rm -f -- "$WARP_LIST" || return 1
+        fi
+        if ! systemctl restart "$WARP_UNIT"; then
+            if [[ $(systemctl show -p Result --value "$WARP_UNIT") != start-limit-hit ]] ||
+                ! systemctl reset-failed "$WARP_UNIT" || ! systemctl start "$WARP_UNIT"; then
+                echo "已还原清单，分流服务恢复失败，请检查日志。" >&2
+                return 1
+            fi
+        fi
+        echo "新规则启动失败，已恢复原清单和服务。" >&2
+        return 1
+    fi
+    if [[ "$active" == true ]]; then
+        echo "域名清单已生效。"
+    else
+        echo "域名清单已保存，下次启动 WARP 分流时生效。"
+    fi
+)
+
+warp_config() {
+    python3 -I - "$1" "$2" "$3" <<'PY'
+import configparser
+import ipaddress
+import json
+from pathlib import Path
+import sys
+from urllib.parse import urlsplit
+
+profile, domain_file, version = sys.argv[1:]
+# wgcf 可为 IPv4、IPv6 分别写一行 Address。只读取参数，不执行配置中的钩子。
+wg = configparser.ConfigParser(interpolation=None, strict=True, inline_comment_prefixes=("#",))
+addresses = []
+allowed = []
+lines = []
+section = ""
+with open(profile, encoding="utf-8-sig") as f:
+    for line in f:
+        value = line.split("#", 1)[0].strip()
+        if value.startswith("["):
+            section = value
+        key, sep, items = value.partition("=")
+        if section == "[Interface]" and sep and key.strip().lower() == "address":
+            addresses.extend(str(ipaddress.ip_interface(x.strip())) for x in items.split(","))
+        elif section == "[Peer]" and sep and key.strip().lower() == "allowedips":
+            allowed.extend(str(ipaddress.ip_network(x.strip())) for x in items.split(","))
+        elif sep and key.strip().lower() not in {"privatekey", "publickey", "mtu", "endpoint",
+                                                "presharedkey", "reserved", "persistentkeepalive"}:
+            continue
+        else:
+            lines.append(line)
+try:
+    wg.read_string("".join(lines))
+    peer = wg["Peer"]
+    endpoint = urlsplit("//" + peer["Endpoint"])
+    if not addresses or not allowed or not endpoint.hostname or not endpoint.port:
+        raise ValueError
+    wg_peer = {"address": endpoint.hostname, "port": endpoint.port, "public_key": peer["PublicKey"],
+               "allowed_ips": allowed}
+    if peer.get("PersistentKeepalive", "0").lower() != "off":
+        wg_peer["persistent_keepalive_interval"] = int(peer.get("PersistentKeepalive", "0"))
+    if "PresharedKey" in peer:
+        wg_peer["pre_shared_key"] = peer["PresharedKey"]
+    if "Reserved" in peer:
+        wg_peer["reserved"] = [int(x) for x in peer["Reserved"].split(",")]
+    warp = {"type": "wireguard", "tag": "warp", "system": False, "address": addresses,
+            "private_key": wg["Interface"]["PrivateKey"], "mtu": int(wg["Interface"].get("MTU", 1280)),
+            "domain_resolver": "bootstrap", "peers": [wg_peer]}
+except (ValueError, KeyError, configparser.Error):
+    sys.exit("无法读取 WARP 单 Peer WireGuard 配置，请检查 Address、密钥、Endpoint 和 AllowedIPs。")
+for existing in (Path("/etc/s-box/sb.json"), Path("/etc/sing-box/config.json")):
+    if not existing.is_file():
+        continue
+    try:
+        config = json.loads(existing.read_text())
+    except (OSError, ValueError):
+        continue
+    for entry in config.get("endpoints", []) + config.get("outbounds", []):
+        if entry.get("type") == "wireguard" and entry.get("private_key") == warp["private_key"]:
+            sys.exit(f"此 WireGuard 身份已配置在 {existing}。请运行 buds hy2 warp setup --new-profile 生成独立身份。")
+with open(domain_file) as f:
+    domains = f.read().split()
+families = {ipaddress.ip_interface(a).version for a in addresses}
+families &= {ipaddress.ip_network(n).version for n in allowed}
+if not families:
+    sys.exit("WireGuard 地址与 AllowedIPs 的协议族不一致。")
+strategy = "prefer_ipv4"
+if len(families) == 1:
+    strategy = "ipv4_only" if 4 in families else "ipv6_only"
+tun = {"type": "tun", "tag": "split", "interface_name": "buds-warp0", "stack": "gvisor",
+       "address": ["198.18.240.1/32", "fd42:6275:6473::1/128"], "auto_route": False}
+ipv6_status = Path("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+ipv6 = not (ipv6_status.is_file() and ipv6_status.read_text().strip() == "1")
+if tuple(map(int, version.split(".")[:2])) >= (1, 14):
+    tun["dns_mode"] = "disabled"
+dns = {"servers": [
+    {"type": "fakeip", "tag": "virtual", "inet4_range": "198.18.248.0/21",
+     "inet6_range": "fd42:6275:6473:1::/96"},
+    {"type": "local", "tag": "bootstrap"},
+    {"type": "udp", "server": "1.1.1.1" if 4 in families else "2606:4700:4700::1111",
+     "tag": "real", "detour": "warp"}],
+    "rules": [
+        {"inbound": "split", "domain_suffix": domains, "query_type": ["A", "AAAA"],
+         "action": "route", "server": "virtual", "rewrite_ttl": 5},
+        {"inbound": "split", "query_type": ["HTTPS", "SVCB"], "action": "predefined", "rcode": "NOERROR"}],
+    "final": "real"}
+route = {"default_domain_resolver": "real", "rules": [
+    {"ip_cidr": "198.18.240.2/32", "port": 53, "action": "hijack-dns"},
+    {"domain_suffix": domains, "action": "resolve", "server": "real", "strategy": strategy},
+    {"domain_suffix": domains, "action": "route", "outbound": "warp"},
+    {"action": "reject"}]}
+if not ipv6:
+    tun["address"].pop()
+    del dns["servers"][0]["inet6_range"]
+    dns["rules"][0]["query_type"] = ["A"]
+    dns["rules"][1]["query_type"].append("AAAA")
+json.dump({"inbounds": [tun], "endpoints": [warp], "dns": dns, "route": route,
+           "experimental": {"cache_file": {"enabled": True, "store_fakeip": True,
+                                           "path": "fakeip.db"}}}, sys.stdout)
+PY
+}
+
+warp_link_up_file() {
+    cat <<'LINK_UP'
+#!/usr/bin/env bash
+set -eu
+[[ -s domains ]] || exit 0
+link=buds-warp0
+for ((i=0; i<100; i++)); do
+    ip -o link show up dev "$link" 2>/dev/null | grep -q . && break
+    sleep 0.1
+done
+ip route add 198.18.240.2/32 dev "$link"
+ip route add 198.18.240.3/32 dev "$link"
+ip route add 198.18.248.0/21 dev "$link"
+if grep -Fq 'fd42:6275:6473::1/128' config.json; then
+    ip -6 route add fd42:6275:6473:1::/96 dev "$link"
+fi
+resolvectl default-route "$link" no
+resolvectl dns "$link" 198.18.240.2
+resolvectl dnssec "$link" no
+resolvectl dnsovertls "$link" no
+mapfile -t domains < <(tr -s '[:space:]' '\n' < domains | sed '/^$/d;s/^/~/')
+resolvectl domain "$link" "${domains[@]}"
+resolvectl flush-caches
+LINK_UP
+}
+
+warp_files() {
+    local profile=$1 binary=$2 version=$3
+    warp_domains > "$WARP_DIR/domains" || return 1
+    warp_config "$profile" "$WARP_DIR/domains" "$version" > "$WARP_DIR/config.json" || return 1
+    (cd "$WARP_DIR" && "$binary" check -c config.json) || return 1
+    warp_prepare_policy || return 1
+
+    cat > "$WARP_DIR/$WARP_UNIT" <<UNIT
+[Unit]
+Description=Buds WARP domain split routing
+After=network-online.target systemd-resolved.service
+Wants=network-online.target
+Requires=systemd-resolved.service
+
+[Service]
+WorkingDirectory=$WARP_DIR
+UMask=0077
+ExecStartPre=/usr/bin/env bash $WARP_DIR/preflight
+ExecStart=$binary run -c $WARP_DIR/config.json
+ExecStartPost=/usr/bin/env bash $WARP_DIR/link-up
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+warp_check_stub() {
+    awk '$1=="nameserver" {count++; if ($2!="127.0.0.53") other=1}
+         END {exit !(count && !other)}' /etc/resolv.conf ||
+        { echo "系统 DNS 必须仅使用 127.0.0.53；混用其他 nameserver 会绕过域名分流。" >&2; return 1; }
+}
+
+warp_check_routes() {
+if ip link show dev buds-warp0 >/dev/null 2>&1; then
+    echo "接口 buds-warp0 已被占用。" >&2
+    exit 1
+fi
+python3 -I - <<'PY'
+import ipaddress
+import json
+import subprocess
+import sys
+from pathlib import Path
+ipv6_status = Path("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+for family, ranges in [("-4", ["198.18.240.0/30", "198.18.248.0/21"]),
+                       ("-6", ["fd42:6275:6473::/126", "fd42:6275:6473:1::/96"])]:
+    if family == "-6" and ipv6_status.is_file() and ipv6_status.read_text().strip() == "1":
+        continue
+    routes = json.loads(subprocess.check_output(["ip", "-j", family, "route", "show", "table", "all"]))
+    for r in routes:
+        dst = r.get("dst", "default")
+        if dst != "default" and any(ipaddress.ip_network(dst, strict=False).overlaps(ipaddress.ip_network(n)) for n in ranges):
+            sys.exit("虚拟地址与已有路由冲突：" + dst)
+PY
+}
+
+warp_preflight_file() {
+    printf '#!/usr/bin/env bash\nset -eu\n'
+    declare -f warp_check_stub warp_check_routes
+    cat <<'PREFLIGHT'
+warp_check_stub
+warp_check_routes
+python3 -I policy.py render base.json ../warp-domains .
+if [[ -s domains ]]; then
+    set -o pipefail
+    LC_ALL=C SYSTEMD_COLORS=0 resolvectl --no-pager domain | python3 -I policy.py check-resolved domains
+fi
+PREFLIGHT
+}
+
+warp_requirements() {
+    local tool failed=0
+    has_systemd || { echo "此主机未运行 systemd；当前 WARP 路由需要 systemd 和 systemd-resolved。" >&2; return 1; }
+    for tool in resolvectl ip python3 curl flock; do
+        command -v "$tool" >/dev/null || { echo "缺少 $tool。" >&2; failed=1; }
+    done
+    [[ -c /dev/net/tun && -r /dev/net/tun && -w /dev/net/tun ]] ||
+        { echo "无法访问 /dev/net/tun。容器需要宿主机映射 TUN 并授予 CAP_NET_ADMIN。" >&2; failed=1; }
+    systemctl is-active --quiet systemd-resolved ||
+        { echo "systemd-resolved 未运行。请先检查发行版的 DNS 管理方式。" >&2; failed=1; }
+    warp_check_stub ||
+        { echo "静态公网 DNS 可用 buds hy2 warp dns-switch 迁移。其他 DNS 布局请按 README 配置。" >&2; failed=1; }
+    return "$failed"
+}
+
+warp_doctor() (
+    local detected profile binary version work failed=0
+    warp_requirements || failed=1
+    if [[ -f "$WARP_DIR/.buds-managed" ]] && systemctl is-active --quiet "$WARP_UNIT"; then
+        warp_runtime_binary || return 1
+        echo "WARP 服务已运行。可使用 buds hy2 warp check 检查实际出口。"
+        return "$failed"
+    fi
+    detected=$(warp_find_binary) || failed=1
+    profile=$(warp_resolve_profile "${1:-}") || failed=1
+    [[ -z "$detected" ]] || printf '已找到 sing-box：%s\n' "$detected"
+    [[ -z "$profile" ]] || printf '已找到 WARP 配置：%s\n' "$profile"
+    if command -v ip >/dev/null && command -v python3 >/dev/null; then
+        warp_check_routes || failed=1
+    fi
+    if [[ -n "$detected" && -n "$profile" ]] && command -v python3 >/dev/null; then
+        read -r binary version <<< "$detected"
+        umask 077
+        work=$(mktemp -d) || return 1
+        trap 'rm -rf -- "$work"' EXIT
+        if warp_domains > "$work/default-domains" &&
+            warp_config "$profile" "$work/default-domains" "$version" > "$work/base.json" &&
+            python3 -I -c "$(warp_policy_tool)" render "$work/base.json" "$WARP_LIST" "$work" &&
+            (cd "$work" && "$binary" check -c config.json); then
+            echo "配置校验通过。"
+        else
+            failed=1
+        fi
+    fi
+    if (( !failed )); then echo "启用前检查通过。"; fi
+    return "$failed"
+)
+
+warp_domain_selected() {
+    awk -v host="$1" '{for (i=1; i<=NF; i++) {
+        suffix="." $i
+        if (host==$i || (length(host)>length(suffix) && substr(host,length(host)-length(suffix)+1)==suffix)) found=1
+    }} END {exit !found}' "$WARP_DIR/domains"
+}
+
+warp_verify() {
+    python3 -I - "$WARP_DIR/domains" <<'PY' || return 1
+import ipaddress
+import json
+import socket
+import subprocess
+import sys
+nets = [ipaddress.ip_network(n) for n in ("198.18.248.0/21", "fd42:6275:6473:1::/96")]
+with open(sys.argv[1], encoding="utf-8") as source:
+    domains = set(source.read().split())
+def matches(host):
+    return any(host == d or host.endswith("." + d) for d in domains)
+probes = ["play.google.com", "scholar.google.com", "www.youtube.com", "gemini.google.com",
+          "chatgpt.com", "claude.ai"]
+hosts = [h for h in probes if matches(h)]
+if domains and not hosts:
+    hosts.append(min(domains))
+for host in dict.fromkeys(hosts + ["github.com", "x.com"]):
+    split = matches(host)
+    ips = {r[4][0] for r in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}
+    if not ips or any(any(ipaddress.ip_address(ip) in n for n in nets) != split for ip in ips):
+        sys.exit(host + " 的系统解析结果与分流策略不符")
+    reachable = []
+    for ip in sorted(ips):
+        result = subprocess.run(["ip", "-j", "route", "get", ip], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode and not split:
+            continue
+        result.check_returncode()
+        route = json.loads(result.stdout)[0]
+        if (route.get("dev") == "buds-warp0") != split:
+            sys.exit(host + " 的内核出口与分流策略不符：" + ip)
+        reachable.append(ip)
+    if not reachable:
+        sys.exit(host + " 没有可用的内核路由")
+    print(host, "→", "buds-warp0" if split else "原有出口", ", ".join(reachable))
+PY
+    if warp_domain_selected www.google.com; then
+        curl -q --noproxy '*' -fsS --max-time 15 -o /dev/null https://www.google.com/generate_204 ||
+            { echo "Google HTTPS 连通测试失败。" >&2; return 1; }
+    fi
+}
+
+warp_remove() {
+    [[ -d "$WARP_DIR" ]] || return 0
+    [[ ! -L "$WARP_DIR" && -f "$WARP_DIR/.buds-managed" ]] ||
+        { echo "目录缺少 buds 管理标记，已保留：$WARP_DIR" >&2; return 1; }
+    if [[ "$WARP_DIR/$WARP_UNIT" -ef "/etc/systemd/system/$WARP_UNIT" ]]; then
+        systemctl stop "$WARP_UNIT" && systemctl disable "$WARP_UNIT" || return 1
+    elif [[ $(systemctl show -p LoadState --value "$WARP_UNIT") != not-found ]]; then
+        echo "检测到同名系统服务，已保留配置，请检查 $WARP_UNIT。" >&2
+        return 1
+    fi
+    rm -f -- "$WARP_DIR"/{domains,config.json,base.json,policy.py,preflight,link-up,fakeip.db} "$WARP_DIR/$WARP_UNIT" || return 1
+    rm -f -- "$WARP_DIR/.buds-managed" || return 1
+    if ! rmdir -- "$WARP_DIR"; then
+        touch "$WARP_DIR/.buds-managed"
+        return 1
+    fi
+    systemctl daemon-reload
+}
+
+warp_tunnel_probe() {
+    [[ -s "$WARP_DIR/domains" ]] || return 0
+    local trace
+    if trace=$(curl -q --noproxy '*' --resolve one.one.one.one:443:198.18.240.3 \
+        -fsS --max-time 15 https://one.one.one.one/cdn-cgi/trace) &&
+        tr -d '\r' <<< "$trace" | grep -Eq '^warp=(on|plus)$'; then
+        echo "WARP 隧道 HTTPS 出口验证通过。"
+        return 0
+    fi
+    echo "无法通过 WARP 隧道确认 Cloudflare 出口，请检查 WireGuard 配置和 UDP 连通性。" >&2
+    return 1
+}
+
+warp_trace() {
+    local host result reported split failed=0
+    local hosts=(www.cloudflare.com)
+    if warp_domain_selected chatgpt.com; then hosts+=(chatgpt.com); fi
+    for host in "${hosts[@]}"; do
+        split=false
+        if warp_domain_selected "$host"; then split=true; fi
+        if result=$(curl -q --noproxy '*' -fsS --max-time 8 "https://$host/cdn-cgi/trace") &&
+            grep -q '^warp=' <<< "$result"; then
+            printf '%s  ' "$host"
+            awk -F= '/^(ip|loc|warp)=/ {printf "%s ", $0} END {print ""}' <<< "$result"
+            reported=$(sed -n 's/^warp=//p' <<< "$result" | tr -d '\r')
+            if [[ "$split" == true && "$reported" == off ]] ||
+                [[ "$split" == false && "$reported" != off ]]; then
+                echo "出口标记与预期不符，请检查 WARP 配置和 VPS 原有默认出口。" >&2
+                failed=1
+            fi
+        else
+            printf '%s 未返回出口诊断信息。\n' "$host"
+        fi
+    done
+    return "$failed"
+}
+
+warp_manage() (
+    local action=${1:-status} profile=${2:-} detected binary version
+    if [[ "$action" == status ]]; then
+        if [[ ! -d "$WARP_DIR" ]]; then echo "WARP 分流未启用。"; return 0; fi
+        systemctl status "$WARP_UNIT" --no-pager
+        return
+    fi
+    if [[ "$action" == domains ]]; then
+        shift
+        exec 9>/run/buds-warp-split.lock && flock -x 9 || return 1
+        warp_edit_domains "$@"
+        return
+    fi
+    if [[ "$action" == doctor ]]; then warp_doctor "$profile"; return; fi
+    has_systemd || { echo "WARP 分流需要 systemd 和 systemd-resolved。"; return 1; }
+    exec 9>/run/buds-warp-split.lock || return 1
+    flock -x 9 || return 1
+    case "$action" in
+        setup)
+            [[ -z "$profile" || "$profile" == --new-profile ]] || return 2
+            warp_setup "$profile"; return ;;
+        dns-switch)
+            [[ ! -d "$WARP_DIR" ]] || { echo "请先运行 buds hy2 warp disable。" >&2; return 1; }
+            warp_dns_switch; return ;;
+        dns-restore)
+            [[ ! -d "$WARP_DIR" ]] || { echo "请先运行 buds hy2 warp disable。" >&2; return 1; }
+            warp_dns_restore; return ;;
+        disable) warp_remove && echo "WARP 分流已关闭。" ; return ;;
+        check)
+            systemctl is-active --quiet "$WARP_UNIT" && warp_verify && warp_trace || return 1
+            if grep -Fq '"198.18.240.3/32"' "$WARP_DIR/config.json" || [[ ! -s "$WARP_DIR/domains" ]]; then
+                warp_tunnel_probe
+            else
+                echo "旧版运行配置没有专用出口探针；隧道出口尚未验证。" >&2
+                return 1
+            fi
+            return ;;
+        enable) ;;
+        *) echo "用法：buds hy2 warp {doctor|setup [--new-profile]|dns-switch|dns-restore|enable [配置路径]|status|check|disable|domains}"; return 2 ;;
+    esac
+    if [[ -d "$WARP_DIR" ]]; then
+        systemctl is-active --quiet "$WARP_UNIT" && { echo "WARP 分流已启用。"; return 0; }
+        echo "已有未运行的分流配置，请检查 status，或 disable 后重试。"; return 1
+    fi
+    warp_requirements || return 1
+    [[ $(systemctl show -p LoadState --value "$WARP_UNIT") == not-found ]] ||
+        { echo "$WARP_UNIT 已被占用。"; return 1; }
+    detected=$(warp_find_binary) && profile=$(warp_resolve_profile "$profile") || return 1
+    read -r binary version <<< "$detected"
+    umask 077
+    mkdir -p "$(dirname "$WARP_DIR")" && mkdir "$WARP_DIR" || return 1
+    touch "$WARP_DIR/.buds-managed" || { rmdir "$WARP_DIR"; return 1; }
+    trap 'rc=$?; if ((rc)); then warp_remove || echo "清理未完成，请运行 buds hy2 warp disable。" >&2; fi' EXIT
+    warp_files "$profile" "$binary" "$version" || return 1
+    systemctl enable "$WARP_DIR/$WARP_UNIT" && systemctl start "$WARP_UNIT" || return 1
+    warp_verify && warp_tunnel_probe && warp_trace || return 1
+    echo "WARP 分流已启用，当前清单选路检查通过。"
+)
+
+uninstall() {
+    echo -e "\n  ${C_RED}⚠ 警告: 即将卸载 Hysteria 2 服务！${C_RESET}"
+    read -rp "  确认彻底卸载吗？(y/N): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        if [[ -f "$WARP_DIR/.buds-managed" ]]; then warp_manage disable || return 1; fi
+        if ! cleanup_renewal; then
+            echo "  卸载已停止：续签任务未能清理，请处理后重试。" >&2
+            return 1
+        fi
+        # 历史版本可能已删除服务定义。停止失败时，仅在服务仍活动时中止清理。
+        if ! stop && { (has_systemd && systemctl is-active --quiet hysteria-server) ||
+            (has_openrc && rc-service hysteria-server status >/dev/null 2>&1) ||
+            pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; }; then
+            echo "  卸载已停止：服务未能停止，请处理后重试。" >&2
+            return 1
+        fi
+        if ! cleanup_firewall; then
+            echo "  服务已停止，卸载尚未完成：防火墙清理失败，已保留服务定义、节点配置和待清理规则。" >&2
+            return 1
+        fi
+        if has_systemd; then
+            if [[ -f /etc/systemd/system/hysteria-server.service ]] ||
+                systemctl is-enabled --quiet hysteria-server; then
+                systemctl disable hysteria-server || return 1
+            fi
+            rm -rf /etc/systemd/system/hysteria-server.service.d || return 1
+            rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service || return 1
+            systemctl daemon-reload || return 1
+        fi
+        if has_openrc; then
+            if [[ -e /etc/runlevels/default/hysteria-server || -L /etc/runlevels/default/hysteria-server ]]; then
+                rc-update del hysteria-server default || return 1
+            fi
+            rm -f /etc/init.d/hysteria-server || return 1
+        fi
+        if [[ -f /etc/rc.local ]]; then
+            sed -i '\|^/usr/local/bin/hysteria-service start$|d' /etc/rc.local
+        fi
+        rm -f /usr/local/bin/hysteria /usr/local/bin/buds /usr/local/bin/hy2 /usr/local/bin/hysteria-service
+        rm -rf /etc/hysteria /var/log/hysteria.log /etc/logrotate.d/hysteria
+        rm -f /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh
+        rm -f /etc/sysctl.d/99-hysteria-performance.conf
+        echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已卸载，本项目创建的防火墙规则已清理，原有 Nginx 及其他系统服务未作修改。${C_RESET}\n"
+    else
+        echo -e "\n  已取消卸载。\n"
+    fi
+}
+
+is_version_newer() {
+    local remote="$1" current="$2"
+    [[ -z "$remote" || -z "$current" || "$remote" == "$current" ]] && return 1
+
+    local -a r_parts c_parts
+    IFS='.' read -r -a r_parts <<< "$remote"
+    IFS='.' read -r -a c_parts <<< "$current"
+
+    local max_len=${#r_parts[@]}
+    [[ ${#c_parts[@]} -gt $max_len ]] && max_len=${#c_parts[@]}
+
+    local i
+    for ((i=0; i<max_len; i++)); do
+        local r="${r_parts[i]:-0}"
+        local c="${c_parts[i]:-0}"
+        r="${r//[^0-9]/}"
+        c="${c//[^0-9]/}"
+        [[ -z "$r" ]] && r=0
+        [[ -z "$c" ]] && c=0
+        if (( 10#$r > 10#$c )); then
+            return 0
+        elif (( 10#$r < 10#$c )); then
+            return 1
+        fi
+    done
+    return 1
+}
+
+valid_release_version() {
+    [[ "$1" =~ ^(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){2}$ ]]
+}
+
+read_script_version() {
+    sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)"$/\1/p' "$1"
+}
+
+fetch_repo_version() (
+    [[ -s "$UPDATE_PUBLIC_KEY" ]] || return 1
+    local tmp version
+    tmp=$(mktemp -d) || return 2
+    trap 'rm -rf -- "$tmp"' EXIT
+    curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 3 --max-time 6 --max-filesize 128 \
+        "$UPDATE_REPO_URL/buds.version" -o "$tmp/version" 2>/dev/null || return 1
+    curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 3 --max-time 6 --max-filesize 16384 \
+        "$UPDATE_REPO_URL/buds.version.sig" -o "$tmp/version.sig" 2>/dev/null &&
+        openssl dgst -sha256 -verify "$UPDATE_PUBLIC_KEY" -signature "$tmp/version.sig" "$tmp/version" >/dev/null 2>&1 ||
+        { echo "仓库更新版本验签失败。" >&2; return 2; }
+    version=$(cat "$tmp/version") || return 2
+    valid_release_version "$version" || return 2
+    printf '%s\n' "$version"
+)
+
+check_remote_version() {
+    local force="${1:-false}" now cache_time remote_ver
+    now=$(date +%s) || return 1
+
+    if [[ "$force" != true && -f "$VERSION_CACHE_FILE" ]]; then
+        IFS=: read -r cache_time remote_ver < "$VERSION_CACHE_FILE" || true
+        if [[ "$cache_time" =~ ^[1-9][0-9]{0,11}$ ]] &&
+            valid_release_version "$remote_ver" && (( now >= cache_time && now - cache_time < 1800 )); then
+            printf '%s\n' "$remote_ver"
+            return 0
+        fi
+    fi
+
+    remote_ver=$(fetch_repo_version) || return 1
+    if [[ -d "$CONFIG_DIR" ]]; then
+        (umask 077; printf '%s:%s\n' "$now" "$remote_ver" > "$VERSION_CACHE_FILE") 2>/dev/null || true
+    fi
+    printf '%s\n' "$remote_ver"
+}
+
+update_script() (
+    if [[ ! -s "$UPDATE_PUBLIC_KEY" ]]; then
+        printf '缺少可信发布公钥 %s，请按 README 安装。\n' "$UPDATE_PUBLIC_KEY" >&2
+        return 1
+    fi
+    local remote_ver
+    if ! remote_ver=$(check_remote_version true); then
+        echo "无法获取有效的仓库更新版本，请检查网络、更新分支和签名。" >&2
+        return 1
+    fi
+    if ! is_version_newer "$remote_ver" "$SCRIPT_VERSION"; then
+        printf '当前已是最新版本（v%s）。\n' "$SCRIPT_VERSION"
+        return 0
+    fi
+    if ! command -v flock >/dev/null 2>&1; then
+        echo "更新需要 flock，请安装系统提供的 flock 工具。" >&2
+        return 1
+    fi
+
+    local target_dir installed_ver tmp_dir release_url downloaded_ver lock_fd
+    target_dir=$(dirname "$BUDS_CLI") || return 1
+    # 持锁重新检查已安装版本，避免并发更新用较旧版本覆盖新版本。
+    (umask 077; : >> "${UPDATE_PUBLIC_KEY}.lock") || return 1
+    exec {lock_fd}<> "${UPDATE_PUBLIC_KEY}.lock" || return 1
+    flock -x "$lock_fd" || return 1
+    if [[ -f "$BUDS_CLI" ]]; then
+        installed_ver=$(read_script_version "$BUDS_CLI") || return 1
+        if valid_release_version "$installed_ver" && ! is_version_newer "$remote_ver" "$installed_ver"; then
+            printf '已安装 v%s，无需替换。\n' "$installed_ver"
+            return 0
+        fi
+    fi
+
+    tmp_dir=$(mktemp -d "${target_dir}/.buds_update.XXXXXX") || return 1
+    trap 'rm -rf -- "$tmp_dir"' EXIT
+    release_url="$UPDATE_REPO_URL/releases/$remote_ver"
+    if ! curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 20 --max-filesize 1048576 \
+        "${release_url}/buds" -o "${tmp_dir}/buds" ||
+        ! curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 20 --max-filesize 16384 \
+        "${release_url}/buds.sig" -o "${tmp_dir}/buds.sig"; then
+        echo "下载发布脚本或签名失败，已保留现有脚本。" >&2
+        return 1
+    fi
+    if ! openssl dgst -sha256 -verify "$UPDATE_PUBLIC_KEY" \
+        -signature "${tmp_dir}/buds.sig" "${tmp_dir}/buds" >/dev/null 2>&1; then
+        echo "发布签名验证失败，已保留现有脚本。" >&2
+        return 1
+    fi
+
+    downloaded_ver=$(read_script_version "${tmp_dir}/buds") || return 1
+    if [[ "$downloaded_ver" != "$remote_ver" ]]; then
+        echo "下载脚本版本不匹配，已保留现有脚本。" >&2
+        return 1
+    fi
+    if [[ "$(head -n 1 "${tmp_dir}/buds")" != '#!/usr/bin/env bash' ]] ||
+        ! bash -n "${tmp_dir}/buds" 2>/dev/null; then
+        echo "新脚本语法校验未通过，已保留现有脚本。" >&2
+        return 1
+    fi
+    if [[ -d "$BUDS_CLI" ]] ||
+        ! chmod 755 "${tmp_dir}/buds" || ! mv -f "${tmp_dir}/buds" "$BUDS_CLI"; then
+        echo "无法替换管理脚本，已保留现有脚本。" >&2
+        return 1
+    fi
+    if ! ln -sf "$BUDS_CLI" "$HY2_CLI"; then
+        echo "主脚本已更新，hy2 快捷链接创建失败，可继续使用 buds。" >&2
+    fi
+    rm -f "$VERSION_CACHE_FILE" 2>/dev/null || true
+    printf '脚本已成功更新至 v%s！\n' "$remote_ver"
+)
+
+warp_domains_menu() {
+    local choice old new file confirm
+    local -a items
+    while true; do
+        printf '\n域名清单：1 查看　2 添加　3 删除　4 修改　5 导入整份清单　6 恢复 Google 默认清单　0 返回\n'
+        read -rp "请选择： " choice || return
+        case "$choice" in
+            1) warp_manage domains list || return 1 ;;
+            2|3)
+                read -ra items -p "输入域名，多个域名用空格分隔： " || return
+                if [[ "$choice" == 2 ]]; then warp_manage domains add "${items[@]}" || true
+                else warp_manage domains remove "${items[@]}" || true; fi ;;
+            4)
+                read -rp "原域名： " old && read -rp "新域名： " new || return
+                warp_manage domains replace "$old" "$new" || true ;;
+            5)
+                read -rp "输入用于替换整份清单的文件路径（回车取消）： " file || return
+                if [[ -n "$file" ]]; then warp_manage domains import "$file" || true; fi ;;
+            6)
+                read -rp "用 Google 默认域名替换当前全部条目？[y/N] " confirm || return
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then warp_manage domains reset || true; fi ;;
+            0|"") return 0 ;;
+            *) echo "请输入 0 至 6。" ;;
+        esac
+    done
+}
+
+show_menu() {
+    local remote_ver
+    remote_ver=$(check_remote_version 2>/dev/null) || remote_ver=""
+    while true; do
+        local status_badge domain listen has_update
+        local is_running=false
+        if has_systemd; then
+            if systemctl is-active --quiet hysteria-server 2>/dev/null; then
+                is_running=true
+            fi
+        elif has_openrc; then
+            if rc-service hysteria-server status 2>/dev/null | grep -q "started"; then
+                is_running=true
+            fi
+        else
+            if pgrep -fx "$PROCESS_PATTERN" >/dev/null 2>&1; then
+                is_running=true
+            fi
+        fi
+
+        if [[ "$is_running" == "true" ]]; then
+            status_badge="${C_GREEN}● 运行中 (Running)${C_RESET}"
+        else
+            status_badge="${C_RED}● 已停止 (Stopped)${C_RESET}"
+        fi
+
+        domain=$(get_domain)
+        listen=$(get_listen)
+        [[ -z "$listen" ]] && listen="未配置"
+        has_update=false
+        if is_version_newer "$remote_ver" "$SCRIPT_VERSION"; then
+            has_update=true
+        fi
+
+        clear 2>/dev/null || true
+        echo -e "       ${C_SPARK}✧${C_RESET}                                      ${C_SPARK}✦${C_RESET}"
+        echo -e "  ${C_ORANGE_BOLD}█▀▀█ █  █ █▀▀▄ █▀▀▀${C_RESET}   ${C_GRAY_LIGHT}█  █ █  █ █▀▀█${C_RESET}"
+        echo -e "  ${C_ORANGE_BOLD}█▀▀▄ █  █ █  █ ▀▀▀█${C_RESET}   ${C_GRAY_LIGHT}█▀▀█ ▀██▀   ▄▀${C_RESET}"
+        echo -e "  ${C_ORANGE_BOLD}█  █ █  █ █  █    █${C_RESET}   ${C_GRAY_LIGHT}█  █   █  ▄▀  ${C_RESET}"
+        echo -e "  ${C_ORANGE_BOLD}▀▀▀▀ ▀▀▀▀ ▀▀▀  ▀▀▀▀${C_RESET}   ${C_GRAY_LIGHT}▀  ▀   ▀  ▀▀▀▀${C_RESET}"
+        echo -e "  ${C_GRAY_MID}Hysteria 2 High-Performance Protocol Suite${C_RESET}  ${C_CYAN}v${SCRIPT_VERSION}${C_RESET}\n"
+
+        echo -e "  ${C_BAR}  ${C_WHITE}节点状态${C_RESET}  ${status_badge}    ${C_WHITE}监听端口${C_RESET}  ${C_CYAN}${listen}${C_RESET}"
+        echo -e "  ${C_BAR}  ${C_GRAY_MID}解析域名${C_RESET}  ${C_GRAY_LIGHT}${domain}${C_RESET}    ${C_GRAY_MID}协议混淆${C_RESET}  ${C_AMBER}Salamander${C_RESET}"
+        if [[ "$has_update" == "true" ]]; then
+            echo -e "  ${C_BAR}  ${C_SPARK}✦ 发现脚本新版本  v${remote_ver} (当前: v${SCRIPT_VERSION})  ▶ 输入 8 或 u 即可一键更新${C_RESET}"
+        fi
+        echo ""
+
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}核心业务${C_RESET} ${C_GRAY_MID}· CORE ACTIONS${C_RESET}"
+        echo -e "     ${C_ORANGE_BOLD}1.${C_RESET} ${C_WHITE}运行状态${C_RESET}      ${C_GRAY_MID}Service Status & UDP Socket${C_RESET}"
+        echo -e "     ${C_ORANGE_BOLD}2.${C_RESET} ${C_WHITE}节点链接${C_RESET}      ${C_GRAY_MID}Connection URIs & v2rayN Link${C_RESET}"
+        echo -e "     ${C_ORANGE_BOLD}3.${C_RESET} ${C_WHITE}客户端配置${C_RESET}    ${C_GRAY_MID}Client Config (client.yaml)${C_RESET}"
+        echo -e "     ${C_ORANGE_BOLD}4.${C_RESET} ${C_WHITE}实时日志${C_RESET}      ${C_GRAY_MID}Live Journal Log (Ctrl+C 退出)${C_RESET}\n"
+
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}服务控制${C_RESET} ${C_GRAY_MID}· SERVICE CONTROL${C_RESET}"
+        echo -e "     ${C_ORANGE_BOLD}5.${C_RESET} ${C_WHITE}重启服务${C_RESET}      ${C_GRAY_MID}Restart Hysteria 2${C_RESET}"
+        echo -e "     ${C_ORANGE_BOLD}6.${C_RESET} ${C_WHITE}启动服务${C_RESET}      ${C_GRAY_MID}Start Hysteria 2${C_RESET}"
+        echo -e "     ${C_ORANGE_BOLD}7.${C_RESET} ${C_WHITE}停止服务${C_RESET}      ${C_GRAY_MID}Stop Hysteria 2${C_RESET}\n"
+
+        echo -e "  ${C_SUBBAR}  ${C_ORANGE_BOLD}系统维护${C_RESET} ${C_GRAY_MID}· MAINTENANCE${C_RESET}"
+        if [[ "$has_update" == "true" ]]; then
+            echo -e "     ${C_ORANGE_BOLD}8.${C_RESET} ${C_SPARK}更新脚本${C_RESET}      ${C_GRAY_MID}Update buds CLI to Latest${C_RESET} ${C_SPARK}(新版本: v${remote_ver})${C_RESET}"
+        else
+            echo -e "     ${C_ORANGE_BOLD}8.${C_RESET} ${C_WHITE}更新脚本${C_RESET}      ${C_GRAY_MID}Update buds CLI to Latest${C_RESET}"
+        fi
+        echo -e "     ${C_ORANGE_BOLD}9.${C_RESET} ${C_WHITE}模拟续签${C_RESET}      ${C_GRAY_MID}Let's Encrypt SSL Dry-Run${C_RESET}"
+        echo -e "    ${C_ORANGE_BOLD}10.${C_RESET} ${C_WHITE}卸载节点${C_RESET}      ${C_GRAY_MID}Uninstall & Clean Firewall${C_RESET}"
+        echo -e "    ${C_ORANGE_BOLD}11.${C_RESET} ${C_WHITE}WARP 定向分流${C_RESET}"
+        echo -e "     ${C_GRAY_MID}0.${C_RESET} ${C_GRAY_MID}退出脚本${C_RESET}      ${C_GRAY_MID}Exit${C_RESET}\n"
+
+        read -rp "$(echo -e "  ${C_ORANGE_BOLD}❯${C_RESET} ${C_WHITE}请选择操作编号 [0-11]: ${C_RESET}")" choice
+        case "$choice" in
+            1) status || true; read -rp "按回车键返回主菜单..." ;;
+            2) link || true; read -rp "按回车键返回主菜单..." ;;
+            3) client || true; read -rp "按回车键返回主菜单..." ;;
+            4) log || true ;;
+            5) restart || echo -e "  ${C_RED}✖ 重启服务失败，请检查状态或日志。${C_RESET}"; read -rp "按回车键返回主菜单..." ;;
+            6) start || echo -e "  ${C_RED}✖ 启动服务失败，请检查状态或日志。${C_RESET}"; read -rp "按回车键返回主菜单..." ;;
+            7) stop || echo -e "  ${C_RED}✖ 停止服务失败，请检查进程状态。${C_RESET}"; read -rp "按回车键返回主菜单..." ;;
+            8|[uU]|update)
+                if update_script; then
+                    read -rp "按回车键重新加载主菜单..."
+                    if [[ -x "${BUDS_CLI:-/usr/local/bin/buds}" ]]; then
+                        exec "${BUDS_CLI:-/usr/local/bin/buds}" hy2
+                    fi
+                else
+                    read -rp "按回车键返回主菜单..."
+                fi
+                ;;
+            9) renew_test || echo -e "  ${C_RED}✖ 证书续签模拟失败，请检查日志。${C_RESET}"; read -rp "按回车键返回主菜单..." ;;
+            10) uninstall || true; break ;;
+            11)
+                warp_manage status || true
+                read -rp "启用前诊断(p)、准备依赖(s)、迁移 DNS(n)、启用(e)、关闭(d)、检测(c)、管理域名(m)、返回(回车)： " op
+                case "$op" in
+                    p) warp_manage doctor || true ;;
+                    s) warp_manage setup || true ;;
+                    n) read -rp "迁移系统 DNS 到本机存根，会短暂重启解析服务。确认？[y/N] " op
+                       if [[ "$op" =~ ^[Yy]$ ]]; then warp_manage dns-switch || true; fi ;;
+                    e) read -rp "WARP WireGuard 配置路径（回车自动查找）： " profile
+                       warp_manage enable "$profile" || true ;;
+                    d) warp_manage disable || true ;;
+                    c) warp_manage check || true ;;
+                    m) warp_domains_menu || true ;;
+                esac
+                read -rp "按回车键返回主菜单..." ;;
+            0) exit 0 ;;
+            *) echo "输入无效，请重新选择。" ;;
+        esac
+    done
+}
+
+check_root
+
+case "$1" in
+    status) status ;;
+    log) log ;;
+    restart) restart ;;
+    stop) stop ;;
+    start) start ;;
+    link) link ;;
+    client) client ;;
+    warp) shift; warp_manage "$@" ;;
+    renew-test) renew_test ;;
+    uninstall) uninstall ;;
+    update) update_script ;;
+    check-update)
+        if [[ ! -s "$UPDATE_PUBLIC_KEY" ]]; then
+            printf '缺少可信发布公钥 %s，请按 README 安装。\n' "$UPDATE_PUBLIC_KEY" >&2
+            exit 1
+        fi
+        if ! r_ver=$(check_remote_version true); then
+            echo "无法获取有效的仓库更新版本，请检查网络、更新分支和签名。" >&2
+            exit 1
+        fi
+        if is_version_newer "$r_ver" "$SCRIPT_VERSION"; then
+            echo "新版本可用: v${r_ver} (当前: v${SCRIPT_VERSION})"
+            exit 0
+        else
+            echo "已是最新版本: v${SCRIPT_VERSION}"
+            exit 0
+        fi
+        ;;
+    version|-v|--version)
+        echo "buds-hy2 v${SCRIPT_VERSION}"
+        exit 0
+        ;;
+    *) show_menu ;;
+esac
