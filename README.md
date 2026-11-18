@@ -8,26 +8,26 @@
 
 ## 快速安装
 
-从发布页取得 `update.pub`（PEM 格式），用 `openssl pkey -pubin -in update.pub -outform DER | openssl dgst -sha256` 计算公钥指纹，并与维护者通过独立可信渠道提供的指纹核对。核对后以 root 身份安装公钥：
+从 [updates 分支](https://github.com/Buds-2025/buds-hy2/tree/updates) 取得 `update.pub`（PEM 格式），用 `openssl pkey -pubin -in update.pub -outform DER | openssl dgst -sha256` 计算公钥指纹，并与维护者通过独立可信渠道提供的指纹核对。核对后以 root 身份安装公钥：
 
 ```bash
 install -d -m 0755 -o root -g root /etc/buds-hy2
 install -m 0644 -o root -g root update.pub /etc/buds-hy2/update.pub
 ```
 
-从[项目 Releases](https://github.com/Buds-2025/buds-hy2/releases)选择已签名的版本。将下方版本号换为所选版本，验签成功后运行安装器：
+从仓库更新分支的 `releases/` 目录选择版本。将下方版本号换为所选版本，验签成功后运行安装器：
 
 ```bash
 (
   set -e
-  version=v1.3.1
-  base="https://github.com/Buds-2025/buds-hy2/releases/download/$version"
+  version=1.5.1
+  base="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates/releases/$version"
   work=$(mktemp -d)
   trap 'rm -rf -- "$work"' EXIT
   curl -q -fsSL --proto '=https' --proto-redir '=https' "$base/install.sh" -o "$work/install.sh"
   curl -q -fsSL --proto '=https' --proto-redir '=https' "$base/install.sh.sig" -o "$work/install.sh.sig"
   openssl dgst -sha256 -verify /etc/buds-hy2/update.pub -signature "$work/install.sh.sig" "$work/install.sh"
-  test "$(grep -m 1 '^SCRIPT_VERSION=' "$work/install.sh")" = "SCRIPT_VERSION=\"${version#v}\""
+  test "$(grep -m 1 '^SCRIPT_VERSION=' "$work/install.sh")" = "SCRIPT_VERSION=\"$version\""
   bash "$work/install.sh"
 )
 ```
@@ -72,31 +72,27 @@ buds hy2 renew-test  # 模拟测试证书自动续签逻辑
 buds hy2 uninstall   # 安全卸载服务
 ```
 
-管理面板从 GitHub Release 检查版本。更新需要 `curl`、`openssl`、`flock` 和预先安装的可信公钥。只有版本匹配、签名有效且通过 Bash 语法检查的脚本才会替换现有 CLI。
+从 v1.5.1 起，菜单第8项从仓库 `updates` 分支读取签名版本清单，再按版本下载并验签脚本。更新需要 `curl`、`openssl`、`flock` 和可信公钥。v1.5.0 及更早版本需先按下文「从旧管理脚本迁移」进行一次验签迁移。
 
-### WARP 系统级域名分流（v1.5.0）
+### WARP 系统级域名分流
 
 菜单第11项管理分流，默认关闭。已有节点可在取得包含此功能的签名版本后升级CLI。直接使用可信源码时，将下文的`buds hy2 warp`换为`bash "/源码绝对路径/buds" hy2 warp`，并填入本机实际路径。使用同一份脚本即可查看状态、关闭分流或卸载节点。
 
-适用于使用systemd和systemd-resolved的Linux VPS。`/etc/resolv.conf`中的有效`nameserver`必须全部指向本机存根`127.0.0.53`。混用外部DNS可能导致同一目标有时走WARP、有时走原出口。需要内核TUN、启用本机IPv6协议栈、iproute2、Python 3、curl、flock，以及包含WireGuard和gVisor的sing-box 1.12或更高1.x版本。VPS的公网可以只有IPv4。sing-box可按[官方软件包说明](https://sing-box.sagernet.org/installation/package-manager/)安装。
+适用于使用systemd和systemd-resolved的Linux VPS。`/etc/resolv.conf`中的有效`nameserver`必须全部指向本机存根`127.0.0.53`。混用外部DNS可能导致同一目标有时走WARP、有时走原出口。需要内核TUN、iproute2、Python 3、curl、flock，以及包含WireGuard和gVisor的sing-box 1.12或更高1.x版本。VPS的公网可以只有IPv4。内核关闭IPv6时只建立IPv4虚拟路由。sing-box可按[官方软件包说明](https://sing-box.sagernet.org/installation/package-manager/)安装。
 
-准备一个有效的WARP WireGuard配置。如果已经用参考项目生成过配置，可以直接使用`/etc/warp/wgcf-profile.conf`。首次使用可在私有目录中运行下列命令生成配置，需要预先安装[wgcf](https://github.com/ViRb3/wgcf)并完成账号注册。只需配置文件，无须启动wg-quick或把系统默认出口切换到WARP。
-
-```bash
-umask 077
-mkdir -p /root/buds-wgcf && cd /root/buds-wgcf
-wgcf register
-wgcf generate
-buds hy2 warp enable /root/buds-wgcf/wgcf-profile.conf
-```
+先在服务器上运行 `buds hy2 warp doctor`（菜单第11项输入`p`）。它会检查 TUN、DNS、内核、WireGuard 配置和已有路由。脚本可识别活动 sing-box 服务、`/etc/s-box/sing-box`、受信任的 PATH 程序及脚本准备的独立内核。非标准位置可在启用时用 `BUDS_SING_BOX_BIN=/绝对路径/sing-box buds hy2 warp enable` 指定。
 
 ```bash
-buds hy2 warp enable   # 使用 /etc/warp/wgcf-profile.conf
-buds hy2 warp status   # 查看服务状态
-buds hy2 warp check    # 抽查 DNS 和内核选路，非空清单还会实测 WARP 隧道出口
-buds hy2 warp disable  # 停止分流，清理专用服务及配置副本
+buds hy2 warp doctor           # 启用前诊断
+buds hy2 warp setup            # 准备内核，缺少配置时用 wgcf 注册和生成配置
+buds hy2 warp enable           # 自动查找 WireGuard 配置
+buds hy2 warp check            # 检查分流和实际 WARP 出口
+buds hy2 warp disable          # 关闭分流
 ```
 
+`setup`在 x86_64 和 ARM64 上可按固定 SHA-256 校验下载 sing-box 和 wgcf，保存在`/etc/buds-hy2/warp-tools`。其他架构可先安装适配的内核和 wgcf，或用`buds hy2 warp enable /实际路径/warp.conf`导入独立配置。wgcf 是社区工具，首次注册需在服务器终端阅读并确认条款。不要重复使用正在运行的 WireGuard 私钥；如需为 buds-HY2 单独注册，执行`buds hy2 warp setup --new-profile`。脚本会检查常见 sing-box 配置中的重复身份。
+
+如果诊断发现`/etc/resolv.conf`是只含公网 nameserver 的静态文件，可在服务器终端以 root 执行`buds hy2 warp dns-switch`。脚本备份原文件、保留原上游并短暂重启解析服务。查询验证失败时会尝试恢复原配置。以后需要撤销时先执行`buds hy2 warp disable`，再执行`buds hy2 warp dns-restore`。带搜索域、解析选项、容器挂载或其他 DNS 管理器的主机，请按本机管理方式配置 systemd-resolved。OpenRC 或无 systemd 的环境仍可使用 HY2 基础功能。容器启用 WARP 需由宿主机提供 TUN 和网络管理权限。
 内置清单只包含Google系列服务，覆盖搜索、Play、谷歌学术、YouTube、Gemini及相关资源域名。ChatGPT、Claude、GitHub和x.com默认沿用原有出口。列入清单的域名由专用解析器分配虚拟IPv4或IPv6地址，sing-box通过WARP查询真实地址并转发TCP或UDP。
 
 在菜单第11项输入`m`即可管理域名。内置条目与自行添加的条目都支持增删和修改。命令行示例：
@@ -129,14 +125,14 @@ buds hy2 warp domains reset                        # 用内置 Google 清单替�
 ```bash
 (
   set -e
-  version=v1.3.1
-  base="https://github.com/Buds-2025/buds-hy2/releases/download/$version"
+  version=1.5.1
+  base="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates/releases/$version"
   work=$(mktemp -d /usr/local/bin/.buds_upgrade.XXXXXX)
   trap 'rm -rf -- "$work"' EXIT
   curl -q -fsSL --proto '=https' --proto-redir '=https' "$base/buds" -o "$work/buds"
   curl -q -fsSL --proto '=https' --proto-redir '=https' "$base/buds.sig" -o "$work/buds.sig"
   openssl dgst -sha256 -verify /etc/buds-hy2/update.pub -signature "$work/buds.sig" "$work/buds"
-  grep -Fx "SCRIPT_VERSION=\"${version#v}\"" "$work/buds"
+  grep -Fx "SCRIPT_VERSION=\"$version\"" "$work/buds"
   bash -n "$work/buds"
   chmod 755 "$work/buds"
   mv -f "$work/buds" /usr/local/bin/buds
@@ -164,9 +160,9 @@ Let's Encrypt模式会复用并启用已有续签定时器或cron任务，缺失
 
 开发验证：`python scripts/test_regressions.py`执行隔离回归测试（需Python 3和Bash），`python scripts/sync_cli.py --check`检查CLI与安装器内嵌版本的一致性。测试使用临时文件和系统命令替身，不执行真实安装。
 
-## 发布资产
+## 仓库更新资产
 
-使用独立保管的 RSA 或 ECDSA 私钥签署同步后的 `buds` 和 `install.sh`，并生成与两个脚本一致的版本文件：
+使用独立保管的 RSA 或 ECDSA 私钥签署同步后的 `buds` 和 `install.sh`，并签署版本文件：
 
 ```bash
 set -e
@@ -175,8 +171,9 @@ version=$(sed -n 's/^SCRIPT_VERSION="\([0-9.]*\)"$/\1/p' buds)
 test -n "$version"
 test "$(grep -m 1 '^SCRIPT_VERSION=' install.sh)" = "SCRIPT_VERSION=\"$version\""
 printf '%s\n' "$version" > buds.version
+openssl dgst -sha256 -sign /secure/path/update.key -out buds.version.sig buds.version
 openssl dgst -sha256 -sign /secure/path/update.key -out buds.sig buds
 openssl dgst -sha256 -sign /secure/path/update.key -out install.sh.sig install.sh
 ```
 
-在 GitHub Release `v$version` 下发布 `buds`、`buds.sig`、`buds.version`、`install.sh`、`install.sh.sig` 和 `update.pub`。每次发布使用新标签，公钥指纹通过独立可信渠道分发。
+将 `update.pub`、`buds.version`、`buds.version.sig` 放在 `updates` 分支根目录，将 `buds`、`buds.sig`、`install.sh`、`install.sh.sig` 放在该分支的 `releases/$version/` 下。用一次提交发布版本目录和版本清单。保留已发布的版本目录，并通过独立可信渠道分发公钥指纹。

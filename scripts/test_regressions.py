@@ -175,6 +175,41 @@ if printf '%s\n' 'Global: ~.' 'Link 3 (vpn0):' '     ~branch.team.example.com' \
 """)
         self.assertEqual(out.count("DNS 路由域冲突"), 4)
 
+    def test_warp_finds_a_manual_sing_box_installation_outside_path(self):
+        self.shell("""
+mkdir -p "$SANDBOX/etc/s-box"
+cat > "$SANDBOX/etc/s-box/sing-box" <<'SING_BOX'
+#!/usr/bin/env bash
+echo 'sing-box version 1.14.2'
+SING_BOX
+chmod 755 "$SANDBOX/etc/s-box/sing-box"
+warp_exec_safe() { :; }
+systemctl() { echo 0; }
+found=$(warp_find_binary)
+[[ "$found" == "$SANDBOX/etc/s-box/sing-box 1.14.2" ]]
+""")
+
+    @unittest.skipUnless(os.name == "posix", "requires filesystem symlinks")
+    def test_warp_dns_switch_and_restore_preserve_the_static_resolver(self):
+        self.shell("""
+mkdir -p "$(dirname "$WARP_STUB")"
+printf '%s\n' 'nameserver 127.0.0.53' > "$WARP_STUB"
+printf '%s\n' '# original' 'nameserver 8.8.8.8' 'nameserver 8.8.4.4' > "$SANDBOX/etc/resolv.conf"
+cp "$SANDBOX/etc/resolv.conf" "$SANDBOX/original"
+timeout() { return "$DNS_TEST_RESULT"; }
+DNS_TEST_RESULT=1
+if warp_dns_switch; then exit 9; fi
+cmp "$SANDBOX/etc/resolv.conf" "$SANDBOX/original"
+[[ ! -e "$WARP_DNS_DROPIN" && ! -e "$WARP_DNS_STATE" ]]
+DNS_TEST_RESULT=0
+warp_dns_switch
+[[ $(readlink "$SANDBOX/etc/resolv.conf") == "$WARP_STUB" ]]
+grep -Fx 'DNS=8.8.8.8 8.8.4.4' "$WARP_DNS_DROPIN"
+warp_dns_restore
+cmp "$SANDBOX/etc/resolv.conf" "$SANDBOX/original"
+[[ ! -e "$WARP_DNS_DROPIN" && ! -e "$WARP_DNS_STATE" ]]
+""")
+
     def test_warp_trace_detects_swapped_exits(self):
         self.shell("""
 mkdir -p "$WARP_DIR"
@@ -240,6 +275,7 @@ ln -f "$WARP_DIR/$WARP_UNIT" "$SANDBOX/etc/systemd/system/$WARP_UNIT"
 echo previous.example > "$WARP_LIST"
 cp "$WARP_LIST" "$WARP_DIR/domains"
 warp_prepare_policy() { :; }
+warp_runtime_binary() { echo sing-box; }
 python3() {
     case " $* " in *"policy.py render "*) return 0 ;; esac
     "$PYTHON_BIN" -X utf8 "$@"
@@ -283,6 +319,7 @@ esac
 SB
 chmod +x "$SANDBOX/bin/sing-box"
 export PATH="$SANDBOX/bin:$PATH"
+warp_exec_safe() { :; }
 profile_path="$SANDBOX/wg.conf"
 printf '%s\n' '[Interface]' 'Address=172.16.0.2/32' 'PrivateKey=fixture' '[Peer]' \\
     'PublicKey=fixture' 'Endpoint=Peer.Example.NET:2408' 'AllowedIPs=0.0.0.0/0' > "$profile_path"
@@ -422,7 +459,7 @@ DOMAIN=node.example.com; CLIENT_PORT_STR=19957; AUTH_PASSWORD=pass; OBFS_PASSWOR
 setup_cli
 """, "install.sh")
         installed_cli = (self.directory / "usr/local/bin/buds").read_text(encoding="utf-8")
-        self.assertIn('SCRIPT_VERSION="1.5.0"', installed_cli)
+        self.assertIn('SCRIPT_VERSION="1.5.1"', installed_cli)
         self.assertNotIn("unsigned sibling", installed_cli)
 
     def test_init_detection_requires_commands_and_runtime(self):
@@ -1075,7 +1112,7 @@ is_version_newer "" "1.2.0" || echo "PASS7"
 """)
         self.assertEqual(output.strip().splitlines(), [f"PASS{i}" for i in range(1, 8)])
 
-    def test_remote_version_cache_and_fallback(self):
+    def test_remote_version_uses_only_fresh_cache(self):
         out = self.shell("""
 printf '%s:2.0.0\n' "$(date +%s)" > "$VERSION_CACHE_FILE"
 curl() { echo CURL_CALLED >> "$ACTION_FILE"; return 1; }
@@ -1083,6 +1120,9 @@ check_remote_version
 """)
         self.assertEqual(out.strip(), "2.0.0")
         self.assertNotIn("CURL_CALLED", self.actions())
+        key = self.directory / "etc/buds-hy2/update.pub"
+        key.parent.mkdir()
+        key.write_text("nonempty fixture")
 
         out = self.shell("""
 printf '%s:2.0.0\n' "$(( $(date +%s) + 3600 ))" > "$VERSION_CACHE_FILE"
@@ -1091,9 +1131,8 @@ check_remote_version
 """, expected=1)
         self.assertEqual(out, "")
         self.assertIn("CURL_CALLED", self.actions())
-        self.shell('curl() { echo "1.4.0/invalid"; }\ncheck_remote_version true\n', expected=1)
 
-    def test_update_verifies_release_before_replacing_script(self):
+    def test_update_verifies_repository_manifest_and_script_before_replacing_script(self):
         target_cli = self.directory / "usr/local/bin/buds"
         target_cli.parent.mkdir(parents=True)
         initial = '#!/usr/bin/env bash\nSCRIPT_VERSION="1.3.1"\n'
@@ -1103,6 +1142,8 @@ check_remote_version
         release_script = self.directory / "release-buds"
         private_key = self.directory / "fixture.key"
         signature = self.directory / "release-buds.sig"
+        manifest = self.directory / "release-buds.version"
+        manifest_sig = self.directory / "release-buds.version.sig"
 
         def openssl(*args):
             subprocess.run([OPENSSL, *map(str, args)], check=True, capture_output=True)
@@ -1113,20 +1154,28 @@ check_remote_version
 
         openssl("genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", private_key)
         openssl("pkey", "-in", private_key, "-pubout", "-out", public_key)
+        manifest.write_text("1.4.0\n", encoding="utf-8", newline="\n")
+        openssl("dgst", "-sha256", "-sign", private_key, "-out", manifest_sig, manifest)
         mock_download = """
 SCRIPT_VERSION=1.3.1
 flock() { [[ "$1" == -x && "$2" =~ ^[0-9]+$ ]]; }
 curl() {
     case " $* " in
-        *'/latest/download/buds.version '*) echo 1.4.0 ;;
-        *'/download/v1.4.0/buds '*) cp "$SANDBOX/release-buds" "${!#}" ;;
-        *'/download/v1.4.0/buds.sig '*) cp "$SANDBOX/release-buds.sig" "${!#}" ;;
+        *'/updates/buds.version '*) cp "$SANDBOX/release-buds.version" "${!#}" ;;
+        *'/updates/buds.version.sig '*) cp "$SANDBOX/release-buds.version.sig" "${!#}" ;;
+        *'/updates/releases/1.4.0/buds '*) cp "$SANDBOX/release-buds" "${!#}" ;;
+        *'/updates/releases/1.4.0/buds.sig '*) cp "$SANDBOX/release-buds.sig" "${!#}" ;;
         *) return 1 ;;
     esac
 }
 update_script 2>&1
 """
         valid = '#!/usr/bin/env bash\nSCRIPT_VERSION="1.4.0"\necho updated\n'
+        manifest.write_text("9.9.9\n", encoding="utf-8", newline="\n")
+        out = self.shell(mock_download, expected=1)
+        self.assertIn("仓库更新版本验签失败", out)
+        self.assertEqual(target_cli.read_text(encoding="utf-8"), initial)
+        manifest.write_text("1.4.0\n", encoding="utf-8", newline="\n")
         sign_script(valid)
         release_script.write_text(valid + "echo changed\n", encoding="utf-8", newline="\n")
         out = self.shell(mock_download, expected=1)
