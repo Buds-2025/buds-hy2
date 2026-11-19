@@ -4,7 +4,7 @@ set -e
 CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
-SCRIPT_VERSION="1.7.1"
+SCRIPT_VERSION="1.7.2"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 UPDATE_REPO_URL="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates"
@@ -28,6 +28,10 @@ C_GREEN="\033[38;5;114m"        # 薄荷绿 (运行中)
 C_RED="\033[38;5;203m"          # 珊瑚红 (已停止)
 C_CYAN="\033[38;5;153m"         # 冰青色 (端口/参数)
 C_YELLOW="\033[38;5;221m"       # 浅金黄 (链接)
+if [[ ! -t 1 || ${TERM:-dumb} == dumb || -n ${NO_COLOR:-} ]]; then
+    C_RESET= C_BOLD= C_DIM= C_ORANGE= C_ORANGE_BOLD= C_AMBER= C_SPARK= C_WHITE=
+    C_GRAY_LIGHT= C_GRAY_MID= C_GRAY_DARK= C_GREEN= C_RED= C_CYAN= C_YELLOW=
+fi
 C_BAR="${C_ORANGE_BOLD}▌${C_RESET}"
 C_SUBBAR="${C_ORANGE}▎${C_RESET}"
 
@@ -2875,6 +2879,64 @@ panel_clear() {
     if [[ -t 1 && "${TERM:-dumb}" != dumb ]]; then printf '\033[H\033[2J'; fi
 }
 
+panel_width() {
+    local rows width=
+    if [[ -t 0 ]]; then
+        read -r rows width < <(stty size 2>/dev/null) || width=
+    fi
+    [[ "$width" =~ ^[1-9][0-9]{0,3}$ ]] || width=${COLUMNS:-80}
+    [[ "$width" =~ ^[1-9][0-9]{0,3}$ ]] || width=80
+    printf '%s\n' "$width"
+}
+
+panel_logo() {
+    local width=$1 i
+    local -a buds=('█▀▀█ █  █ █▀▀▄ █▀▀▀' '█▀▀▄ █  █ █  █ ▀▀▀█' '█  █ █  █ █  █    █' '▀▀▀▀ ▀▀▀▀ ▀▀▀  ▀▀▀▀')
+    local -a hy2=('█  █ █  █ █▀▀█' '█▀▀█ ▀██▀   ▄▀' '█  █   █  ▄▀' '▀  ▀   ▀  ▀▀▀▀')
+    if (( width >= 48 )); then
+        printf '       %b✧                                      ✦%b\n' "$C_SPARK" "$C_RESET"
+    else
+        printf '       %b✧    ✦%b\n' "$C_SPARK" "$C_RESET"
+    fi
+    if (( width >= 38 )); then
+        for i in "${!buds[@]}"; do
+            printf '  %b%s%b   %b%s%b\n' "$C_ORANGE_BOLD" "${buds[i]}" "$C_RESET" "$C_GRAY_LIGHT" "${hy2[i]}" "$C_RESET"
+        done
+    else
+        printf "  ${C_ORANGE_BOLD}%s${C_RESET}\n" "${buds[@]}"
+        printf "  ${C_GRAY_LIGHT}%s${C_RESET}\n" "${hy2[@]}"
+    fi
+    if (( width >= 52 )); then
+        printf '  %bHysteria 2 High-Performance Protocol Suite%b  %bv%s%b\n' "$C_GRAY_LIGHT" "$C_RESET" "$C_CYAN" "$SCRIPT_VERSION" "$C_RESET"
+    else
+        printf '  %bHysteria 2%b  %bv%s%b\n' "$C_GRAY_LIGHT" "$C_RESET" "$C_CYAN" "$SCRIPT_VERSION" "$C_RESET"
+    fi
+}
+
+panel_section() {
+    printf '\n%b▌ %s%b\n' "$1" "$2" "$C_RESET"
+}
+
+panel_choices() {
+    local accent=$1 width=$2 count=1 index=0 label non_ascii cells
+    shift 2
+    local LC_ALL=C
+    if (( width >= 80 )); then count=3
+    elif (( width >= 52 )); then count=2; fi
+    for label in "$@"; do
+        index=$((index + 1))
+        printf ' %b%2d.%b %s' "$accent" "$index" "$C_RESET" "$label"
+        if (( index % count == 0 || index == $# )); then
+            printf '\n'
+        else
+            # 当前选项只有 ASCII 和三字节中文字符；中文在终端占两格。
+            non_ascii=${label//[[:print:]]/}
+            cells=$(( ${#label} - ${#non_ascii} / 3 ))
+            printf '%*s' "$((21 - cells))" ''
+        fi
+    done
+}
+
 panel_pause() {
     if [[ -t 0 && -t 1 ]]; then
         local key
@@ -2985,14 +3047,9 @@ nodes_edit_menu() {
 }
 
 nodes_options() {
-    printf '%s\n' \
-        '  1. 节点列表与端口      2. 一键新增节点' \
-        '  3. 连接链接            4. 客户端配置' \
-        '  5. 运行状态            6. 最近日志' \
-        '  7. 启动节点            8. 停止节点' \
-        '  9. 重启节点           10. 编辑端口、密码等设置' \
-        ' 11. 删除附加节点       12. 主节点模拟续签' \
-        ' 13. 主节点实时日志     14. 卸载整套 HY2'
+    panel_choices "$C_ORANGE_BOLD" "$1" '节点列表与端口' '一键新增节点' '连接链接' '客户端配置' \
+        '运行状态' '最近日志' '启动节点' '停止节点' '重启节点' '编辑端口、密码等设置' \
+        '删除附加节点' '主节点模拟续签' '主节点实时日志' '卸载整套 HY2'
 }
 
 nodes_pick() {
@@ -3030,8 +3087,8 @@ nodes_menu() {
     local choice name confirm action
     while true; do
         panel_clear
-        printf '\nA 节点管理\n'
-        nodes_options
+        panel_section "$C_ORANGE_BOLD" 'A 节点管理'
+        nodes_options "$(panel_width)"
         echo '  0. 返回首页'
         read -rp 'A 区操作编号（0–14）：' choice || return 0
         case "$choice" in
@@ -3331,21 +3388,16 @@ warp_menu_begin() {
 }
 
 warp_options() {
-    printf '%s\n' \
-        '  1. 一键安装并启用      2. 检测分流和出口' \
-        '  3. 管理分流域名        4. Gemini 出口地址族' \
-        '  5. 关闭分流            6. 启用前诊断' \
-        '  7. 服务状态和日志      8. 准备依赖' \
-        '  9. 安装独立内核       10. 准备 WARP 配置' \
-        ' 11. 迁移系统 DNS       12. 恢复原 DNS' \
-        ' 13. 使用已有配置启用'
+    panel_choices "$C_CYAN" "$1" '一键安装并启用' '检测分流和出口' '管理分流域名' 'Gemini 出口地址族' \
+        '关闭分流' '启用前诊断' '服务状态和日志' '准备依赖' '安装独立内核' '准备 WARP 配置' \
+        '迁移系统 DNS' '恢复原 DNS' '使用已有配置启用'
 }
 
 warp_menu() {
     local choice profile confirm
     while true; do
         panel_clear
-        printf '\nB WARP 分流管理\n'
+        panel_section "$C_CYAN" 'B WARP 分流管理'
         if systemctl is-active --quiet "$WARP_UNIT" 2>/dev/null; then
             echo "WARP 分流正在运行。"
         elif [[ -d "$WARP_DIR" ]]; then
@@ -3354,7 +3406,7 @@ warp_menu() {
             echo "WARP 分流未启用。首次使用可选择 1 按提示完成，也可分步操作。"
         fi
         echo '设置由所有节点共用。首次使用选 1，检查实际出口选 2。'
-        warp_options
+        warp_options "$(panel_width)"
         echo '  0. 返回首页'
         read -rp 'B 区操作编号（0–13）：' choice || return 0
         case "$choice" in
@@ -3406,7 +3458,7 @@ warp_menu() {
 }
 
 show_menu() {
-    local remote_ver choice
+    local remote_ver choice width
     remote_ver=$(check_remote_version 2>/dev/null) || remote_ver=""
     while true; do
         local status_badge domain listen has_update
@@ -3426,9 +3478,9 @@ show_menu() {
         fi
 
         if [[ "$is_running" == "true" ]]; then
-            status_badge="${C_GREEN}● 运行中 (Running)${C_RESET}"
+            status_badge="${C_GREEN}● 运行中${C_RESET}"
         else
-            status_badge="${C_RED}● 已停止 (Stopped)${C_RESET}"
+            status_badge="${C_RED}● 已停止${C_RESET}"
         fi
 
         domain=$(get_domain)
@@ -3440,18 +3492,21 @@ show_menu() {
         fi
 
         panel_clear
-        printf '%bBUDS HY2%b  v%s\n' "$C_ORANGE_BOLD" "$C_RESET" "$SCRIPT_VERSION"
-        echo -e "  ${C_BAR}  ${C_WHITE}主节点状态${C_RESET}  ${status_badge}    ${C_WHITE}监听端口${C_RESET}  ${C_CYAN}${listen}${C_RESET}"
-        echo -e "  ${C_BAR}  ${C_GRAY_MID}解析域名${C_RESET}  ${C_GRAY_LIGHT}${domain}${C_RESET}    ${C_GRAY_MID}协议混淆${C_RESET}  ${C_AMBER}Salamander${C_RESET}"
+        width=$(panel_width)
+        panel_logo "$width"
+        printf '  主节点  %b    UDP  %b%s%b\n' "$status_badge" "$C_CYAN" "$listen" "$C_RESET"
+        printf '  域名    %b%s%b' "$C_WHITE" "$domain" "$C_RESET"
+        if (( width < 52 )); then printf '\n '; fi
+        printf '   混淆  %bSalamander%b\n' "$C_AMBER" "$C_RESET"
         if [[ "$has_update" == "true" ]]; then
             echo -e "  ${C_BAR}  ${C_SPARK}✦ 发现脚本新版本  v${remote_ver} (当前: v${SCRIPT_VERSION})  ▶ 输入 U 即可更新${C_RESET}"
         fi
-        printf '\n%bA 节点管理%b\n' "$C_ORANGE_BOLD" "$C_RESET"
-        nodes_options
-        printf '\n%bB WARP 分流管理%b\n' "$C_ORANGE_BOLD" "$C_RESET"
-        warp_options
-        printf '\n%s\n' 'U. 更新脚本    0. 退出'
-        read -rp '先选区域 A 或 B，再输入操作编号（U 更新，0 退出）：' choice || return 0
+        panel_section "$C_ORANGE_BOLD" 'A 节点管理'
+        nodes_options "$width"
+        panel_section "$C_CYAN" 'B WARP 分流管理'
+        warp_options "$width"
+        printf '  %bU. 更新脚本    0. 退出%b\n' "$C_GRAY_LIGHT" "$C_RESET"
+        read -rp '先选区域 [A/B] › ' choice || return 0
         case "${choice^^}" in
             A) nodes_menu; continue ;;
             B) warp_menu; continue ;;

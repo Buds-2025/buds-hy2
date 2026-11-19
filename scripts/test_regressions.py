@@ -147,6 +147,29 @@ INPUT
         for menu, n in ((nodes, 14), (warp, 13)):
             self.assertEqual(list(map(int, re.findall(r"\b(\d+)\. ", menu))), list(range(1, n + 1)))
 
+    def test_panel_logo_and_numbered_grid_at_different_widths(self):
+        import unicodedata
+        def cells(line):
+            return sum(2 if unicodedata.east_asian_width(char) in ("F", "W") else 1 for char in line)
+
+        for width, columns in ((32, 1), (38, 1), (52, 2), (80, 3), (120, 3)):
+            with self.subTest(width=width):
+                output = self.shell(f"COLUMNS={width}\nw=$(panel_width)\npanel_logo \"$w\"\necho '---'\nnodes_options \"$w\"\n")
+                logo, menu = output.split("---\n")
+                self.assertNotIn("\x1b", output)
+                self.assertIn("✧", logo)
+                self.assertIn("✦", logo)
+                self.assertIn("█▀▀█ █  █ █▀▀▄ █▀▀▀", logo)
+                self.assertIn("█  █ █  █ █▀▀█", logo)
+                self.assertEqual("High-Performance Protocol Suite" in logo, width >= 52)
+                self.assertEqual(len(logo.splitlines()), 10 if width < 38 else 6)
+                self.assertLessEqual(max(map(cells, output.splitlines())), width)
+                self.assertEqual(len(menu.splitlines()), (14 + columns - 1) // columns)
+                for line in menu.splitlines():
+                    # Numbers are right-aligned so their periods share a column.
+                    ends = [cells(line[:m.end()]) for m in re.finditer(r"\d+\.", line)]
+                    self.assertEqual(ends, [4 + i * 26 for i in range(len(ends))])
+
     def test_update_success_reopens_installed_cli_and_confirmed_uninstall_exits(self):
         self.shell(r'''check_remote_version() { echo "$SCRIPT_VERSION"; }
 update_script() { echo updated >> "$ACTION_FILE"; }
