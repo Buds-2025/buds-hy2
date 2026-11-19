@@ -16,7 +16,7 @@ OVERRIDE_DIR="/etc/systemd/system/hysteria-server.service.d"
 OVERRIDE_FILE="${OVERRIDE_DIR}/override.conf"
 SERVICE_FILE="/etc/systemd/system/hysteria-server.service"
 SYSCTL_FILE="/etc/sysctl.d/99-hysteria-performance.conf"
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.7.1"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 
@@ -1224,7 +1224,7 @@ set -e
 CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.7.1"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 UPDATE_REPO_URL="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates"
@@ -4128,25 +4128,25 @@ nodes_edit_menu() {
         elif command -v dnf >/dev/null; then packages=(dnf install -y python3-pyyaml)
         elif command -v yum >/dev/null; then packages=(yum install -y python3-pyyaml)
         elif command -v pacman >/dev/null; then packages=(pacman -S --needed --noconfirm python-yaml)
-        else echo '编辑主节点需要系统 Python 3 的 PyYAML 包。'; panel_pause '节点菜单' || true; return 0; fi
+        else echo '编辑主节点需要系统 Python 3 的 PyYAML 包。'; panel_pause 'A 区' || true; return 0; fi
         echo "编辑主节点需要 PyYAML 读取现有配置。将执行：${packages[*]}"
         read -rp '现在安装此依赖？[y/N] ' confirm || return 0
         [[ "${confirm,,}" == y ]] || return 0
         if ! "${packages[@]}" || ! python3 -I -c 'import yaml'; then
-            echo '依赖尚未就绪，请核对软件源后重试。'; panel_pause '节点菜单' || true; return 0
+            echo '依赖尚未就绪，请核对软件源后重试。'; panel_pause 'A 区' || true; return 0
         fi
     fi
     while true; do
         panel_clear
         printf '\n编辑节点 %s\n\n' "$name"
-        nodes_manage detail "$name" || return 0
+        if ! nodes_manage detail "$name"; then panel_pause 'A 区' || true; return 0; fi
         echo '改端口或密码会短暂重启这个运行中的节点。完成后请重新导入它的链接。'
         printf '%s\n' '1. 访问地址      2. 本地 UDP 端口' \
             '3. 公网端口映射  4. 重新生成认证和混淆密码' \
             '5. 单独更换认证或混淆密码'
-        if [[ "$name" != main ]]; then echo '6. 选择 TLS 证书'; fi
-        echo '7. 更换伪装网站'
-        echo '0. 返回节点菜单'
+        echo '6. 更换伪装网站'
+        if [[ "$name" != main ]]; then echo '7. 选择 TLS 证书'; fi
+        echo '0. 返回 A 区'
         read -rp '请选择要修改的设置：' choice || return 0
         case "$choice" in
             1) flag=--domain; prompt='输入已指向这台服务器的域名或 IPv4，如 hy.example.com（回车取消）：'
@@ -4181,10 +4181,10 @@ nodes_edit_menu() {
                 esac
                 panel_pause '编辑菜单' || return 0
                 continue ;;
-            6) if [[ "$name" == main ]]; then continue; fi
+            7) if [[ "$name" == main ]]; then echo "主节点请从 1–6 中选择。"; panel_pause "编辑菜单" || return 0; continue; fi
                echo '建议填 auto 自动选择。self 会生成带指纹的自签名证书；shared 需要主证书覆盖这个地址。'
                flag=--tls; prompt='输入 auto、self 或 shared（回车取消）：' ;;
-            7) echo '伪装网站用于回应普通 HTTPS 访问。它不会改变节点地址或 WARP 规则。'
+            6) echo '伪装网站用于回应普通 HTTPS 访问。它不会改变节点地址或 WARP 规则。'
                flag=--masquerade; prompt='输入完整 HTTPS 网址，如 https://www.example.org/（回车取消）：' ;;
             0|'') return 0 ;;
             *) echo '请输入有效编号。'; panel_pause '编辑菜单' || return 0; continue ;;
@@ -4195,7 +4195,7 @@ nodes_edit_menu() {
             read -rp "将把节点 $name 的这项设置改为 $value。确认提交？[y/N] " confirm || return 0
             [[ "${confirm,,}" == y ]] || break
             if nodes_manage edit "$name" "$flag" "$value"; then
-                echo '请在节点菜单选 1 或 2 获取最新链接或配置。'
+                echo '请在A 区选 3 或 4 获取最新链接或配置。'
                 panel_pause '编辑菜单' || return 0
                 break
             fi
@@ -4204,110 +4204,85 @@ nodes_edit_menu() {
     done
 }
 
-nodes_selected_menu() {
-    local name=$1 choice action confirm
-    while true; do
-        panel_clear
-        printf '\n管理节点 %s\n\n' "$name"
-        if ! nodes_manage detail "$name"; then
-            panel_pause '多节点管理' || true
-            return 0
-        fi
-        printf '\n%s\n' '1. 连接链接  2. 客户端配置  3. 运行状态  4. 最近日志'
-        printf '%s\n' '5. 启动  6. 停止  7. 重启  8. 修改端口、密码和其他设置'
-        if [[ "$name" == main ]]; then
-            echo 'r. 模拟证书续签  l. 实时日志  u. 卸载整套 HY2 服务'
-        else
-            echo '9. 删除这个附加节点'
-        fi
-        echo '0. 返回节点区'
-        read -rp '请选择节点操作：' choice || return 0
-        case "$choice" in
-            1) action=link ;;
-            2) action=client ;;
-            3) action=status ;;
-            4) action=log ;;
-            5) action=start ;;
-            6|7)
-                action=stop
-                [[ "$choice" != 7 ]] || action=restart
-                read -rp "此操作会中断节点 $name 的现有连接。确认继续？[y/N] " confirm || return 0
-                [[ "${confirm,,}" == y ]] || continue ;;
-            8) nodes_edit_menu "$name"; continue ;;
-            r|l|u)
-                if [[ "$name" == main ]]; then
-                    case "$choice" in
-                        r) renew_test || echo '模拟续签未成功，请检查上方日志。' ;;
-                        l) (trap 'exit 0' INT; log) || true ;;
-                        u) if uninstall menu; then exit 0; fi ;;
-                    esac
-                else echo '请使用当前菜单列出的选项。'; fi
-                panel_pause '节点菜单' || return 0; continue ;;
-            9)
-                if [[ "$name" == main ]]; then echo '主节点的整套卸载入口为 u。'; panel_pause '节点菜单' || return 0; continue; fi
-                read -rp "输入 $name 确认删除（回车取消）：" confirm || return 0
-                if [[ "$confirm" == "$name" ]]; then
-                    if nodes_manage delete "$name" --yes; then
-                        panel_pause '多节点管理' || true
-                        return 0
-                    fi
-                    echo '删除未完成，请检查提示。'
-                else
-                    echo '已取消删除。'
-                fi
-                panel_pause '节点菜单' || return 0
-                continue ;;
-            0|'') return 0 ;;
-            *) echo '请输入有效编号。'; panel_pause '节点菜单' || return 0; continue ;;
-        esac
-        nodes_manage "$action" "$name" || echo '操作未完成，请检查提示。'
-        panel_pause '节点菜单' || return 0
-    done
+nodes_options() {
+    printf '%s\n' \
+        '  1. 节点列表与端口      2. 一键新增节点' \
+        '  3. 连接链接            4. 客户端配置' \
+        '  5. 运行状态            6. 最近日志' \
+        '  7. 启动节点            8. 停止节点' \
+        '  9. 重启节点           10. 编辑端口、密码等设置' \
+        ' 11. 删除附加节点       12. 主节点模拟续签' \
+        ' 13. 主节点实时日志     14. 卸载整套 HY2'
 }
 
 nodes_pick() {
-    local listed choice i
-    local -a names
-    if ! listed=$(nodes_manage names); then
-        panel_pause '多节点管理' || true
-        return 0
+    local listed number item i
+    local -a names=()
+    if ! listed=$(nodes_manage names); then panel_pause 'A 区' || true; return 1; fi
+    while IFS= read -r item; do
+        [[ -n "$item" ]] || continue
+        if [[ "$2" == 11 && "$item" == main ]]; then continue; fi
+        names+=("$item")
+    done <<< "$listed"
+    if (( ${#names[@]} == 0 )); then
+        if [[ "$2" == 11 ]]; then echo '没有可删除的附加节点。'
+        else echo '未找到节点，请先完成主节点安装。'; fi
+        panel_pause 'A 区' || true
+        return 1
     fi
-    if [[ -z "$listed" ]]; then
-        echo '未找到已配置的主节点，请先使用安装脚本完成首次安装。'
-        panel_pause '多节点管理' || true
-        return 0
-    fi
-    mapfile -t names <<< "$listed"
-    printf '\n选择要管理的节点\n\n'
+    printf '\n选择操作对象\n'
     for i in "${!names[@]}"; do
         if [[ "${names[i]}" == main ]]; then printf '%s. main（主节点）\n' "$((i+1))"
         else printf '%s. %s\n' "$((i+1))" "${names[i]}"; fi
     done
-    while read -rp '输入节点编号（回车取消）：' choice && [[ -n "$choice" && "$choice" != 0 ]]; do
-        if [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && (( choice <= ${#names[@]} )); then
-            nodes_selected_menu "${names[choice-1]}"
+    while read -rp '输入节点编号（0 或回车取消）：' number; do
+        [[ -n "$number" && "$number" != 0 ]] || break
+        if [[ "$number" =~ ^[1-9][0-9]{0,5}$ ]] && (( number <= ${#names[@]} )); then
+            printf -v "$1" '%s' "${names[number-1]}"
             return 0
         fi
         echo '请从列表中选择一个节点编号。'
     done
+    return 1
 }
 
 nodes_menu() {
-    local choice
+    local choice name confirm action
     while true; do
         panel_clear
-        printf '\n节点管理\n\n'
-        printf '%s\n' '1. 查看所有节点和端口' '2. 一键新增节点（地址、端口均可回车自动填写）' \
-            '3. 管理已有节点（含主节点，更改端口、密码或查看链接）' '0. 返回主菜单'
-        read -rp '请选择多节点操作：' choice || return 0
+        printf '\nA 节点管理\n'
+        nodes_options
+        echo '  0. 返回首页'
+        read -rp 'A 区操作编号（0–14）：' choice || return 0
         case "$choice" in
             1) nodes_manage list || true ;;
             2) nodes_quick_add || echo '新增未完成，请检查提示。' ;;
-            3) nodes_pick; continue ;;
+            3|4|5|6|7|8|9|10|11)
+                nodes_pick name "$choice" || continue
+                case "$choice" in
+                    3) action=link ;; 4) action=client ;; 5) action=status ;;
+                    6) action=log ;; 7) action=start ;;
+                    8|9)
+                        action=stop; [[ "$choice" != 9 ]] || action=restart
+                        read -rp "此操作会中断节点 $name 的现有连接。确认继续？[y/N] " confirm || return 0
+                        [[ "${confirm,,}" == y ]] || continue ;;
+                    10) nodes_edit_menu "$name"; continue ;;
+                    11)
+                        read -rp "输入节点名称 $name 确认删除（回车取消）：" confirm || return 0
+                        if [[ "$confirm" == "$name" ]]; then
+                            nodes_manage delete "$name" --yes || echo '删除未完成，请检查提示。'
+                        else echo '已取消删除。'; fi
+                        panel_pause 'A 区' || return 0
+                        continue ;;
+                esac
+                nodes_manage "$action" "$name" || echo '操作未完成，请检查提示。' ;;
+            12) renew_test || echo '模拟续签未成功，请检查上方日志。' ;;
+            13) (trap 'exit 0' INT; log) || true ;;
+            14) if uninstall menu; then exit 0; fi ;;
             0|'') return 0 ;;
-            *) echo '请输入有效编号。' ;;
+            *) echo '请输入 A 区的 1–14，或输入 0 返回首页。' ;;
         esac
-        panel_pause '多节点管理' || return 0
+        panel_pause 'A 区' || return 0
     done
 }
 
@@ -4575,36 +4550,55 @@ warp_menu_begin() {
     fi
 }
 
+warp_options() {
+    printf '%s\n' \
+        '  1. 一键安装并启用      2. 检测分流和出口' \
+        '  3. 管理分流域名        4. Gemini 出口地址族' \
+        '  5. 关闭分流            6. 启用前诊断' \
+        '  7. 服务状态和日志      8. 准备依赖' \
+        '  9. 安装独立内核       10. 准备 WARP 配置' \
+        ' 11. 迁移系统 DNS       12. 恢复原 DNS' \
+        ' 13. 使用已有配置启用'
+}
+
 warp_menu() {
     local choice profile confirm
     while true; do
         panel_clear
-        printf '\nWARP 定向分流\n'
+        printf '\nB WARP 分流管理\n'
         if systemctl is-active --quiet "$WARP_UNIT" 2>/dev/null; then
             echo "WARP 分流正在运行。"
         elif [[ -d "$WARP_DIR" ]]; then
-            echo "WARP 服务未运行，可选择 p 检查或用 buds hy2 warp status 查看日志。"
+            echo "WARP 服务未运行，可选择 6 检查或用 buds hy2 warp status 查看日志。"
         else
-            echo "WARP 分流未启用。首次使用可选择 a 按提示完成，也可分步操作。"
+            echo "WARP 分流未启用。首次使用可选择 1 按提示完成，也可分步操作。"
         fi
-        echo '这份设置由所有节点共用。首次使用选 a；想确认哪些网站走 WARP，选 c。'
-        printf '\n%s\n' '常用操作'
-        printf '%s\n' 'a. 一键准备并启用    c. 验证分流和出口    m. 编辑分流域名' \
-            'g. 选择 Gemini 的 IPv4 / IPv6 出口    d. 关闭分流'
-        printf '\n%s\n' '分步设置与故障排查'
-        printf '%s\n' 'p. 启用前诊断    t. 服务状态和日志    s. 准备依赖    i. 安装独立内核' \
-            'w. 准备 WARP 配置    n. 迁移系统 DNS    r. 恢复原 DNS    e. 使用已有配置启用' '0. 返回主菜单'
-        read -rp "请选择： " choice || return 0
-        case "${choice,,}" in
-            a) warp_menu_begin || echo "引导未完成，可选择 p 检查并按提示重试。" ;;
-            p) warp_manage doctor || true ;;
-            t) warp_manage status || true ;;
-            w) echo '已有可用的专用配置时会沿用它。需要注册时会提示确认。'
+        echo '设置由所有节点共用。首次使用选 1，检查实际出口选 2。'
+        warp_options
+        echo '  0. 返回首页'
+        read -rp 'B 区操作编号（0–13）：' choice || return 0
+        case "$choice" in
+            1) warp_menu_begin || echo "引导未完成，可选择 6 检查并按提示重试。" ;;
+            2) warp_manage check || true ;;
+            3) warp_domains_menu; continue ;;
+            4)
+                warp_manage gemini-family || true
+                echo '通常选 auto。若第 2 项检测到只有一个入口地区合适，输入对应的 ipv4 或 ipv6。'
+                read -rp '输入 auto、ipv4 或 ipv6（更改需要短暂重启 WARP，回车返回）: ' profile || return 0
+                if [[ -n "$profile" ]]; then warp_manage gemini-family "$profile" || true; fi
+                ;;
+            5)
+                read -rp '关闭后所有节点的目标域名都将回到原有出口。确认关闭？[y/N] ' confirm || return 0
+                if [[ "${confirm,,}" == y ]]; then warp_manage disable || echo "关闭未完成，请参照上方提示。"
+                else echo '已取消关闭。'; fi ;;
+            6) warp_manage doctor || true ;;
+            7) warp_manage status || true ;;
+            8) warp_manage setup || echo "准备依赖未完成，请参照上方提示。" ;;
+            9) warp_manage setup --managed-core || echo "独立内核准备未完成，请参照上方提示。" ;;
+            10) echo '已有可用的专用配置时会沿用它。需要注册时会提示确认。'
                warp_manage setup --new-profile || echo '配置未就绪，请查看上方提示。' ;;
-            s) warp_manage setup || echo "准备依赖未完成，请参照上方提示。" ;;
-            i) warp_manage setup --managed-core || echo "独立内核准备未完成，请参照上方提示。" ;;
-            n|r)
-                if [[ "${choice,,}" == n ]]; then
+            11|12)
+                if [[ "$choice" == 11 ]]; then
                     read -rp "迁移系统 DNS 到本机存根，会短暂重启解析服务。确认？[y/N] " confirm || return 0
                     if [[ "${confirm,,}" == y ]]; then
                         warp_manage dns-switch || echo "DNS 迁移未完成，请参照上方提示。"
@@ -4620,26 +4614,14 @@ warp_menu() {
                     fi
                 fi
                 ;;
-            e)
+            13)
                 read -rp "输入服务器上的 WireGuard .conf 路径；已有配置直接回车自动查找： " profile || return 0
-                warp_manage enable "$profile" || echo "启用未完成，可选择 p 查看启用条件。"
-                ;;
-            c) warp_manage check || true ;;
-            d)
-                read -rp '关闭后所有节点的目标域名都将回到原有出口。确认关闭？[y/N] ' confirm || return 0
-                if [[ "${confirm,,}" == y ]]; then warp_manage disable || echo "关闭未完成，请参照上方提示。"
-                else echo '已取消关闭。'; fi ;;
-            m) warp_domains_menu; continue ;;
-            g)
-                warp_manage gemini-family || true
-                echo '通常选 auto。若 c 检测到只有一个入口地区合适，输入对应的 ipv4 或 ipv6。'
-                read -rp '输入 auto、ipv4 或 ipv6（更改需要短暂重启 WARP，回车返回）: ' profile || return 0
-                if [[ -n "$profile" ]]; then warp_manage gemini-family "$profile" || true; fi
+                warp_manage enable "$profile" || echo "启用未完成，可选择 6 查看启用条件。"
                 ;;
             0|"") return 0 ;;
-            *) echo "选项无效，请重新选择。" ;;
+            *) echo "请输入 B 区的 1–13，或输入 0 返回首页。" ;;
         esac
-        panel_pause 'WARP 菜单' || return 0
+        panel_pause 'B 区' || return 0
     done
 }
 
@@ -4678,37 +4660,30 @@ show_menu() {
         fi
 
         panel_clear
-        echo -e "       ${C_SPARK}✧${C_RESET}                                      ${C_SPARK}✦${C_RESET}"
-        echo -e "  ${C_ORANGE_BOLD}█▀▀█ █  █ █▀▀▄ █▀▀▀${C_RESET}   ${C_GRAY_LIGHT}█  █ █  █ █▀▀█${C_RESET}"
-        echo -e "  ${C_ORANGE_BOLD}█▀▀▄ █  █ █  █ ▀▀▀█${C_RESET}   ${C_GRAY_LIGHT}█▀▀█ ▀██▀   ▄▀${C_RESET}"
-        echo -e "  ${C_ORANGE_BOLD}█  █ █  █ █  █    █${C_RESET}   ${C_GRAY_LIGHT}█  █   █  ▄▀  ${C_RESET}"
-        echo -e "  ${C_ORANGE_BOLD}▀▀▀▀ ▀▀▀▀ ▀▀▀  ▀▀▀▀${C_RESET}   ${C_GRAY_LIGHT}▀  ▀   ▀  ▀▀▀▀${C_RESET}"
-        echo -e "  ${C_GRAY_MID}Hysteria 2 High-Performance Protocol Suite${C_RESET}  ${C_CYAN}v${SCRIPT_VERSION}${C_RESET}\n"
-
+        printf '%bBUDS HY2%b  v%s\n' "$C_ORANGE_BOLD" "$C_RESET" "$SCRIPT_VERSION"
         echo -e "  ${C_BAR}  ${C_WHITE}主节点状态${C_RESET}  ${status_badge}    ${C_WHITE}监听端口${C_RESET}  ${C_CYAN}${listen}${C_RESET}"
         echo -e "  ${C_BAR}  ${C_GRAY_MID}解析域名${C_RESET}  ${C_GRAY_LIGHT}${domain}${C_RESET}    ${C_GRAY_MID}协议混淆${C_RESET}  ${C_AMBER}Salamander${C_RESET}"
         if [[ "$has_update" == "true" ]]; then
-            echo -e "  ${C_BAR}  ${C_SPARK}✦ 发现脚本新版本  v${remote_ver} (当前: v${SCRIPT_VERSION})  ▶ 输入 8 或 u 即可一键更新${C_RESET}"
+            echo -e "  ${C_BAR}  ${C_SPARK}✦ 发现脚本新版本  v${remote_ver} (当前: v${SCRIPT_VERSION})  ▶ 输入 U 即可更新${C_RESET}"
         fi
-        echo ""
-
-        printf '%s\n' '12. 节点管理    查看、新增、修改主节点或附加节点' \
-            '11. WARP 分流   引导启用、管理域名、检测出口'
-        printf '\n%s\n' '8. 更新脚本     0. 退出'
-        read -rp '请选择入口（12 / 11 / 8 / 0）：' choice || return 0
-        case "$choice" in
-            8|[uU]|update)
+        printf '\n%bA 节点管理%b\n' "$C_ORANGE_BOLD" "$C_RESET"
+        nodes_options
+        printf '\n%bB WARP 分流管理%b\n' "$C_ORANGE_BOLD" "$C_RESET"
+        warp_options
+        printf '\n%s\n' 'U. 更新脚本    0. 退出'
+        read -rp '先选区域 A 或 B，再输入操作编号（U 更新，0 退出）：' choice || return 0
+        case "${choice^^}" in
+            A) nodes_menu; continue ;;
+            B) warp_menu; continue ;;
+            U)
                 if update_script && [[ -x "$BUDS_CLI" ]]; then
-                    panel_pause '主菜单' || return 0
+                    panel_pause '首页' || return 0
                     exec "$BUDS_CLI" hy2
-                fi
-                ;;
-            11) warp_menu; continue ;;
-            12) nodes_menu; continue ;;
-            0) exit 0 ;;
-            *) echo "输入无效，请重新选择。" ;;
+                fi ;;
+            0) return 0 ;;
+            *) echo '请先输入 A 或 B 进入对应区域，再输入该区的编号。' ;;
         esac
-        panel_pause '主菜单' || return 0
+        panel_pause '首页' || return 0
     done
 }
 

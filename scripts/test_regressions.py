@@ -80,90 +80,84 @@ sleep() {{ :; }}
         return (self.directory / "actions").read_text(encoding="utf-8")
 
     def test_nodes_menu_dispatches_all_actions_and_requires_matching_delete_confirmation(self):
-        result = self.shell(r'''nodes_manage() {
-    printf '%s\n' "$*" >> "$ACTION_FILE"
-    case "$1" in
-        list) echo '节点列表结果' ;;
-        names) printf '%s\n' alpha beta ;;
-        detail) echo "节点 $2 的资料" ;;
-        quick-add) if [[ "$2" == taken ]]; then return 3; fi; [[ "$2" != failed ]] ;;
-    esac
+        edits = [
+            ("1\nproxy.example.org\ny", "--domain proxy.example.org"),
+            ("2\n3443:3474\ny", "--ports 3443:3474"),
+            ("3\nsame\ny", "--public-ports same"),
+            ("4\ny", "--auth random --obfs random"),
+            ("5\n1", "--auth custom"), ("5\n2", "--obfs custom"),
+            ("5\n3\ny", "--auth random"), ("5\n4\ny", "--obfs random"),
+            ("6\nhttps://example.org/\ny", "--masquerade https://example.org/"),
+            ("7\nself\ny", "--tls self"),
+        ]
+        entries = ["1", "2\nfailed", "2\ntaken\nwork",
+                   "3\n999\n1", "4\n2", "5\n2", "6\n2", "7\n2", "8\n2\ny", "9\n2\ny",
+                   "10\n2\n" + "\n\n".join(keys for keys, _ in edits) + "\n\n0",
+                   "11\n1\nwrong", "11\n1\nwork", "12", "13", "14", "0"]
+        # Each completed action pauses exactly once. Leaving the edit screen returns directly.
+        keys = "\n\n".join(entries[:10]) + "\n\n" + entries[10] + "\n" + "\n\n".join(entries[11:])
+        out = self.shell(r'''nodes_manage() {
+  echo "$*" >> "$ACTION_FILE"
+  case "$1" in
+    list) echo '节点列表结果' ;;
+    names) printf '%s\n' main work ;;
+    quick-add) case "$2" in taken) return 3 ;; failed) return 1 ;; esac ;;
+  esac
 }
+renew_test() { echo renew >> "$ACTION_FILE"; }
+log() { echo live >> "$ACTION_FILE"; }
+uninstall() { echo uninstall >> "$ACTION_FILE"; return 1; }
 panel_clear() { echo '<刷新>'; }
-panel_pause() { echo "按回车返回$1…"; IFS= read -r ignored; }
+panel_pause() { echo "按回车返回$1"; read -r ignored; }
 nodes_menu <<'INPUT'
+''' + keys + "\nINPUT\n")
+        self.assertIn("节点列表结果\n按回车返回A 区\n<刷新>", out)
+        self.assertIn("新增未完成", out)
+        self.assertIn("已取消删除", out)
+        self.assertIn("请从列表中选择一个节点编号", out)
+        self.assertEqual([a for a in self.actions().splitlines() if a not in ("names", "detail work", "port-guide work")], [
+            "list", "quick-add failed", "quick-add taken", "quick-add work", "link work",
+            "link main", "client work", "status work", "log work", "start work", "stop work", "restart work",
+            *["edit work " + args for _, args in edits],
+            "delete work --yes", "renew", "live", "uninstall",
+        ])
+
+    def test_home_lists_both_sections_and_requires_a_letter_before_dispatch(self):
+        output = self.shell(r'''check_remote_version() { echo "$SCRIPT_VERSION"; }
+nodes_menu() { echo A >> "$ACTION_FILE"; }
+warp_menu() { echo B >> "$ACTION_FILE"; }
+update_script() { echo U >> "$ACTION_FILE"; return 1; }
+show_menu <<'INPUT'
 1
-
-2
-failed
-
-2
-taken
-alpha
-
-3
-999
-1
-1
-
-2
-
-3
-
-4
-
-5
-
-6
-y
-
-7
-y
-
+11
+12
 8
-1
-proxy.example.org
-y
-
-2
-3443:3474
-y
-
-3
-same
-y
-
-4
-y
-
-5
-2
-
-6
-self
-y
-
-0
-9
-wrong-name
-
-9
-alpha
-
+a
+B
+A
+b
+u
 0
 INPUT
 ''')
-        self.assertIn("新增未完成", result)
-        self.assertIn("已取消删除", result)
-        self.assertIn("请从列表中选择一个节点编号", result)
-        self.assertIn("节点列表结果\n按回车返回多节点管理…\n<刷新>", result)
-        actions = self.actions().splitlines()
-        self.assertEqual(actions[:6], ["list", "quick-add failed", "quick-add taken", "quick-add alpha", "link alpha", "names"])
-        self.assertEqual([action for action in actions[6:] if not action.startswith("detail ") and not action.startswith("port-guide ")], [
-            "link alpha", "client alpha", "status alpha", "log alpha", "start alpha", "stop alpha", "restart alpha",
-            "edit alpha --domain proxy.example.org", "edit alpha --ports 3443:3474", "edit alpha --public-ports same",
-            "edit alpha --auth random --obfs random", "edit alpha --obfs custom", "edit alpha --tls self", "delete alpha --yes",
-        ])
+        self.assertEqual(self.actions().splitlines(), ["A", "B", "A", "B", "U"])
+        self.assertEqual(output.count("请先输入 A 或 B"), 4)
+        nodes = output.split("A 节点管理", 1)[1].split("B WARP 分流管理", 1)[0]
+        warp = output.split("B WARP 分流管理", 1)[1].split("U. 更新脚本", 1)[0]
+        for menu, n in ((nodes, 14), (warp, 13)):
+            self.assertEqual(list(map(int, re.findall(r"\b(\d+)\. ", menu))), list(range(1, n + 1)))
+
+    def test_update_success_reopens_installed_cli_and_confirmed_uninstall_exits(self):
+        self.shell(r'''check_remote_version() { echo "$SCRIPT_VERSION"; }
+update_script() { echo updated >> "$ACTION_FILE"; }
+mkdir -p "$(dirname "$BUDS_CLI")"
+printf '#!/usr/bin/env bash\necho "reopen $1" >> "%s"\n' "$ACTION_FILE" > "$BUDS_CLI"
+chmod +x "$BUDS_CLI"
+show_menu <<< U
+''')
+        self.assertEqual(self.actions().splitlines(), ["updated", "reopen hy2"])
+        self.shell("uninstall() { echo removed >> \"$ACTION_FILE\"; }\nnodes_menu <<< 14\necho unexpected >> \"$ACTION_FILE\"\n")
+        self.assertEqual(self.actions().splitlines(), ["removed"])
 
     def node_manager(self, primary_public="443"):
         source = (ROOT / "buds").read_text(encoding="utf-8")
@@ -264,9 +258,8 @@ nodes_manage() {
     case "$1" in names) printf '%s\\n' main work ;; port-guide) echo '本机可选范围' ;; esac
 }
 nodes_menu <<'INPUT'
-3
+10
 1
-8
 2
 auto:32
 n
@@ -483,38 +476,70 @@ warp_trace
 """)
 
     def test_warp_menu_keeps_options_available_after_cancellation_and_failure(self):
-        output = self.shell(r"""
+        output = self.shell(r'''
 systemctl() { return 1; }
 warp_manage() {
     printf '%s\n' "$*" >> "$ACTION_FILE"
-    if [[ "$1" == check ]]; then return 1; fi
+    [[ "$1" != check ]]
 }
 warp_menu_begin() { echo wizard >> "$ACTION_FILE"; }
-warp_domains_menu() { echo domains-menu >> "$ACTION_FILE"; }
 warp_menu <<'INPUT'
-c
-p
-s
-i
+1
+2
+3
+1
+2
+example.org one.test
+3
+example.org
+4
+one.test
+two.test
+5
+/tmp/example
 n
-n
-n
+5
+/tmp/example
 y
-e
+6
+n
+6
+y
+0
+4
+ipv6
+5
+n
+5
+y
+6
+7
+8
+9
+10
+11
+n
+11
+y
+12
+n
+12
+y
+13
 
-d
-y
-r
-y
-m
-a
 0
 INPUT
-""")
+''')
         self.assertIn("已取消 DNS 迁移", output)
-        self.assertEqual(self.actions().splitlines(),
-                         ["check", "doctor", "setup", "setup --managed-core", "dns-switch",
-                          "enable ", "disable", "dns-restore", "domains-menu", "wizard"])
+        self.assertIn("已取消关闭", output)
+        self.assertIn("已取消 DNS 恢复", output)
+        self.assertEqual(self.actions().splitlines(), [
+            "wizard", "check", "domains list", "domains add example.org one.test",
+            "domains remove example.org", "domains replace one.test two.test",
+            "domains import /tmp/example", "domains reset", "gemini-family", "gemini-family ipv6",
+            "disable", "doctor", "status", "setup", "setup --managed-core", "setup --new-profile",
+            "dns-switch", "dns-restore", "enable ",
+        ])
 
     def test_warp_wizard_reverts_only_dns_it_changed_for_this_attempt(self):
         self.shell(r"""
