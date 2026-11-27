@@ -146,7 +146,7 @@ INPUT
         self.assertEqual(output.count("请先输入 A 或 B"), 4)
         nodes = output.split("A 节点管理", 1)[1].split("B WARP 分流管理", 1)[0]
         warp = output.split("B WARP 分流管理", 1)[1].split("U. 更新脚本", 1)[0]
-        for menu, n in ((nodes, 14), (warp, 13)):
+        for menu, n in ((nodes, 14), (warp, 14)):
             self.assertEqual(list(map(int, re.findall(r"\b(\d+)\. ", menu))), list(range(1, n + 1)))
 
     def test_panel_logo_and_numbered_grid_at_different_widths(self):
@@ -239,7 +239,8 @@ show_menu <<< U
         def run(*args, **kwargs):
             changes.append(args)
             return SimpleNamespace(stdout="argv[]=/usr/local/bin/hysteria server --config " + str(server) + " ;")
-        manager.update(run=run, active=lambda _: True, check_hopping=lambda _: None,
+        manager["listeners"] = lambda: []
+        manager.update(sync_reserved_ports=lambda **kwargs: changes.append(("reserve", kwargs)), run=run, active=lambda _: True, check_hopping=lambda _: None,
                        port_conflicts=lambda _: ([((45000, 45031), "其他节点")], []),
                        primary_firewall=lambda *args: changes.append((args[0], args[-1])))
         args = SimpleNamespace(tls=None, domain=None, masquerade=None, ports="45000", public_ports=None, auth="random", obfs="random")
@@ -258,12 +259,14 @@ show_menu <<< U
             self.assertEqual(before, [p.read_bytes() for p in (server, client, unit)])
             self.assertFalse((self.config / ".public_port").exists())
             self.assertIn(("start", "443"), changes)
+            self.assertLess(changes.index(("reserve", {"extra": "41000-41031"})), changes.index(("open", "41000-41031")))
             changes.clear()
             manager["active"] = lambda _: False
             with redirect_stdout(StringIO()):
                 manager["edit_primary"](args)
             self.assertNotIn(("start", "41000-41031"), changes)
             self.assertIn('"CAP_NET_ADMIN"', json.dumps(unit.read_text().split("=")[-1].split()))
+            self.assertIn(("reserve", {"primary": "41000-41031"}), changes)
             self.assertIn('# keep local policy\nacl:', server.read_text())
             self.assertIn('server: "proxy.example.com:41000-41031"', client.read_text())
             self.assertNotIn('test-password', client.read_text())
@@ -557,6 +560,10 @@ n
 y
 13
 
+14
+n
+14
+y
 0
 INPUT
 ''')
@@ -568,7 +575,7 @@ INPUT
             "domains remove example.org", "domains replace one.test two.test",
             "domains import /tmp/example", "domains reset", "gemini-family", "gemini-family ipv6",
             "disable", "doctor", "status", "setup", "setup --managed-core", "setup --new-profile",
-            "dns-switch", "dns-restore", "enable ",
+            "dns-switch", "dns-restore", "enable ", "repair",
         ])
 
     def test_warp_wizard_reverts_only_dns_it_changed_for_this_attempt(self):
@@ -650,6 +657,7 @@ if warp_tunnel_probe; then exit 9; fi
         mkdir -p "$SANDBOX/watch" && cd "$SANDBOX/watch"
         echo google.com > domains
         printf '%s\n' '{"route":{"rules":[{"ip_cidr":"198.18.240.3/32"}]}}' > config.json
+        warp_target_check() { :; }
         warp_healthcheck_file > healthcheck
         export -f sleep
         export ACTION_FILE
@@ -657,20 +665,25 @@ if warp_tunnel_probe; then exit 9; fi
         export -f flock
         systemctl() {
             echo "$*" >> "$ACTION_FILE"
+            if [[ "$1" == show ]]; then echo unique; return; fi
             [[ "$1" == is-active && "$2" == buds-warp-split.service ]] || return 0
             echo "$WATCH_STATE"
         }
         export -f systemctl
         export WATCH_STATE
         WATCH_STATE=active
-        curl() { return 1; }
+        curl() { [[ " $* " == *" one.one.one.one:443:1.1.1.1 "* ]]; }
         export -f curl
+        if bash healthcheck; then exit 9; fi
+        if grep -q restart "$ACTION_FILE"; then exit 9; fi
+        echo "unique $(( $(date +%s) - 300 ))" > "$SANDBOX/run/buds-warp-watch.failure"
         bash healthcheck
         [[ $(grep -c 'restart buds-warp-split.service' "$ACTION_FILE") == 1 ]]
         : > "$ACTION_FILE"
         WATCH_STATE=active
         curl() { printf '%s\n' 'warp=off'; }
         export -f curl
+        echo "unique $(( $(date +%s) - 300 ))" > "$SANDBOX/run/buds-warp-watch.failure"
         if bash healthcheck 2>/dev/null; then :; fi
         [[ $(grep -c 'restart buds-warp-split.service' "$ACTION_FILE") == 1 ]]
         : > "$ACTION_FILE"
@@ -679,6 +692,21 @@ if warp_tunnel_probe; then exit 9; fi
         export -f curl
         bash healthcheck
         [[ "$(<"$ACTION_FILE")" == "is-active buds-warp-split.service" ]]
+        : > "$ACTION_FILE"
+        WATCH_STATE=active
+        curl() { [[ " $* " == *' https://www.google.com/generate_204 '* ]] && echo '204 198.18.248.5'; }
+        export -f curl
+        bash healthcheck
+        if grep -q restart "$ACTION_FILE"; then exit 9; fi
+        : > "$ACTION_FILE"
+        curl() { return 1; }
+        export -f curl
+        if bash healthcheck; then exit 9; fi
+        if grep -q restart "$ACTION_FILE"; then exit 9; fi
+        : > "$ACTION_FILE"
+        WATCH_STATE=activating
+        bash healthcheck
+        if grep -Eq '^(reset-failed|start|restart) ' "$ACTION_FILE"; then exit 9; fi
         : > "$ACTION_FILE"
         WATCH_STATE=failed
         systemctl() {
@@ -696,10 +724,10 @@ if warp_tunnel_probe; then exit 9; fi
         systemctl() {
             echo "$*" >> "$ACTION_FILE"
             [[ "$1" == is-active ]] && { echo "$WATCH_STATE"; return 0; }
-            [[ "$1" == reset-failed ]] || return 1
+            [[ "$1" == reset-failed || "$1" == is-enabled ]] || return 1
         }
         export -f systemctl
-        bash healthcheck
+        if bash healthcheck; then exit 9; fi
         [[ -s "$ACTION_FILE" ]]
         : > "$ACTION_FILE"
         flock() { return 1; }
@@ -755,7 +783,7 @@ if warp_tunnel_probe; then exit 9; fi
         grep -q -- "disable --now .*$WARP_TIMER" "$ACTION_FILE"
         """)
 
-    def test_warp_check_brings_an_old_install_up_to_date_without_reenabling(self):
+    def test_warp_repair_brings_an_old_install_up_to_date_without_reenabling(self):
         python = shlex.quote(Path(sys.executable).as_posix())
         self.shell(f'python3() {{ {python} -X utf8 "$@"; }}\n' + r"""
         mkdir -p "$WARP_DIR" "$SANDBOX/bin" "$SANDBOX/etc/systemd/system"
@@ -778,12 +806,17 @@ if warp_tunnel_probe; then exit 9; fi
         has_systemd() { :; }
         flock() { :; }
         PROBES=0
-        warp_tunnel_probe() { PROBES=$((PROBES+1)); (( PROBES > 1 )); }
+        warp_tunnel_probe() { PROBES=$((PROBES+1)); (( PROBES > 2 )); }
         warp_verify() { :; }
         warp_trace() { :; }
         warp_gemini_check() { :; }
+        warp_target_check() { :; }
+        if warp_manage check; then exit 9; fi
+        [[ ! -e "$WARP_DIR/healthcheck" ]]
+        if grep -Eq '^(start|restart|enable|daemon-reload|reset-failed) ' "$ACTION_FILE"; then exit 9; fi
+        PROBES=0
         # 旧安装：缺少 healthcheck、link-up 无探测、隧道不通 → 升级、重启一次、再验证通过。
-        warp_manage check
+        warp_manage repair
         [[ -x "$WARP_DIR/healthcheck" ]]
         grep -q 'cdn-cgi/trace' "$WARP_DIR/link-up"
         [[ -e "$WARP_DIR/$WARP_TIMER" ]]
@@ -791,10 +824,11 @@ if warp_tunnel_probe; then exit 9; fi
         grep -Fxq "start $WARP_TIMER" "$ACTION_FILE"
         [[ $(grep -c 'restart buds-warp-split.service' "$ACTION_FILE") == 1 ]]
         if grep -qE ' (stop|disable) ' "$ACTION_FILE"; then exit 9; fi
+        ln -f "$WARP_DIR/$WARP_UNIT" "$SANDBOX/etc/systemd/system/$WARP_UNIT"
         # 隧道持续不通：报告失败而不是伪装成功。
         : > "$ACTION_FILE"
         warp_tunnel_probe() { return 1; }
-        if warp_manage check 2>/dev/null; then exit 9; fi
+        if warp_manage repair 2>/dev/null; then exit 9; fi
         [[ $(grep -c 'restart buds-warp-split.service' "$ACTION_FILE") == 1 ]]
         # 服务未运行（如重启限额停住）：清除状态并启动，不做重启。
         : > "$ACTION_FILE"
@@ -806,7 +840,7 @@ if warp_tunnel_probe; then exit 9; fi
             esac
         }
         warp_tunnel_probe() { :; }
-        warp_manage check
+        warp_manage repair
         grep -Fxq 'reset-failed buds-warp-split.service' "$ACTION_FILE"
         grep -Fxq 'start buds-warp-split.service' "$ACTION_FILE"
         if grep -q 'restart buds-warp-split.service' "$ACTION_FILE"; then exit 9; fi
@@ -817,38 +851,94 @@ if warp_tunnel_probe; then exit 9; fi
         sync = manager["sync_reserved_ports"]
         target = self.directory / "sysctl.d/99-buds-hy2-reserved-ports.conf"
         manager["SYSCTL_FILE"] = target
-        calls = []
-        state = {"current": "50000-50010\n"}
-        def run(*args, **_):
-            calls.append(args)
-            return SimpleNamespace(returncode=0, stdout=state["current"])
+        other = self.directory / "site.conf"
+        manager["external_reservation_files"] = lambda: [other] if other.exists() else []
+        state = {"current": "40000,50000-50010", "writable": True}
+        writes = []
+        def run(*args):
+            if args[-1] == "net.ipv4.ip_local_port_range":
+                return SimpleNamespace(stdout="32768 60999")
+            if args[1] == "-n":
+                return SimpleNamespace(stdout=state["current"])
+            if not state["writable"]:
+                raise ValueError("read only")
+            state["current"] = args[-1].split("=")[1]
+            writes.append(state["current"])
         manager["run"] = run
-        (self.config / "config.yaml").write_text("listen: :28965-49652\n", encoding="utf-8")
-        node = self.config / "nodes/work"
-        node.mkdir(parents=True)
-        node.joinpath("node.json").write_text(json.dumps({
-            "name": "work", "ports": "40000-40031", "public_ports": "40000-40031",
-            "domain": "node.example.com", "tls": "shared"}), encoding="utf-8")
-        line = "net.ipv4.ip_local_reserved_ports = "
-        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
-            # 主节点范围吸收了节点范围，文件只记录本项目范围；运行值保留其他工具设置的 50000-50010。
-            manager["PRIMARY_LISTEN"] = "28965-49652"
+        (self.config / "config.yaml").touch()
+        manager["PRIMARY_LISTEN"] = "28965-49652"
+        with patch.object(os, "fchown", create=True), patch.object(os, "fchmod", create=True), redirect_stdout(StringIO()):
             sync()
-            self.assertIn(line + "28965-49652", target.read_text(encoding="utf-8"))
-            self.assertIn(("sysctl", "-q", "-w", "net.ipv4.ip_local_reserved_ports=28965-49652,50000-50010"), calls)
-            # 跳跃改为单端口：本项目范围从运行值和文件中收回，外来范围仍在。
-            manager["PRIMARY_LISTEN"] = "24443"
-            node.joinpath("node.json").write_text(json.dumps({
-                "name": "work", "ports": "24443", "public_ports": "24443",
-                "domain": "node.example.com", "tls": "shared"}), encoding="utf-8")
-            state["current"] = "28965-49652,50000-50010\n"
+            self.assertEqual(state["current"], "28965-49652,50000-50010")
+            self.assertIn("# owned: 28965-39999,40001-49652", target.read_text())
+            self.assertIn(" = 28965-49652,50000-50010", target.read_text())
             sync()
-            self.assertIn(("sysctl", "-q", "-w", "net.ipv4.ip_local_reserved_ports=50000-50010"), calls)
-            # 外来范围已被其所属工具取消：运行值清空，文件保持移除。
-            state["current"] = "\n"
+            self.assertEqual(len(writes), 1)
+            with self.assertRaisesRegex(ValueError, "耗尽"):
+                sync(extra="30000-62000")
+            state["writable"] = False
+            with self.assertRaisesRegex(ValueError, "read only"):
+                sync(primary="24443")
+            self.assertIn("28965", target.read_text())
+            state["writable"] = True
+            sync(primary="24443")
+            self.assertEqual(state["current"], "40000,50000-50010")
+            self.assertFalse(target.exists())
+            other.write_text("net.ipv4.ip_local_reserved_ports = 443,444")
+            with self.assertRaisesRegex(ValueError, "site.conf"):
+                sync()
+            self.assertFalse(target.exists())
+            state["current"] = "28965-49652"
+            other.write_text("net.ipv4.ip_local_reserved_ports = 28965-49652")
             sync()
-        self.assertFalse(target.exists())
-        self.assertEqual(calls[-1], ("sysctl", "-q", "-w", "net.ipv4.ip_local_reserved_ports="))
+            self.assertFalse(target.exists())
+
+    def test_fallback_changes_only_runtime_port_for_default_cloudflare_peer(self):
+        self.shell('cd "$SANDBOX"; warp_policy_tool > policy.py')
+        script = self.directory / "policy.py"
+        def invoke(action):
+            subprocess.run([sys.executable, "-I", script, action], cwd=self.directory,
+                           check=True, capture_output=True)
+        peer = {"address": "162.159.192.1", "public_key": "fixture", "port": 2408}
+        runtime = self.directory / "config.json"
+        template = self.directory / "base.json"
+        def config():
+            return json.dumps({"endpoints": [{"tag": "warp", "peers": [peer]}]})
+        template.write_text(config())
+        runtime.write_text(config())
+        for port in (500, 1701, 4500, 2408):
+            invoke("next-port")
+            runtime.write_text(template.read_text())
+            invoke("apply-port")
+            self.assertEqual(json.loads(runtime.read_text())["endpoints"][0]["peers"][0]["port"], port)
+        self.assertEqual(template.read_text(), config())
+        invoke("next-port")
+        for field, value in (("address", "192.0.2.1"), ("port", 51820), ("public_key", "new")):
+            previous = peer[field]
+            peer[field] = value
+            template.write_text(config())
+            runtime.write_text(config())
+            invoke("apply-port")
+            self.assertEqual(runtime.read_text(), config())
+            peer[field] = previous
+
+    def test_target_check_reports_partial_family_and_wrong_http_code(self):
+        result = self.shell(r"""
+warp_domain_selected() { [[ "$1" == www.google.com ]]; }
+python3() { cat >/dev/null; printf '%s\n' '4 198.18.248.2' '6 fd42:6275:6473:1::2'; }
+curl() {
+    echo "$*" >> "$ACTION_FILE"
+    case " $* " in
+        *' www.google.com:443:198.18.248.2 '*) echo 204 ;;
+        *' www.google.com:443:[fd42:6275:6473:1::2] '*) echo 302 ;;
+        *) return 77 ;;
+    esac
+}
+if warp_target_check 2>&1; then exit 9; fi
+""")
+        self.assertIn("IPv4 HTTPS 204", result)
+        self.assertIn("IPv6 业务探测失败", result)
+        self.assertEqual(len(self.actions().splitlines()), 2)
 
     def test_warp_partial_install_cleanup_is_retryable(self):
         self.shell("""
@@ -1961,8 +2051,9 @@ IS_NAT=false; IS_CONTAINER=false
 collect_parameters <<'INPUT'
 node.example.com
 20000-20010
+21000-21010
 INPUT
-[[ "$LISTEN_STR" == :20000-20010 ]]
+[[ "$LISTEN_STR" == :21000-21010 ]]
 """, "install.sh")
         self.assertIn("20005", output)
 

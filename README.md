@@ -20,7 +20,7 @@ install -m 0644 -o root -g root update.pub /etc/buds-hy2/update.pub
 ```bash
 (
   set -e
-  version=1.5.2
+  version=1.7.4
   base="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates/releases/$version"
   work=$(mktemp -d)
   trap 'rm -rf -- "$work"' EXIT
@@ -142,9 +142,15 @@ buds hy2 warp domains reset                        # 用内置 Google 清单替�
 
 一条规则匹配该域名及其所有子域名。例如，把`google.com`改成`scholar.google.com`后，谷歌学术仍走WARP，`www.google.com`恢复原出口。若清单内还保留父域名，删除单个子域名条目后仍会匹配父域名。一个服务可能使用多个独立域名，例如YouTube的视频请求还会访问`googlevideo.com`。
 
-服务启动后脚本会实际探测WARP出口；握手在约一分钟内未完成时，服务判定启动失败并由systemd重启，换新会话重新握手。`buds-warp-watch.timer`每五分钟复查一次：进程在运行但隧道不通时重启分流服务，服务因重启限额停住时清除状态并拉起。表现为此前服务状态为`active`、HY2客户端能连上但清单内域名超时或测速失败。排查用`journalctl -u buds-warp-split -u buds-warp-watch`；`buds hy2 warp check`会补齐旧版安装缺少的探测、保活和看门狗，并在隧道不通时重启分流服务后重新验证。wgcf配置未指定保活时默认使用25秒保活。
+**日常检测**用B区第2项或`buds hy2 warp check`。它检查内核选路和WARP出口，并对清单覆盖的Google、YouTube逐个测试系统返回的IPv4、IPv6虚拟地址。每个HTTPS探测须返回204。检测失败会显示出错的域名和地址族，检查过程不会重启服务。客户端仍需从实际节点复测。
 
-端口跳跃会把发往整个范围的入站UDP重定向到基准端口。本机任何进程若随机拿到该范围内的源端口，其UDP回包都会被劫持，典型现象是WARP握手、DNS查询间歇性超时。脚本因此在`/etc/sysctl.d/99-buds-hy2-reserved-ports.conf`保留所有节点的跳跃范围，让内核不再把它们用作源端口；新增、修改、删除节点时自动更新，`buds hy2 nodes reserve-ports`可手动重算，卸载时清理。
+**已有服务器升级**时先执行`buds hy2 update`，再运行`buds hy2 nodes reserve-ports`。已启用托管WARP的机器可以执行`buds hy2 warp refresh`，刷新下次启动和巡检使用的文件，当前进程和会话继续运行。早于1.7.3且还没有看门狗单元的安装，可在维护时段使用B区第14项或`buds hy2 warp repair`补齐单元并修复分流，必要时会重启WARP。
+
+**自动恢复**由`buds-warp-watch.timer`每五分钟执行。出口探针正常但Google或YouTube某个地址族异常时，巡检记录失败并保留会话。探针两次失败后会核对已选业务和原生网络；同一WARP会话跨两轮都满足重启条件时才尝试重连。启动阶段有独立的握手探测。对使用默认UDP 2408的Cloudflare入口，启动探测持续失败后，下次启动会尝试同一地址的500、1701、4500，依次循环。原始WireGuard配置继续保留。上游或线路持续不可用时，备用端口也可能失败。[Cloudflare入口及端口说明](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/deployment/firewall/)
+
+**端口跳跃**会在Linux上安装UDP重定向规则。新装和改端口时先保留跳跃范围，再启用规则，旧范围在切换成功后回收。若范围中已有其他UDP套接字、内核拒绝保留，或新范围会过度挤占临时端口，操作会停止并提示换用较小范围或单端口。脚本记录自己新增的保留范围，遇到其他工具持久管理同一内核参数时会提示核对。保留范围只影响后续自动分配的端口。[Linux源端口参数说明](https://docs.kernel.org/networking/ip-sysctl.html)
+
+查看本次开机的启动和巡检记录可用`journalctl -b -u buds-warp-split -u buds-warp-watch --no-pager -n 80`。内核维护前后各执行一次B区第2项，再用实际客户端各访问一个分流网站和一个原生出口网站。
 
 批量导入时可每行写一个域名，支持空行和`#`注释，空文件表示清空。脚本统一大小写并去重。可先用`buds hy2 warp domains list > /root/my-domains.txt`导出、编辑，再导入。配置保存在`/etc/buds-hy2/warp-domains`，关闭分流、重启和升级CLI后继续保留。在线修改会重启专用WARP服务，已有WARP连接需要重连；新规则启动失败时脚本会尝试恢复原清单和服务。
 
@@ -163,7 +169,7 @@ buds hy2 warp domains reset                        # 用内置 Google 清单替�
 ```bash
 (
   set -e
-  version=1.5.2
+  version=1.7.4
   base="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates/releases/$version"
   work=$(mktemp -d /usr/local/bin/.buds_upgrade.XXXXXX)
   trap 'rm -rf -- "$work"' EXIT

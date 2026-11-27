@@ -4,7 +4,7 @@ set -e
 CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
-SCRIPT_VERSION="1.7.3"
+SCRIPT_VERSION="1.7.4"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 UPDATE_REPO_URL="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates"
@@ -1252,6 +1252,43 @@ def resolve_endpoints(path):
                 raise ValueError(f"WireGuard 端点没有可用的原有网络路由：{host}")
     atomic(path, json.dumps(cfg))
 
+def fallback_port(action):
+    # 仅对 Cloudflare 默认 WireGuard 入口使用备用端口。用户指定的自定义端口优先。
+    path = Path("config.json")
+    if action == "apply-port" and not Path("fallback-port").is_file():
+        return
+    runtime = json.loads(path.read_text())
+    template = json.loads(Path("base.json").read_text())
+    ports = (2408, 500, 1701, 4500)
+    state = Path("fallback-port")
+    if len(runtime.get("endpoints", [])) != 1 or len(template.get("endpoints", [])) != 1:
+        return
+    endpoint = runtime["endpoints"][0]
+    if len(endpoint["peers"]) != 1 or endpoint.get("tag") != "warp":
+        return
+    peer = endpoint["peers"][0]
+    original = template["endpoints"][0]["peers"][0]
+    if original["port"] != ports[0]:
+        return
+    ip = ip_address(peer["address"])
+    networks = ("162.159.192.0/24", "162.159.193.0/24", "2606:4700:100::/48")
+    if not any(ip in ip_network(net) for net in networks):
+        return
+    identity = [original["address"], original["public_key"]]
+    if action == "next-port":
+        if peer["port"] in ports:
+            port = ports[(ports.index(peer["port"]) + 1) % len(ports)]
+            atomic(state, json.dumps([identity, port]))
+            print(f"下次启动将尝试同一 WARP 入口的 UDP {port}。", file=sys.stderr)
+    elif state.is_file():
+        try:
+            saved, port = json.loads(state.read_text())
+        except (ValueError, TypeError):
+            return
+        if saved == identity and port in ports:
+            peer["port"] = port
+            atomic(path, json.dumps(runtime))
+
 def edit(action, current, args):
     if action == "import" and len(args) == 1:
         return names(args[0])
@@ -1280,6 +1317,8 @@ try:
         render(*args)
     elif action == "check-resolved":
         check_resolved_domains(*args)
+    elif action in ("next-port", "apply-port"):
+        fallback_port(action)
     elif action == "resolve-endpoints":
         resolve_endpoints(*args)
     else:
@@ -1341,7 +1380,7 @@ if changed:
     os.chmod(name, 0o600)
     os.replace(name, path)
 PY
-    warp_sync_units
+    [[ "${1:-}" == files-only ]] || warp_sync_units
 )
 
 warp_edit_domains() (
@@ -1535,10 +1574,27 @@ json.dump({"inbounds": [tun], "endpoints": [warp], "dns": dns, "route": route,
 PY
 }
 
+warp_target_alive() {
+    local host family result
+    for host in www.google.com www.youtube.com; do
+        warp_domain_selected "$host" || continue
+        for family in -4 -6; do
+            if result=$(curl -q --noproxy '*' "$family" -sS --max-time 8 -o /dev/null \
+                    -w '%{http_code} %{remote_ip}' "https://$host/generate_204" 2>/dev/null) &&
+                    [[ "$result" =~ ^204[[:space:]](198\.18\.24[89]\.|198\.18\.25[0-5]\.|fd42:6275:6473:1:) ]]; then
+                echo "Trace 暂时失败，$host 分流连接可用，本轮保留当前会话。" >&2
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
 warp_link_up_file() {
+    printf '#!/usr/bin/env bash\nset -eu\n'
+    declare -f warp_domain_selected warp_target_alive
     cat <<'LINK_UP'
-#!/usr/bin/env bash
-set -eu
+WARP_DIR=$PWD
 [[ -s domains ]] || exit 0
 link=buds-warp0
 for ((i=0; i<100; i++)); do
@@ -1565,32 +1621,44 @@ if grep -Fq '"198.18.240.3/32"' config.json; then
         if curl -q --noproxy '*' --resolve one.one.one.one:443:198.18.240.3 \
                 -fsS --max-time 5 https://one.one.one.one/cdn-cgi/trace 2>/dev/null |
                 tr -d '\r' | grep -Eq '^warp=(on|plus)$'; then
-            exit 0
+            break
         fi
         sleep 2
     done
-    echo "WARP 隧道在启动后约一分钟内未完成握手，本单元判定失败并重启。" >&2
-    exit 1
+    if ((i == 8)); then
+        warp_target_alive && exit 0
+        python3 -I policy.py next-port || true
+        echo "WARP 启动探测超时，下一次启动将重新建立会话。" >&2
+        exit 1
+    fi
 fi
 LINK_UP
 }
 
 warp_healthcheck_file() {
+    printf '#!/usr/bin/env bash\nset -eu\n'
+    declare -f warp_domain_selected warp_target_check warp_target_alive
     cat <<'HEALTHCHECK'
-#!/usr/bin/env bash
-set -eu
+WARP_DIR=$PWD
+stamp=/run/buds-warp-watch.failure
 unit=buds-warp-split.service
 # 与域名编辑共用排他锁；锁被占用说明正在重载，跳过本轮。
 exec 9>/run/buds-warp-split.lock || exit 0
 flock -n 9 || exit 0
 state=$(systemctl is-active "$unit" 2>/dev/null || true)
-if [[ "$state" != active ]]; then
+case "$state" in
+    active|failed) ;;
+    *) exit 0 ;;
+esac
+if [[ "$state" == failed ]]; then
+    systemctl is-enabled --quiet "$unit" || exit 0
     # start-limit-hit 只能先清除再启动；启动过程由 link-up 验证隧道。
     systemctl reset-failed "$unit" 2>/dev/null || true
     if systemctl start "$unit"; then
         echo "分流服务处于 $state，已重新启动。"
     else
         echo "分流服务处于 $state，重新启动失败。" >&2
+        exit 1
     fi
     exit 0
 fi
@@ -1601,13 +1669,34 @@ probe() {
         -fsS --max-time 8 https://one.one.one.one/cdn-cgi/trace 2>/dev/null |
         tr -d '\r' | grep -Eq '^warp=(on|plus)$'
 }
-if probe; then exit 0; fi
+if probe; then rm -f -- "$stamp"; warp_target_check; exit $?; fi
 sleep 5
-if probe; then exit 0; fi
-echo "WARP 隧道连续两次探测失败，重启分流服务以重新握手。" >&2
+if probe; then rm -f -- "$stamp"; warp_target_check; exit $?; fi
+if warp_target_alive; then rm -f -- "$stamp"; exit 0; fi
+# 本机原生网络也故障时，重启 WARP 无法修复底层连接。
+if ! curl -q --noproxy '*' --resolve one.one.one.one:443:1.1.1.1 -fsS --max-time 8 \
+        https://one.one.one.one/cdn-cgi/trace -o /dev/null; then
+    rm -f -- "$stamp"
+    echo "原生网络对照探测也失败，本轮保留当前会话。" >&2
+    exit 1
+fi
+invocation=$(systemctl show -p InvocationID --value "$unit")
+now=$(date +%s)
+previous="" last=0
+if [[ -f "$stamp" ]]; then read -r previous last < "$stamp" || true; fi
+if [[ -z "$invocation" || "$invocation" != "$previous" || ! "$last" =~ ^[0-9]{1,12}$ ]] ||
+        (( now < last || now - last > 900 )); then
+    printf '%s %s\n' "$invocation" "$now" > "$stamp"
+    echo "首次确认分流出口故障，等待下一轮复查。" >&2
+    exit 1
+fi
+(( now - last >= 180 )) || exit 1
+rm -f -- "$stamp"
+python3 -I policy.py next-port || true
+echo "同一会话跨两轮检测失败，原生网络正常，正在恢复 WARP。" >&2
 if ! systemctl restart "$unit"; then
     systemctl reset-failed "$unit" 2>/dev/null || true
-    systemctl start "$unit" || echo "分流服务重启后仍失败，请查看 journalctl -u $unit。" >&2
+    systemctl start "$unit" || { echo "分流服务重启后仍失败，请查看 journalctl -u $unit。" >&2; exit 1; }
 fi
 HEALTHCHECK
 }
@@ -1621,7 +1710,7 @@ Description=Buds WARP domain split routing
 After=network-online.target systemd-resolved.service
 Wants=network-online.target
 Requires=systemd-resolved.service
-StartLimitIntervalSec=300
+StartLimitIntervalSec=600
 StartLimitBurst=5
 
 [Service]
@@ -1668,7 +1757,7 @@ warp_watch_links() {
     local name link
     for name in "$WARP_WATCH" "$WARP_TIMER"; do
         link="/etc/systemd/system/$name"
-        if [[ -e "$link" && ! "$link" -ef "$WARP_DIR/$name" ]]; then
+        if [[ ( -e "$link" || -L "$link" ) && ! "$link" -ef "$WARP_DIR/$name" ]]; then
             echo "$link 已被其他文件占用，请先检查。" >&2
             return 1
         fi
@@ -1681,7 +1770,7 @@ warp_sync_units() (
     [[ -d "$WARP_DIR" && ! -L "$WARP_DIR" && -f "$WARP_DIR/.buds-managed" &&
         "$WARP_DIR/$WARP_UNIT" -ef "/etc/systemd/system/$WARP_UNIT" ]] || return 0
     local binary work file changed=false
-    binary=$(warp_runtime_binary) || return 0
+    binary=$(warp_runtime_binary) || return 1
     umask 077
     work=$(mktemp -d "$WARP_DIR.units.XXXXXX") || return 1
     trap 'rm -rf -- "$work"' EXIT
@@ -1700,9 +1789,8 @@ warp_sync_units() (
         systemctl start "$WARP_TIMER" >/dev/null 2>&1; then
         return 0
     fi
-    systemctl reset-failed "$WARP_WATCH" "$WARP_TIMER" 2>/dev/null || true
-    systemctl start "$WARP_TIMER" >/dev/null 2>&1 ||
-        echo "WARP 看门狗定时器未启用，可运行 systemctl enable --now $WARP_TIMER。" >&2
+    echo "WARP 看门狗定时器未就绪，请检查 systemctl status $WARP_TIMER。" >&2
+    return 1
 )
 
 warp_files() {
@@ -1752,6 +1840,7 @@ warp_check_stub
 warp_check_routes
 python3 -I policy.py render base.json ../warp-domains . ../warp-gemini-family
 python3 -I policy.py resolve-endpoints config.json
+python3 -I policy.py apply-port
 if [[ -s domains ]]; then
     set -o pipefail
     LC_ALL=C SYSTEMD_COLORS=0 resolvectl --no-pager domain | python3 -I policy.py check-resolved domains
@@ -1852,10 +1941,42 @@ for host in dict.fromkeys(hosts + ["github.com", "x.com"]):
         sys.exit(host + " 没有可用的内核路由")
     print(host, "→", "buds-warp0" if split else "原有出口", ", ".join(reachable))
 PY
-    if warp_domain_selected www.google.com; then
+    if [[ "${1:-}" != routes-only ]] && warp_domain_selected www.google.com; then
         curl -q --noproxy '*' -fsS --max-time 15 -o /dev/null https://www.google.com/generate_204 ||
             { echo "Google HTTPS 连通测试失败。" >&2; return 1; }
     fi
+}
+
+warp_target_check() {
+    local host family code result=0 records ip endpoint
+    for host in www.google.com www.youtube.com; do
+        warp_domain_selected "$host" || continue
+        records=$(python3 -I - "$host" <<'PY'
+import ipaddress
+import socket
+import sys
+nets = [ipaddress.ip_network(c) for c in ("198.18.248.0/21", "fd42:6275:6473:1::/96")]
+addresses = sorted({row[4][0] for row in socket.getaddrinfo(sys.argv[1], 443, type=socket.SOCK_STREAM)})
+for address in addresses:
+    ip = ipaddress.ip_address(address)
+    if not any(ip in net for net in nets):
+        sys.exit("系统解析绕过 WARP：" + address)
+    print(ip.version, address)
+PY
+        ) && [[ -n "$records" ]] || return 1
+        while read -r family ip; do
+            endpoint=$ip
+            [[ "$family" == 6 ]] && endpoint="[$ip]"
+            if code=$(curl -q --noproxy '*' "-$family" --resolve "$host:443:$endpoint" \
+                    -sS --max-time 12 -o /dev/null -w '%{http_code}' "https://$host/generate_204") && [[ "$code" == 204 ]]; then
+                echo "$host IPv$family HTTPS 204"
+            else
+                echo "$host IPv$family 业务探测失败（HTTP ${code:-000}），请核对该地址族的分流出口。" >&2
+                result=1
+            fi
+        done <<< "$records"
+    done
+    return "$result"
 }
 
 warp_remove() {
@@ -1876,7 +1997,7 @@ warp_remove() {
         echo "检测到同名系统服务，已保留配置，请检查 $WARP_UNIT。" >&2
         return 1
     fi
-    rm -f -- "$WARP_DIR"/{domains,config.json,base.json,policy.py,preflight,link-up,healthcheck,fakeip.db} \
+    rm -f -- "$WARP_DIR"/{domains,config.json,base.json,policy.py,preflight,link-up,healthcheck,fakeip.db,fallback-port} \
         "$WARP_DIR/$WARP_UNIT" "$WARP_DIR/$WARP_WATCH" "$WARP_DIR/$WARP_TIMER" || return 1
     rm -f -- "$WARP_DIR/.buds-managed" || return 1
     if ! rmdir -- "$WARP_DIR"; then
@@ -1897,7 +2018,7 @@ warp_tunnel_probe() {
         return 0
     fi
     echo "无法通过 WARP 隧道确认 Cloudflare 出口，请检查 WireGuard 配置和 UDP 连通性。" >&2
-    echo "看门狗 $WARP_TIMER 会继续尝试恢复，也可稍后再运行 buds hy2 warp check。" >&2
+    echo "可用 buds hy2 warp status 查日志；维护时段可选 B 区第 14 项修复。" >&2
     return 1
 }
 
@@ -1992,48 +2113,59 @@ warp_manage() (
             [[ ! -d "$WARP_DIR" ]] || { echo "请先运行 buds hy2 warp disable。" >&2; return 1; }
             warp_dns_restore; return ;;
         disable) warp_remove && echo "WARP 分流已关闭。" ; return ;;
-        check)
-            if [[ ! -d "$WARP_DIR" ]]; then
-                echo "WARP 分流未启用。请先选择「启用」，再检测实际出口。" >&2
-                return 1
+        refresh)
+            [[ -d "$WARP_DIR" && ! -L "$WARP_DIR" && -f "$WARP_DIR/.buds-managed" &&
+                "$WARP_DIR/$WARP_UNIT" -ef "/etc/systemd/system/$WARP_UNIT" ]] ||
+                { echo "无法确认托管服务归属。" >&2; return 1; }
+            warp_prepare_policy files-only || return 1
+            echo "已刷新启动与巡检脚本，下一次调用时生效。" ; return ;;
+        check|repair)
+            [[ -d "$WARP_DIR" ]] || { echo "WARP 分流未启用。" >&2; return 1; }
+            if [[ "$action" == repair ]]; then
+                [[ -f "$WARP_DIR/.buds-managed" && ! -L "$WARP_DIR" &&
+                    "$WARP_DIR/$WARP_UNIT" -ef "/etc/systemd/system/$WARP_UNIT" ]] ||
+                    { echo "无法确认 WARP 服务归属，已停止修复。" >&2; return 1; }
+                warp_prepare_policy || return 1
             fi
-            # 旧版安装缺少启动探测、保活和看门狗；检查时补齐托管文件和服务定义，无需重新启用。
-            if [[ -f "$WARP_DIR/.buds-managed" ]]; then warp_prepare_policy; fi
             # 服务未运行（含重启限额停住）：清除状态后启动，启动过程由 link-up 验证隧道。
             if ! systemctl is-active --quiet "$WARP_UNIT"; then
+                [[ "$action" == repair ]] || { echo "WARP 服务未运行。B 区第 14 项可修复。" >&2; return 1; }
                 systemctl reset-failed "$WARP_UNIT" 2>/dev/null || true
                 systemctl start "$WARP_UNIT" || {
                     echo "WARP 服务启动失败。请用 buds hy2 warp status 查看状态和启动日志。" >&2
                     return 1
                 }
             fi
-            # 服务在运行但隧道不通：换新会话重新握手，再按结果报告。
-            if ! warp_tunnel_probe; then
-                echo "WARP 隧道不通，正在重启分流服务重新握手。" >&2
-                if ! systemctl restart "$WARP_UNIT"; then
-                    systemctl reset-failed "$WARP_UNIT" 2>/dev/null || true
-                    systemctl start "$WARP_UNIT" || {
-                        echo "分流服务重启失败，可用 journalctl -u $WARP_UNIT 查看原因。" >&2
-                        return 1
-                    }
-                fi
-                warp_tunnel_probe || return 1
-            fi
-            warp_verify && warp_trace || return 1
-            if grep -Fq '"198.18.240.3/32"' "$WARP_DIR/config.json" || [[ ! -s "$WARP_DIR/domains" ]]; then
-                if [[ -s "$WARP_DIR/domains" ]]; then
-                    echo "分流规则和 WARP 隧道连通检查通过。"
-                    warp_gemini_check
-                else
-                    echo "检测通过。域名清单为空，当前流量使用原有出口。"
-                fi
-            else
-                echo "旧版运行配置没有专用出口探针；隧道出口尚未验证。" >&2
+            if [[ -s "$WARP_DIR/domains" ]] && ! grep -Fq '"198.18.240.3/32"' "$WARP_DIR/config.json"; then
+                echo "旧配置缺少出口探针，无法确认 WARP 出口。请安排维护时段更新分流配置。" >&2
                 return 1
+            fi
+            local failed=0
+            if ! warp_tunnel_probe; then
+                if [[ "$action" == repair ]]; then
+                    sleep 2
+                    if ! warp_tunnel_probe; then
+                        echo "两次 WARP 探测失败，按修复请求重新握手。" >&2
+                        (cd "$WARP_DIR" && python3 -I policy.py next-port) || return 1
+                        systemctl restart "$WARP_UNIT" && warp_tunnel_probe || return 1
+                    fi
+                else
+                    failed=1
+                fi
+            fi
+            warp_verify routes-only || failed=1
+            warp_trace || failed=1
+            warp_target_check || failed=1
+            (( failed == 0 )) || return 1
+            if [[ -s "$WARP_DIR/domains" ]]; then
+                echo "分流规则和抽查的出口连通。"
+                warp_gemini_check
+            else
+                echo "检测通过。域名清单为空，当前流量使用原有出口。"
             fi
             return ;;
         enable) ;;
-        *) echo "用法：buds hy2 warp {doctor|setup [--new-profile|--managed-core]|dns-switch|dns-restore|enable [配置路径]|status|check|disable|domains|gemini-family [auto|ipv4|ipv6]}"; return 2 ;;
+        *) echo "用法：buds hy2 warp {doctor|setup [--new-profile|--managed-core]|dns-switch|dns-restore|enable [配置路径]|status|check|refresh|repair|disable|domains|gemini-family [auto|ipv4|ipv6]}"; return 2 ;;
     esac
     if [[ -d "$WARP_DIR" ]]; then
         systemctl is-active --quiet "$WARP_UNIT" && { echo "WARP 分流已启用。"; return 0; }
@@ -2180,7 +2312,7 @@ def nodes():
 
 
 def listeners():
-    for line in run("ss", "-H", "-lunp").stdout.splitlines():
+    for line in run("ss", "-H", "-uanp").stdout.splitlines():
         fields = line.split()
         if len(fields) >= 5:
             port = fields[3].rsplit(":", 1)[-1]
@@ -2388,8 +2520,7 @@ def parse_spans(text):
     for item in text.split(","):
         item = item.strip()
         if item:
-            first, _, last = item.partition("-")
-            spans.append(ports(f"{first or 1}-{last or first}"))
+            spans.append(ports(item))
     return merge_spans(spans)
 
 
@@ -2421,35 +2552,92 @@ def spans_text(spans):
     return ",".join(f"{first}-{last}" if first != last else str(first) for first, last in spans)
 
 
-def sync_reserved_ports():
-    """跳跃范围里的入站 UDP 会被重定向到基准端口。随机源端口落入该范围的本机 UDP 回包
-    （WireGuard 握手、DNS）会被劫持，所以让内核不再把这些端口用作源端口。
-    文件只记录本项目的范围以便收敛；运行值在此基础上保留其他工具设置的范围。"""
-    ours = []
+def sync_reserved_ports(extra=None, primary=None):
+    """先保护新旧范围，节点切换完成后再回收归属明确的端口。"""
+    spans = [ports(node["ports"]) for node in nodes()]
     if (BASE / "config.yaml").is_file():
-        ours += parse_spans(PRIMARY_LISTEN.partition("#")[0].strip() or "443")
-    for node in nodes():
-        ours += parse_spans(node["ports"])
-    ours = [span for span in merge_spans(ours) if span[0] < span[1]]
+        spans.append(ports((primary or PRIMARY_LISTEN).partition("#")[0].strip() or "443"))
+    if extra:
+        spans.append(ports(extra))
+    desired = merge_spans([span for span in spans if span[0] < span[1]])
     if SYSCTL_FILE.is_symlink():
         raise ValueError(f"请先核对符号链接 {SYSCTL_FILE}。")
-    previous = parse_spans(SYSCTL_FILE.read_text().partition("=")[2]) if SYSCTL_FILE.is_file() else []
-    current = parse_spans(run("sysctl", "-n", SYSCTL_KEY, check=False).stdout)
-    live = merge_spans(ours + subtract_spans(current, previous))
-    if ours:
-        content = ("# buds-hy2：端口跳跃范围内的入站 UDP 会被重定向，内核不能把这些端口用作源端口。\n"
-                   f"{SYSCTL_KEY} = {spans_text(ours)}\n")
-        if not SYSCTL_FILE.is_file() or SYSCTL_FILE.read_text() != content:
+    if not desired and not SYSCTL_FILE.exists():
+        return
+    old = SYSCTL_FILE.read_text() if SYSCTL_FILE.exists() else ""
+    if old and not old.startswith("# buds-hy2"):
+        raise ValueError(f"{SYSCTL_FILE} 已被其他配置占用。")
+    previous = []
+    if old:
+        declared = re.fullmatch(r"# buds-hy2[^\n]*\n(?:# owned: ([0-9,\-]*)\n)?" +
+                                re.escape(SYSCTL_KEY) + r" = ([0-9,\-]+)\n?", old)
+        if not declared:
+            raise ValueError(f"无法识别 {SYSCTL_FILE} 的端口记录。")
+        previous = parse_spans(declared[1] if declared[1] is not None else declared[2])
+    current = parse_spans(run("sysctl", "-n", SYSCTL_KEY).stdout)
+    foreign = subtract_spans(current, previous)
+    live = merge_spans(foreign + desired)
+    owned = subtract_spans(desired, foreign)
+    # sysctl 的赋值会替换整行。宿主机另有持久策略时，不与管理员争夺开机加载顺序。
+    external = False
+    for path in external_reservation_files():
+        values = re.findall(r"^\s*-?net[./]ipv4[./]ip_local_reserved_ports\s*=([^#;\n]*)",
+                            path.read_text(errors="replace"), re.M)
+        if values:
+            external = True
+            if not old and not subtract_spans(desired, current) and all(
+                    not subtract_spans(desired, parse_spans(value)) for value in values):
+                continue
+            raise ValueError(f"{path} 也管理源端口。请由管理员合并跳跃范围并应用，或选用单端口。")
+    if external:
+        return
+    if desired:
+        ephemeral = ports("-".join(run("sysctl", "-n", "net.ipv4.ip_local_port_range").stdout.split()))
+        def available(reservations):
+            return sum(end - start + 1 for start, end in subtract_spans([ephemeral], reservations))
+        if not available(live) or available(live) < min(1024, available(current)):
+            raise ValueError("所选范围会耗尽系统临时端口或使可用数量低于安全余量。请缩小范围或改用单端口。")
+    content = (f"# buds-hy2 port hopping\n# owned: {spans_text(owned)}\n"
+               f"{SYSCTL_KEY} = {spans_text(live)}\n") if desired else ""
+    if live != current:
+        run("sysctl", "-q", "-w", f"{SYSCTL_KEY}={spans_text(live)}")
+        if parse_spans(run("sysctl", "-n", SYSCTL_KEY).stdout) != live:
+            raise ValueError("源端口保留回读不一致。请核对其他网络管理程序后重试。")
+    try:
+        if content and old != content:
             SYSCTL_FILE.parent.mkdir(parents=True, exist_ok=True)
             atomic_text(SYSCTL_FILE, content)
-            SYSCTL_FILE.chmod(0o644)
-    elif SYSCTL_FILE.exists():
-        SYSCTL_FILE.unlink()
-    applied = run("sysctl", "-q", "-w", f"{SYSCTL_KEY}={spans_text(live)}", check=False)
-    if applied.returncode:
-        print("源端口保留已记录，但当前环境无法应用；容器需要由宿主机设置。", file=sys.stderr)
-    elif ours:
-        print(f"内核不再把端口跳跃范围用作源端口：{spans_text(ours)}")
+        elif old and not content:
+            SYSCTL_FILE.unlink()
+    except OSError:
+        if live != current:
+            run("sysctl", "-q", "-w", f"{SYSCTL_KEY}={spans_text(current)}")
+        raise
+    if desired:
+        print(f"已核对跳跃范围的源端口保护：{spans_text(desired)}")
+
+
+def protect_new_range(requested, previous=None):
+    span = ports(requested)
+    if span[0] == span[1]:
+        return
+    sync_reserved_ports(extra=requested)
+    new = subtract_spans([span], [ports(previous)] if previous else [])
+    try:
+        for port, _ in listeners():
+            if any(start <= port <= end for start, end in new):
+                raise ValueError(f"UDP {port} 已被占用。请选择其他范围。")
+    except (Exception, KeyboardInterrupt):
+        sync_reserved_ports()
+        raise
+
+
+def external_reservation_files():
+    paths = [Path("/etc/sysctl.conf")]
+    for directory in ("/etc/sysctl.d", "/run/sysctl.d", "/usr/local/lib/sysctl.d",
+                      "/usr/lib/sysctl.d", "/lib/sysctl.d"):
+        paths.extend(Path(directory).glob("*.conf"))
+    return {path.resolve() for path in paths if path.is_file() and path.resolve() != SYSCTL_FILE.resolve()}
 
 
 def write_files(data, old, stage, path):
@@ -2686,10 +2874,16 @@ def save_node(args):
     stage.mkdir()
     try:
         write_files(data, path if old else None, stage, path)
+        if not old or old["ports"] != data["ports"]:
+            protect_new_range(data["ports"], old.get("ports"))
         if old:
             edit_node(data, old, path, stage, previous)
         else:
             add_node(args, path, data, stage)
+    except (Exception, KeyboardInterrupt):
+        if not previous.exists():
+            sync_reserved_ports()
+        raise
     finally:
         if not previous.exists():
             shutil.rmtree(work)
@@ -2858,6 +3052,7 @@ def edit_primary(args):
             if old is not None:
                 (work / path.name).write_text(old)
         if changed_port:
+            protect_new_range(requested, local)
             primary_firewall("open", work, requested)
         if restarting:
             run("systemctl", "stop", unit)
@@ -2887,6 +3082,8 @@ def edit_primary(args):
                 start_node({"name": "main", "ports": local})
             if pending.exists():
                 primary_firewall("close", work, requested)
+            if changed_port:
+                sync_reserved_ports()
         except (Exception, KeyboardInterrupt):
             cleanup = False
             print(f"自动恢复未完成，原文件和防火墙记录保存在 {work}。", file=sys.stderr)
@@ -2910,6 +3107,8 @@ def edit_primary(args):
     finally:
         if cleanup:
             shutil.rmtree(work)
+    if changed_port:
+        sync_reserved_ports(primary=requested)
     print(f"主节点已保存 · 本地 UDP {requested} · 公网 UDP {external}。请重新导入连接链接或客户端配置。")
 
 
@@ -2968,6 +3167,7 @@ def main():
     actions.add_parser("names")
     actions.add_parser("quick-add").add_argument("name")
     actions.add_parser("reserve-ports")
+    actions.add_parser("prepare-install-ports").add_argument("ports")
     for verb in ("add", "edit"):
         command = actions.add_parser(verb)
         command.add_argument("name")
@@ -2986,6 +3186,12 @@ def main():
     args = parser.parse_args(sys.argv[5:])
     if not args.action:
         parser.error("请选择一个多节点命令，或使用 --help 查看帮助。")
+    if args.action == "prepare-install-ports":
+        if (BASE / "config.yaml").exists():
+            raise ValueError("已有节点配置，请使用节点菜单更改端口。")
+        check_hopping(ports(args.ports))
+        protect_new_range(args.ports)
+        return
     if args.action == "reserve-ports":
         sync_reserved_ports()
         return
@@ -3026,7 +3232,6 @@ def main():
         for signum in (signal.SIGHUP, signal.SIGTERM):
             signal.signal(signum, cancel)
         edit_primary(args)
-        sync_reserved_ports()
         return
     if args.action in ("add", "edit", "quick-add"):
         if pwd.getpwnam("hysteria").pw_gid != grp.getgrnam("hysteria").gr_gid:
@@ -3094,7 +3299,10 @@ nodes_tool() {
 
 nodes_manage() (
     local action=${1:-list} name=${2:-}
-    if [[ "$action" == reserve-ports ]]; then nodes_tool reserve-ports; return; fi
+    if [[ "$action" == reserve-ports || "$action" == prepare-install-ports ]]; then
+        exec 9>/run/buds-hy2-nodes.lock && flock -x 9 || return 1
+        nodes_tool "$@"; return
+    fi
     if [[ "$name" == main ]]; then
         case "$action" in
             detail) printf '主节点 main · %s · 本地 UDP %s · 公网 UDP %s\n' "$(get_domain)" "$(get_listen)" "$(get_public_ports)"; return ;;
@@ -3656,7 +3864,7 @@ warp_menu_begin() {
 warp_options() {
     panel_choices "$C_CYAN" "$1" '一键安装并启用' '检测分流和出口' '管理分流域名' 'Gemini 出口地址族' \
         '关闭分流' '启用前诊断' '服务状态和日志' '准备依赖' '安装独立内核' '准备 WARP 配置' \
-        '迁移系统 DNS' '恢复原 DNS' '使用已有配置启用'
+        '迁移系统 DNS' '恢复原 DNS' '使用已有配置启用' '修复分流服务'
 }
 
 warp_menu() {
@@ -3674,7 +3882,7 @@ warp_menu() {
         echo '设置由所有节点共用。首次使用选 1，检查实际出口选 2。'
         warp_options "$(panel_width)"
         echo '  0. 返回首页'
-        read -rp 'B 区操作编号（0–13）：' choice || return 0
+        read -rp 'B 区操作编号（0–14）：' choice || return 0
         case "$choice" in
             1) warp_menu_begin || echo "引导未完成，可选择 6 检查并按提示重试。" ;;
             2) warp_manage check || true ;;
@@ -3716,8 +3924,11 @@ warp_menu() {
                 read -rp "输入服务器上的 WireGuard .conf 路径；已有配置直接回车自动查找： " profile || return 0
                 warp_manage enable "$profile" || echo "启用未完成，可选择 6 查看启用条件。"
                 ;;
+            14)
+                read -rp '修复会更新托管文件，必要时重启 WARP，已有分流连接可能中断。继续？[y/N] ' confirm || return 0
+                if [[ "${confirm,,}" == y ]]; then warp_manage repair || echo "修复未完成，请查看上方诊断。"; fi ;;
             0|"") return 0 ;;
-            *) echo "请输入 B 区的 1–13，或输入 0 返回首页。" ;;
+            *) echo "请输入 B 区的 1–14，或输入 0 返回首页。" ;;
         esac
         panel_pause 'B 区' || return 0
     done
