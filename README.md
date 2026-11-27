@@ -142,6 +142,8 @@ buds hy2 warp domains reset                        # 用内置 Google 清单替�
 
 一条规则匹配该域名及其所有子域名。例如，把`google.com`改成`scholar.google.com`后，谷歌学术仍走WARP，`www.google.com`恢复原出口。若清单内还保留父域名，删除单个子域名条目后仍会匹配父域名。一个服务可能使用多个独立域名，例如YouTube的视频请求还会访问`googlevideo.com`。
 
+服务启动后脚本会实际探测WARP出口；握手在约一分钟内未完成时，服务判定启动失败并由systemd重启，换新会话重新握手。`buds-warp-watch.timer`每五分钟复查一次：进程在运行但隧道不通时重启分流服务，服务因重启限额停住时清除状态并拉起。表现为此前服务状态为`active`、HY2客户端能连上但清单内域名超时或测速失败。排查用`journalctl -u buds-warp-split -u buds-warp-watch`，`buds hy2 warp check`会补齐旧版安装缺少的探测和看门狗。wgcf配置未指定保活时默认使用25秒保活。
+
 批量导入时可每行写一个域名，支持空行和`#`注释，空文件表示清空。脚本统一大小写并去重。可先用`buds hy2 warp domains list > /root/my-domains.txt`导出、编辑，再导入。配置保存在`/etc/buds-hy2/warp-domains`，关闭分流、重启和升级CLI后继续保留。在线修改会重启专用WARP服务，已有WARP连接需要重连；新规则启动失败时脚本会尝试恢复原清单和服务。
 
 从v1.4.0升级时，正在运行的旧服务继续使用原清单，`domains list`可查看。要立即切换到仅Google的默认规则，执行`buds hy2 warp domains reset`。

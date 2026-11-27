@@ -2044,6 +2044,8 @@ cleanup_renewal() {
 # 专用虚拟地址与公网 CDN 地址分离，同一公网 IP 可同时承载原生和 WARP 连接。
 WARP_DIR=/etc/buds-hy2/warp-split
 WARP_UNIT=buds-warp-split.service
+WARP_WATCH=buds-warp-watch.service
+WARP_TIMER=buds-warp-watch.timer
 WARP_LIST=/etc/buds-hy2/warp-domains
 WARP_GEMINI_FAMILY=/etc/buds-hy2/warp-gemini-family
 WARP_TOOLS=/etc/buds-hy2/warp-tools
@@ -2519,6 +2521,7 @@ warp_current_domains() {
 }
 
 # v1.4 已安装的单元也运行 preflight 和 link-up，更新这两个文件即可接入域名管理。
+# 后续版本在此补充 healthcheck、保活参数和服务定义，已有安装无需重新启用。
 warp_prepare_policy() (
     local stage
     stage=$(mktemp -d "${WARP_DIR}.setup.XXXXXX") || return 1
@@ -2529,11 +2532,36 @@ warp_prepare_policy() (
     fi
     warp_policy_tool > "$stage/policy.py" &&
         warp_link_up_file > "$stage/link-up" &&
-        warp_preflight_file > "$stage/preflight" || return 1
+        warp_preflight_file > "$stage/preflight" &&
+        warp_healthcheck_file > "$stage/healthcheck" || return 1
     local file
-    for file in policy.py link-up preflight; do
+    for file in policy.py link-up preflight healthcheck; do
         mv -f -- "$stage/$file" "$WARP_DIR/$file" || return 1
     done
+    chmod 700 -- "$WARP_DIR/healthcheck" || return 1
+    # 早期版本的 wgcf 配置没有保活；无流量时不再重新握手，隧道失效后无法自愈。
+    python3 -I - "$WARP_DIR/base.json" <<'PY' || return 1
+import json
+import os
+import sys
+import tempfile
+path = sys.argv[1]
+with open(path, encoding="utf-8") as source:
+    cfg = json.load(source)
+changed = False
+for endpoint in cfg.get("endpoints", []):
+    for peer in endpoint.get("peers", []):
+        if not peer.get("persistent_keepalive_interval"):
+            peer["persistent_keepalive_interval"] = 25
+            changed = True
+if changed:
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path), delete=False) as target:
+        json.dump(cfg, target)
+        name = target.name
+    os.chmod(name, 0o600)
+    os.replace(name, path)
+PY
+    warp_sync_units
 )
 
 warp_edit_domains() (
@@ -2661,8 +2689,11 @@ try:
         raise ValueError
     wg_peer = {"address": endpoint.hostname, "port": endpoint.port, "public_key": peer["PublicKey"],
                "allowed_ips": allowed}
-    if peer.get("PersistentKeepalive", "0").lower() != "off":
-        wg_peer["persistent_keepalive_interval"] = int(peer.get("PersistentKeepalive", "0"))
+    if "PersistentKeepalive" not in peer:
+        # wgcf 不写保活；空会话时保活包会触发重新握手，空闲隧道不会静默失效。
+        wg_peer["persistent_keepalive_interval"] = 25
+    elif peer["PersistentKeepalive"].lower() != "off":
+        wg_peer["persistent_keepalive_interval"] = int(peer["PersistentKeepalive"])
     if "PresharedKey" in peer:
         wg_peer["pre_shared_key"] = peer["PresharedKey"]
     if "Reserved" in peer:
@@ -2747,22 +2778,71 @@ resolvectl dnsovertls "$link" no
 mapfile -t domains < <(tr -s '[:space:]' '\n' < domains | sed '/^$/d;s/^/~/')
 resolvectl domain "$link" "${domains[@]}"
 resolvectl flush-caches
+# 路由就绪不等于隧道可用。开机时握手可能无响应，进程却仍在运行；
+# 这里必须确认 WARP 出口，否则让单元失败并重启，用新会话重新握手。
+if grep -Fq '"198.18.240.3/32"' config.json; then
+    for ((i=0; i<8; i++)); do
+        if curl -q --noproxy '*' --resolve one.one.one.one:443:198.18.240.3 \
+                -fsS --max-time 5 https://one.one.one.one/cdn-cgi/trace 2>/dev/null |
+                tr -d '\r' | grep -Eq '^warp=(on|plus)$'; then
+            exit 0
+        fi
+        sleep 2
+    done
+    echo "WARP 隧道在启动后约一分钟内未完成握手，本单元判定失败并重启。" >&2
+    exit 1
+fi
 LINK_UP
 }
 
-warp_files() {
-    local profile=$1 binary=$2 version=$3
-    warp_domains > "$WARP_DIR/domains" || return 1
-    warp_config "$profile" "$WARP_DIR/domains" "$version" > "$WARP_DIR/config.json" || return 1
-    (cd "$WARP_DIR" && "$binary" check -c config.json) || return 1
-    warp_prepare_policy || return 1
+warp_healthcheck_file() {
+    cat <<'HEALTHCHECK'
+#!/usr/bin/env bash
+set -eu
+unit=buds-warp-split.service
+# 与域名编辑共用排他锁；锁被占用说明正在重载，跳过本轮。
+exec 9>/run/buds-warp-split.lock || exit 0
+flock -n 9 || exit 0
+state=$(systemctl is-active "$unit" 2>/dev/null || true)
+if [[ "$state" != active ]]; then
+    # start-limit-hit 只能先清除再启动；启动过程由 link-up 验证隧道。
+    systemctl reset-failed "$unit" 2>/dev/null || true
+    if systemctl start "$unit"; then
+        echo "分流服务处于 $state，已重新启动。"
+    else
+        echo "分流服务处于 $state，重新启动失败。" >&2
+    fi
+    exit 0
+fi
+[[ -s domains && -f config.json ]] || exit 0
+grep -Fq '"198.18.240.3/32"' config.json || exit 0
+probe() {
+    curl -q --noproxy '*' --resolve one.one.one.one:443:198.18.240.3 \
+        -fsS --max-time 8 https://one.one.one.one/cdn-cgi/trace 2>/dev/null |
+        tr -d '\r' | grep -Eq '^warp=(on|plus)$'
+}
+if probe; then exit 0; fi
+sleep 5
+if probe; then exit 0; fi
+echo "WARP 隧道连续两次探测失败，重启分流服务以重新握手。" >&2
+if ! systemctl restart "$unit"; then
+    systemctl reset-failed "$unit" 2>/dev/null || true
+    systemctl start "$unit" || echo "分流服务重启后仍失败，请查看 journalctl -u $unit。" >&2
+fi
+HEALTHCHECK
+}
 
-    cat > "$WARP_DIR/$WARP_UNIT" <<UNIT
+# 二进制路径取自已安装单元；文件写入目标目录后由调用方原子替换。
+warp_unit_files() {
+    local dest=$1 binary=$2
+    cat > "$dest/$WARP_UNIT" <<UNIT
 [Unit]
 Description=Buds WARP domain split routing
 After=network-online.target systemd-resolved.service
 Wants=network-online.target
 Requires=systemd-resolved.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 WorkingDirectory=$WARP_DIR
@@ -2776,6 +2856,64 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 UNIT
+    cat > "$dest/$WARP_WATCH" <<UNIT
+[Unit]
+Description=Buds WARP tunnel watchdog
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=$WARP_DIR
+UMask=0077
+ExecStart=/usr/bin/env bash $WARP_DIR/healthcheck
+UNIT
+    cat > "$dest/$WARP_TIMER" <<UNIT
+[Unit]
+Description=Check the Buds WARP tunnel every few minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=$WARP_WATCH
+
+[Install]
+WantedBy=timers.target
+UNIT
+}
+
+# 已托管的安装：仅在定义变化时刷新服务、看门狗和定时器，并保持定时器启用。
+warp_sync_units() (
+    [[ -d "$WARP_DIR" && ! -L "$WARP_DIR" && -f "$WARP_DIR/.buds-managed" &&
+        "$WARP_DIR/$WARP_UNIT" -ef "/etc/systemd/system/$WARP_UNIT" ]] || return 0
+    local binary work file changed=false
+    binary=$(warp_runtime_binary) || return 0
+    umask 077
+    work=$(mktemp -d "$WARP_DIR.units.XXXXXX") || return 1
+    trap 'rm -rf -- "$work"' EXIT
+    warp_unit_files "$work" "$binary" || return 1
+    for file in "$WARP_UNIT" "$WARP_WATCH" "$WARP_TIMER"; do
+        if ! cmp -s "$work/$file" "$WARP_DIR/$file"; then
+            mv -f -- "$work/$file" "$WARP_DIR/$file" || return 1
+            changed=true
+        fi
+    done
+    [[ "$changed" == true ]] || return 0
+    systemctl daemon-reload || return 1
+    if systemctl is-enabled --quiet "$WARP_UNIT"; then
+        systemctl enable "$WARP_DIR/$WARP_TIMER" >/dev/null 2>&1 &&
+            systemctl start "$WARP_TIMER" >/dev/null 2>&1 ||
+            echo "WARP 看门狗定时器未启用，可运行 systemctl enable --now $WARP_TIMER。" >&2
+    fi
+)
+
+warp_files() {
+    local profile=$1 binary=$2 version=$3
+    warp_domains > "$WARP_DIR/domains" || return 1
+    warp_config "$profile" "$WARP_DIR/domains" "$version" > "$WARP_DIR/config.json" || return 1
+    (cd "$WARP_DIR" && "$binary" check -c config.json) || return 1
+    warp_prepare_policy || return 1
+    warp_unit_files "$WARP_DIR" "$binary"
 }
 
 warp_check_stub() {
@@ -2927,12 +3065,16 @@ warp_remove() {
     [[ ! -L "$WARP_DIR" && -f "$WARP_DIR/.buds-managed" ]] ||
         { echo "目录缺少 buds 管理标记，已保留：$WARP_DIR" >&2; return 1; }
     if [[ "$WARP_DIR/$WARP_UNIT" -ef "/etc/systemd/system/$WARP_UNIT" ]]; then
+        if systemctl cat "$WARP_TIMER" >/dev/null 2>&1; then
+            systemctl disable --now "$WARP_TIMER" >/dev/null 2>&1 || return 1
+        fi
         systemctl stop "$WARP_UNIT" && systemctl disable "$WARP_UNIT" || return 1
     elif [[ $(systemctl show -p LoadState --value "$WARP_UNIT") != not-found ]]; then
         echo "检测到同名系统服务，已保留配置，请检查 $WARP_UNIT。" >&2
         return 1
     fi
-    rm -f -- "$WARP_DIR"/{domains,config.json,base.json,policy.py,preflight,link-up,fakeip.db} "$WARP_DIR/$WARP_UNIT" || return 1
+    rm -f -- "$WARP_DIR"/{domains,config.json,base.json,policy.py,preflight,link-up,healthcheck,fakeip.db} \
+        "$WARP_DIR/$WARP_UNIT" "$WARP_DIR/$WARP_WATCH" "$WARP_DIR/$WARP_TIMER" || return 1
     rm -f -- "$WARP_DIR/.buds-managed" || return 1
     if ! rmdir -- "$WARP_DIR"; then
         touch "$WARP_DIR/.buds-managed"
@@ -2952,6 +3094,7 @@ warp_tunnel_probe() {
         return 0
     fi
     echo "无法通过 WARP 隧道确认 Cloudflare 出口，请检查 WireGuard 配置和 UDP 连通性。" >&2
+    echo "若服务显示运行但隧道不通，看门狗 $WARP_TIMER 会重启分流服务，也可手动 systemctl restart $WARP_UNIT。" >&2
     return 1
 }
 
@@ -3055,9 +3198,13 @@ warp_manage() (
                 fi
                 return 1
             fi
+            # 旧版安装缺少启动探测和看门狗；检查时补齐，无需重新启用。
+            if [[ -f "$WARP_DIR/.buds-managed" ]]; then
+                exec 9>/run/buds-warp-split.lock && flock -n 9 2>/dev/null && warp_sync_units
+            fi
+            if ! warp_tunnel_probe; then return 1; fi
             warp_verify && warp_trace || return 1
             if grep -Fq '"198.18.240.3/32"' "$WARP_DIR/config.json" || [[ ! -s "$WARP_DIR/domains" ]]; then
-                warp_tunnel_probe || return 1
                 if [[ -s "$WARP_DIR/domains" ]]; then
                     echo "分流规则和 WARP 隧道连通检查通过。"
                     warp_gemini_check
@@ -3086,10 +3233,12 @@ warp_manage() (
     touch "$WARP_DIR/.buds-managed" || { rmdir "$WARP_DIR"; return 1; }
     trap 'rc=$?; if ((rc)); then warp_remove || echo "清理未完成，请运行 buds hy2 warp disable。" >&2; fi' EXIT
     warp_files "$profile" "$binary" "$version" || return 1
-    if ! systemctl enable "$WARP_DIR/$WARP_UNIT" || ! systemctl start "$WARP_UNIT"; then
+    if ! systemctl enable "$WARP_DIR/$WARP_UNIT" "$WARP_DIR/$WARP_TIMER" || ! systemctl start "$WARP_UNIT"; then
         echo "WARP 服务启动失败。正在撤销本次启用，可用 journalctl -u $WARP_UNIT 查看原因。" >&2
         return 1
     fi
+    systemctl start "$WARP_TIMER" >/dev/null 2>&1 ||
+        echo "WARP 看门狗定时器未启动，可运行 systemctl start $WARP_TIMER。" >&2
     if ! { warp_verify && warp_tunnel_probe && warp_trace; }; then
         echo "选路或出口验证失败，正在撤销本次启用。" >&2
         return 1

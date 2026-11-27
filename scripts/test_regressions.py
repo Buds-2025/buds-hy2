@@ -334,6 +334,7 @@ warp_config wgcf.conf domains 1.13.0 > split.json
         self.assertFalse(wg["system"])
         self.assertEqual(wg["address"], ["172.16.0.2/32", "fd42::2/128"])
         self.assertEqual(wg["peers"][0]["address"], "2001:db8::1")
+        self.assertEqual(wg["peers"][0]["persistent_keepalive_interval"], 25)
         self.assertFalse((self.directory / "injected").exists())
         if os.environ.get("BUDS_TEST_SING_BOX"):
             subprocess.run([os.environ["BUDS_TEST_SING_BOX"], "check", "-c", "split.json"],
@@ -368,7 +369,11 @@ Endpoint=192.0.2.1:2408
 AllowedIPs=0.0.0.0/0
 WG
 warp_config legacy.conf domains 1.13.0 > config.json
+# 旧版配置没有保活；升级托管文件时补上，不改其他隧道参数。
+python3 -c 'import json,sys; p=sys.argv[1]; c=json.load(open(p)); c["endpoints"][0]["peers"][0]["persistent_keepalive_interval"]=0; json.dump(c, open(p,"w"))' config.json
 warp_prepare_policy
+[[ -x "$WARP_DIR/healthcheck" ]]
+python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["endpoints"][0]["peers"][0]["persistent_keepalive_interval"]==25' "$WARP_DIR/base.json"
 python3 policy.py render base.json ../warp-domains .
 grep -Fxq chatgpt.com domains
 warp_domains > "$WARP_LIST"
@@ -606,9 +611,144 @@ response=warp=off
 if warp_tunnel_probe; then exit 9; fi
 response=
 if warp_tunnel_probe; then exit 9; fi
-: > "$WARP_DIR/domains"
-warp_tunnel_probe
-""")
+        : > "$WARP_DIR/domains"
+        warp_tunnel_probe
+    """)
+
+    def test_warp_link_up_fails_the_unit_until_the_tunnel_answers(self):
+        self.shell(r"""
+        mkdir -p "$SANDBOX/link" && cd "$SANDBOX/link"
+        echo google.com > domains
+        printf '%s\n' '{"route":{"rules":[{"ip_cidr":"198.18.240.3/32"}]}}' > config.json
+        ip() { :; }
+        resolvectl() { :; }
+        export -f sleep ip resolvectl
+        export ACTION_FILE
+        curl() { echo "$*" >> "$ACTION_FILE"; return 1; }
+        export -f curl
+        warp_link_up_file > link-up
+        if bash link-up 2>/dev/null; then exit 9; fi
+        [[ $(grep -c -- '--resolve one.one.one.one:443:198.18.240.3' "$ACTION_FILE") == 8 ]]
+        curl() {
+            echo "$*" >> "$ACTION_FILE"
+            [[ " $* " == *' --noproxy '* && " $* " == *' https://one.one.one.one/cdn-cgi/trace '* ]] || return 1
+            printf '%s\r\n' 'fl=abc' 'warp=on'
+        }
+        export -f curl
+        bash link-up
+        [[ $(grep -c -- '--resolve one.one.one.one:443:198.18.240.3' "$ACTION_FILE") == 9 ]]
+        printf '%s\n' '{"route":{"rules":[]}}' > config.json
+        : > "$ACTION_FILE"
+        bash link-up
+        [[ ! -s "$ACTION_FILE" ]]
+        """, timeout=60)
+
+    def test_warp_watchdog_revives_failed_units_and_restarts_stalled_tunnels(self):
+        self.shell(r"""
+        mkdir -p "$SANDBOX/watch" && cd "$SANDBOX/watch"
+        echo google.com > domains
+        printf '%s\n' '{"route":{"rules":[{"ip_cidr":"198.18.240.3/32"}]}}' > config.json
+        warp_healthcheck_file > healthcheck
+        export -f sleep
+        export ACTION_FILE
+        flock() { :; }
+        export -f flock
+        systemctl() {
+            echo "$*" >> "$ACTION_FILE"
+            [[ "$1" == is-active && "$2" == buds-warp-split.service ]] || return 0
+            echo "$WATCH_STATE"
+        }
+        export -f systemctl
+        export WATCH_STATE
+        WATCH_STATE=active
+        curl() { return 1; }
+        export -f curl
+        bash healthcheck
+        [[ $(grep -c 'restart buds-warp-split.service' "$ACTION_FILE") == 1 ]]
+        : > "$ACTION_FILE"
+        WATCH_STATE=active
+        curl() { printf '%s\n' 'warp=off'; }
+        export -f curl
+        if bash healthcheck 2>/dev/null; then :; fi
+        [[ $(grep -c 'restart buds-warp-split.service' "$ACTION_FILE") == 1 ]]
+        : > "$ACTION_FILE"
+        WATCH_STATE=active
+        curl() { printf '%s\n' 'warp=on'; }
+        export -f curl
+        bash healthcheck
+        [[ "$(<"$ACTION_FILE")" == "is-active buds-warp-split.service" ]]
+        : > "$ACTION_FILE"
+        WATCH_STATE=failed
+        systemctl() {
+            echo "$*" >> "$ACTION_FILE"
+            [[ "$1" == is-active ]] && { echo "$WATCH_STATE"; return 0; }
+            return 0
+        }
+        export -f systemctl
+        bash healthcheck
+        grep -Fxq 'reset-failed buds-warp-split.service' "$ACTION_FILE"
+        grep -Fxq 'start buds-warp-split.service' "$ACTION_FILE"
+        if grep -q 'restart buds-warp-split.service' "$ACTION_FILE"; then exit 9; fi
+        : > "$ACTION_FILE"
+        WATCH_STATE=failed
+        systemctl() {
+            echo "$*" >> "$ACTION_FILE"
+            [[ "$1" == is-active ]] && { echo "$WATCH_STATE"; return 0; }
+            [[ "$1" == reset-failed ]] || return 1
+        }
+        export -f systemctl
+        bash healthcheck
+        [[ -s "$ACTION_FILE" ]]
+        : > "$ACTION_FILE"
+        flock() { return 1; }
+        export -f flock
+        WATCH_STATE=active
+        if bash healthcheck; then :; fi
+        [[ ! -s "$ACTION_FILE" ]]
+        """, timeout=60)
+
+    def test_warp_sync_units_upgrades_managed_installs_once_and_removes_with_them(self):
+        self.shell(r"""
+        mkdir -p "$WARP_DIR" "$SANDBOX/bin" "$SANDBOX/etc/systemd/system"
+        touch "$WARP_DIR/.buds-managed"
+        printf '%s\n' '#!/usr/bin/env bash' > "$SANDBOX/bin/sing-box"
+        chmod 755 "$SANDBOX/bin/sing-box"
+        warp_exec_safe() { :; }
+        printf 'ExecStart=%s/bin/sing-box run -c %s/config.json\n' "$SANDBOX" "$WARP_DIR" > "$WARP_DIR/$WARP_UNIT"
+        ln "$WARP_DIR/$WARP_UNIT" "$SANDBOX/etc/systemd/system/$WARP_UNIT"
+        systemctl() {
+            echo "$*" >> "$ACTION_FILE"
+            case "$1" in
+                is-enabled) return 0 ;;
+                enable) shift; for unit in "$@"; do ln -f "$unit" "$SANDBOX/etc/systemd/system/${unit##*/}"; done ;;
+                start) [[ "$2" == "$WARP_TIMER" ]] ;;
+                daemon-reload) : ;;
+                cat) [[ -e "$SANDBOX/etc/systemd/system/$WARP_TIMER" ]] ;;
+                disable) if [[ "$2" == --now ]]; then rm -f "$SANDBOX/etc/systemd/system/$WARP_TIMER"
+                          else rm -f "$SANDBOX/etc/systemd/system/$WARP_UNIT"; fi ;;
+                stop) : ;;
+                *) return 1 ;;
+            esac
+        }
+        warp_sync_units
+        grep -Fxq 'StartLimitBurst=5' "$WARP_DIR/$WARP_UNIT"
+        grep -Fxq "ExecStart=$SANDBOX/bin/sing-box run -c $WARP_DIR/config.json" "$WARP_DIR/$WARP_UNIT"
+        grep -Fq "ExecStartPost=/usr/bin/env bash $WARP_DIR/link-up" "$WARP_DIR/$WARP_UNIT"
+        grep -Fq "ExecStart=/usr/bin/env bash $WARP_DIR/healthcheck" "$WARP_DIR/$WARP_WATCH"
+        grep -Fxq 'OnUnitActiveSec=5min' "$WARP_DIR/$WARP_TIMER"
+        [[ -e "$SANDBOX/etc/systemd/system/$WARP_TIMER" ]]
+        [[ $(grep -c 'daemon-reload' "$ACTION_FILE") == 1 ]]
+        [[ $(grep -c "start $WARP_TIMER" "$ACTION_FILE") == 1 ]]
+        : > "$ACTION_FILE"
+        warp_sync_units
+        [[ ! -s "$ACTION_FILE" ]]
+        touch "$WARP_DIR/config.json" "$WARP_DIR/healthcheck"
+        # 真实安装中 /etc/systemd/system 下是指向托管文件的符号链接；此处用硬链接模拟，刷新后需重新指向。
+        ln -f "$WARP_DIR/$WARP_UNIT" "$SANDBOX/etc/systemd/system/$WARP_UNIT"
+        warp_remove
+        test ! -e "$WARP_DIR" && test ! -e "$SANDBOX/etc/systemd/system/$WARP_TIMER"
+        grep -q -- "disable --now .*$WARP_TIMER" "$ACTION_FILE"
+        """)
 
     def test_warp_partial_install_cleanup_is_retryable(self):
         self.shell("""
@@ -691,13 +831,14 @@ systemctl() {
     case "$1" in
         is-active) [[ "${!#}" == systemd-resolved || -f "$SANDBOX/active" ]] ;;
         show) echo not-found ;;
-        enable) ln "$2" "$unit_path" ;;
+        enable) shift; for unit in "$@"; do ln "$unit" "$SANDBOX/etc/systemd/system/${unit##*/}"; done ;;
         start|restart)
             (cd "$WARP_DIR" && python3 policy.py render base.json ../warp-domains .) || return 1
             if [[ -e "$SANDBOX/fail-once" ]]; then rm "$SANDBOX/fail-once"; return 1; fi
             touch "$SANDBOX/active" ;;
         stop) rm -f "$SANDBOX/active" ;;
-        disable) rm "$unit_path" ;;
+        cat) [[ -e "$SANDBOX/etc/systemd/system/$WARP_TIMER" ]] ;;
+        disable) rm -f "$SANDBOX/etc/systemd/system/$WARP_TIMER" "$unit_path" ;;
         daemon-reload) : ;;
         *) return 1 ;;
     esac
@@ -716,6 +857,7 @@ if warp_manage domains add 'https://wrong.example/path' accepted.example; then e
 if grep -Fxq accepted.example "$WARP_LIST"; then exit 9; fi
 warp_manage enable "$profile_path"
 [[ -s "$WARP_DIR/config.json" && -e "$unit_path" && -e "$SANDBOX/active" ]]
+[[ -e "$SANDBOX/etc/systemd/system/$WARP_TIMER" && -x "$WARP_DIR/healthcheck" ]]
 if warp_manage domains add example.net; then exit 9; fi
 if grep -Fxq example.net "$WARP_LIST"; then exit 9; fi
 warp_domain_selected child.example.com
