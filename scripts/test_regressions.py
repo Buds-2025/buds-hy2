@@ -2100,5 +2100,48 @@ INPUT
 """, "install.sh")
         self.assertIn("20005", output)
 
+def verify_linux_source_ports():
+    import socket
+    if os.geteuid() != 0 or os.path.samefile("/proc/self/ns/net", "/proc/1/ns/net"):
+        raise RuntimeError("Requires root in a disposable network namespace")
+    key = "net.ipv4.ip_local_reserved_ports"
+    subprocess.run(["sysctl", "-qw", "net.ipv4.ip_local_port_range=38000 43001"], check=True)
+    subprocess.run(["sysctl", "-qw", f"{key}=40123,42500"], check=True)
+    case = Regressions()
+    case.setUp()
+    try:
+        manager = case.node_manager()
+        target = case.directory / "sysctl.d/99-buds-hy2.conf"
+        manager.update(SYSCTL_FILE=target, external_reservation_files=lambda: [], PRIMARY_LISTEN="40000-42000")
+        (case.config / "config.yaml").touch()
+        sync = manager["sync_reserved_ports"]
+        sync()
+        # Model a fresh boot loading the generated file; the kernel itself allocates each socket.
+        subprocess.run(["sysctl", "-qw", f"{key}="], check=True)
+        subprocess.run(["sysctl", "-qp", str(target)], check=True)
+        sockets = []
+        try:
+            for _ in range(512):
+                stream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sockets.append(stream)
+                stream.bind(("0.0.0.0", 0))
+                port = stream.getsockname()[1]
+                if 40000 <= port <= 42000 or port == 42500:
+                    raise AssertionError(f"Kernel allocated reserved port {port}")
+        finally:
+            for stream in sockets:
+                stream.close()
+        sync(primary="24443")
+        remaining = subprocess.check_output(["sysctl", "-n", key], text=True).strip()
+        if remaining != "40123,42500" or target.exists():
+            raise AssertionError("External reservation ownership was lost")
+    finally:
+        case.doCleanups()
+    print("Kernel sysctl reload, 512 concurrent UDP binds and reservation cleanup passed.")
+
+
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    if sys.argv[1:] == ["--verify-netns"]:
+        verify_linux_source_ports()
+    else:
+        unittest.main(verbosity=2)

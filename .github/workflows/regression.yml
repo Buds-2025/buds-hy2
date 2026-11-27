@@ -19,3 +19,5 @@ jobs:
           bash -n install.sh
       - name: Run isolated regression tests
         run: /usr/bin/python3 scripts/test_regressions.py
+      - name: Verify port reservations with the Linux kernel
+        run: sudo unshare --net -- /usr/bin/python3 scripts/test_regressions.py --verify-netns
