@@ -1,0 +1,21 @@
+name: HY2 regression tests
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Check embedded CLI and shell syntax
+        run: |
+          python3 scripts/sync_cli.py --check
+          bash -n buds
+          bash -n install.sh
+      - name: Run isolated regression tests
+        run: /usr/bin/python3 scripts/test_regressions.py
