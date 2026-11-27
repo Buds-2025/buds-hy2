@@ -1579,7 +1579,7 @@ warp_target_alive() {
     for host in www.google.com www.youtube.com; do
         warp_domain_selected "$host" || continue
         for family in -4 -6; do
-            if result=$(curl -q --noproxy '*' "$family" -sS --max-time 8 -o /dev/null \
+            if result=$(curl -q --noproxy '*' "$family" -sS --max-time 4 -o /dev/null \
                     -w '%{http_code} %{remote_ip}' "https://$host/generate_204" 2>/dev/null) &&
                     [[ "$result" =~ ^204[[:space:]](198\.18\.24[89]\.|198\.18\.25[0-5]\.|fd42:6275:6473:1:) ]]; then
                 echo "Trace 暂时失败，$host 分流连接可用，本轮保留当前会话。" >&2
@@ -1761,7 +1761,7 @@ warp_watch_links() {
             echo "$link 已被其他文件占用，请先检查。" >&2
             return 1
         fi
-        ln -sfn -- "$WARP_DIR/$name" "$link" || return 1
+        [[ "$link" -ef "$WARP_DIR/$name" ]] || ln -sfn -- "$WARP_DIR/$name" "$link" || return 1
     done
 }
 
@@ -1781,8 +1781,13 @@ warp_sync_units() (
             changed=true
         fi
     done
+    for file in "$WARP_WATCH" "$WARP_TIMER"; do
+        [[ -e "/etc/systemd/system/$file" ]] || changed=true
+    done
     warp_watch_links || return 1
-    [[ "$changed" == true ]] && { systemctl daemon-reload || return 1; }
+    if [[ "$changed" == true || $(systemctl show -p NeedDaemonReload --value "$WARP_UNIT") == yes ]]; then
+        systemctl daemon-reload || return 1
+    fi
     if ! systemctl is-enabled --quiet "$WARP_UNIT"; then return 0; fi
     # 定时器随主服务启用；已启用但未运行（例如曾因缺少脚本而启动失败）时重新拉起。
     if systemctl enable "$WARP_DIR/$WARP_TIMER" >/dev/null 2>&1 &&
@@ -1984,19 +1989,20 @@ warp_remove() {
     [[ ! -L "$WARP_DIR" && -f "$WARP_DIR/.buds-managed" ]] ||
         { echo "目录缺少 buds 管理标记，已保留：$WARP_DIR" >&2; return 1; }
     if [[ "$WARP_DIR/$WARP_UNIT" -ef "/etc/systemd/system/$WARP_UNIT" ]]; then
-        if systemctl cat "$WARP_TIMER" >/dev/null 2>&1; then
+        if [[ "/etc/systemd/system/$WARP_TIMER" -ef "$WARP_DIR/$WARP_TIMER" ]]; then
             systemctl disable --now "$WARP_TIMER" >/dev/null 2>&1 || return 1
         fi
         systemctl stop "$WARP_UNIT" && systemctl disable "$WARP_UNIT" || return 1
-        local name link
-        for name in "$WARP_WATCH" "$WARP_TIMER"; do
-            link="/etc/systemd/system/$name"
-            if [[ "$link" -ef "$WARP_DIR/$name" ]]; then rm -f -- "$link" || return 1; fi
-        done
     elif [[ $(systemctl show -p LoadState --value "$WARP_UNIT") != not-found ]]; then
         echo "检测到同名系统服务，已保留配置，请检查 $WARP_UNIT。" >&2
         return 1
     fi
+    local name link
+    for name in "$WARP_WATCH" "$WARP_TIMER"; do
+        link="/etc/systemd/system/$name"
+        if [[ "$link" -ef "$WARP_DIR/$name" ]]; then rm -f -- "$link" || return 1; fi
+    done
+    rm -f -- /run/buds-warp-watch.failure || return 1
     rm -f -- "$WARP_DIR"/{domains,config.json,base.json,policy.py,preflight,link-up,healthcheck,fakeip.db,fallback-port} \
         "$WARP_DIR/$WARP_UNIT" "$WARP_DIR/$WARP_WATCH" "$WARP_DIR/$WARP_TIMER" || return 1
     rm -f -- "$WARP_DIR/.buds-managed" || return 1
@@ -2137,8 +2143,13 @@ warp_manage() (
                 }
             fi
             if [[ -s "$WARP_DIR/domains" ]] && ! grep -Fq '"198.18.240.3/32"' "$WARP_DIR/config.json"; then
-                echo "旧配置缺少出口探针，无法确认 WARP 出口。请安排维护时段更新分流配置。" >&2
-                return 1
+                if [[ "$action" == check ]]; then
+                    echo "旧配置缺少出口探针。请在维护时段选择 B 区第 14 项更新并验证。" >&2
+                    return 1
+                fi
+                systemctl restart "$WARP_UNIT" || return 1
+                grep -Fq '"198.18.240.3/32"' "$WARP_DIR/config.json" ||
+                    { echo "重载后仍缺少探针，请核对托管配置。" >&2; return 1; }
             fi
             local failed=0
             if ! warp_tunnel_probe; then
@@ -3741,6 +3752,10 @@ update_script() (
         echo "无法获取有效的仓库更新版本，请检查网络、更新分支和签名。" >&2
         return 1
     fi
+    if is_version_newer "$SCRIPT_VERSION" "$remote_ver"; then
+        printf '当前脚本 v%s 高于签名渠道 v%s，保留当前版本。\n' "$SCRIPT_VERSION" "$remote_ver"
+        return 0
+    fi
     if ! is_version_newer "$remote_ver" "$SCRIPT_VERSION"; then
         printf '当前已是最新版本（v%s）。\n' "$SCRIPT_VERSION"
         return 0
@@ -3864,7 +3879,7 @@ warp_menu_begin() {
 warp_options() {
     panel_choices "$C_CYAN" "$1" '一键安装并启用' '检测分流和出口' '管理分流域名' 'Gemini 出口地址族' \
         '关闭分流' '启用前诊断' '服务状态和日志' '准备依赖' '安装独立内核' '准备 WARP 配置' \
-        '迁移系统 DNS' '恢复原 DNS' '使用已有配置启用' '修复分流服务'
+        '迁移系统 DNS' '恢复原 DNS' '使用已有配置启用' '修复分流服务' '在线刷新保护脚本'
 }
 
 warp_menu() {
@@ -3882,7 +3897,7 @@ warp_menu() {
         echo '设置由所有节点共用。首次使用选 1，检查实际出口选 2。'
         warp_options "$(panel_width)"
         echo '  0. 返回首页'
-        read -rp 'B 区操作编号（0–14）：' choice || return 0
+        read -rp 'B 区操作编号（0–15）：' choice || return 0
         case "$choice" in
             1) warp_menu_begin || echo "引导未完成，可选择 6 检查并按提示重试。" ;;
             2) warp_manage check || true ;;
@@ -3927,8 +3942,13 @@ warp_menu() {
             14)
                 read -rp '修复会更新托管文件，必要时重启 WARP，已有分流连接可能中断。继续？[y/N] ' confirm || return 0
                 if [[ "${confirm,,}" == y ]]; then warp_manage repair || echo "修复未完成，请查看上方诊断。"; fi ;;
+            15)
+                if nodes_manage reserve-ports; then
+                    if [[ -d "$WARP_DIR" ]]; then warp_manage refresh || echo "分流保护文件刷新失败。"
+                    else echo "已检查节点端口。WARP 尚未启用。"; fi
+                else echo "源端口保护检查失败，请处理上方提示后重试。"; fi ;;
             0|"") return 0 ;;
-            *) echo "请输入 B 区的 1–14，或输入 0 返回首页。" ;;
+            *) echo "请输入 B 区的 1–15，或输入 0 返回首页。" ;;
         esac
         panel_pause 'B 区' || return 0
     done
@@ -4034,8 +4054,10 @@ case "$1" in
         if is_version_newer "$r_ver" "$SCRIPT_VERSION"; then
             echo "新版本可用: v${r_ver} (当前: v${SCRIPT_VERSION})"
             exit 0
+        elif is_version_newer "$SCRIPT_VERSION" "$r_ver"; then
+            echo "当前脚本 v$SCRIPT_VERSION 高于签名渠道 v$r_ver。"
         else
-            echo "已是最新版本: v${SCRIPT_VERSION}"
+            echo "已是最新版本: v$SCRIPT_VERSION"
             exit 0
         fi
         ;;

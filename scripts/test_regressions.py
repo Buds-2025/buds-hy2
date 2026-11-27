@@ -146,7 +146,7 @@ INPUT
         self.assertEqual(output.count("请先输入 A 或 B"), 4)
         nodes = output.split("A 节点管理", 1)[1].split("B WARP 分流管理", 1)[0]
         warp = output.split("B WARP 分流管理", 1)[1].split("U. 更新脚本", 1)[0]
-        for menu, n in ((nodes, 14), (warp, 14)):
+        for menu, n in ((nodes, 14), (warp, 15)):
             self.assertEqual(list(map(int, re.findall(r"\b(\d+)\. ", menu))), list(range(1, n + 1)))
 
     def test_panel_logo_and_numbered_grid_at_different_widths(self):
@@ -515,6 +515,7 @@ warp_manage() {
     printf '%s\n' "$*" >> "$ACTION_FILE"
     [[ "$1" != check ]]
 }
+nodes_manage() { echo "nodes $*" >> "$ACTION_FILE"; }
 warp_menu_begin() { echo wizard >> "$ACTION_FILE"; }
 warp_menu <<'INPUT'
 1
@@ -564,6 +565,7 @@ y
 n
 14
 y
+15
 0
 INPUT
 ''')
@@ -575,7 +577,7 @@ INPUT
             "domains remove example.org", "domains replace one.test two.test",
             "domains import /tmp/example", "domains reset", "gemini-family", "gemini-family ipv6",
             "disable", "doctor", "status", "setup", "setup --managed-core", "setup --new-profile",
-            "dns-switch", "dns-restore", "enable ", "repair",
+            "dns-switch", "dns-restore", "enable ", "repair", "nodes reserve-ports",
         ])
 
     def test_warp_wizard_reverts_only_dns_it_changed_for_this_attempt(self):
@@ -922,6 +924,30 @@ if warp_tunnel_probe; then exit 9; fi
             self.assertEqual(runtime.read_text(), config())
             peer[field] = previous
 
+    def test_installer_refuses_hopping_before_writing_a_node_on_reservation_failure(self):
+        self.shell(r"""
+check_root() { :; }
+detect_virtualization() { :; }; detect_init_system() { :; }
+install_dependencies() { :; }; setup_certificates() { :; }; install_official_core() { :; }
+collect_parameters() { IS_PORT_HOPPING=true; LISTEN_STR=:39000-39031; }
+prepare_install_ports() { echo "prepare $1" >> "$ACTION_FILE"; return 1; }
+generate_server_config() { echo config >> "$ACTION_FILE"; }
+configure_service() { echo service >> "$ACTION_FILE"; }
+configure_firewall() { echo firewall >> "$ACTION_FILE"; }
+start_service() { echo start >> "$ACTION_FILE"; }
+if main; then exit 9; fi
+""", "install.sh")
+        self.assertEqual(self.actions().splitlines(), ["prepare 39000-39031"])
+
+    def test_existing_udp_socket_after_reservation_aborts_and_reconciles(self):
+        manager = self.node_manager()
+        calls = []
+        manager["sync_reserved_ports"] = lambda **kwargs: calls.append(kwargs)
+        manager["listeners"] = lambda: [(40512, set())]
+        with self.assertRaisesRegex(ValueError, "40512"):
+            manager["protect_new_range"]("40500-40600", "40500-40510")
+        self.assertEqual(calls, [{"extra": "40500-40600"}, {}])
+
     def test_target_check_reports_partial_family_and_wrong_http_code(self):
         result = self.shell(r"""
 warp_domain_selected() { [[ "$1" == www.google.com ]]; }
@@ -939,6 +965,23 @@ if warp_target_check 2>&1; then exit 9; fi
         self.assertIn("IPv4 HTTPS 204", result)
         self.assertIn("IPv6 业务探测失败", result)
         self.assertEqual(len(self.actions().splitlines()), 2)
+
+    def test_refresh_updates_next_watch_and_boot_without_systemctl_actions(self):
+        python = shlex.quote(Path(sys.executable).as_posix())
+        self.shell(f'python3() {{ {python} -X utf8 "$@"; }}\n' + r"""
+mkdir -p "$WARP_DIR" "$SANDBOX/etc/systemd/system"
+touch "$WARP_DIR/.buds-managed" "$WARP_DIR/$WARP_UNIT"
+ln "$WARP_DIR/$WARP_UNIT" "$SANDBOX/etc/systemd/system/$WARP_UNIT"
+echo '{"endpoints":[]}' > "$WARP_DIR/base.json"
+echo original > "$WARP_DIR/config.json"
+has_systemd() { :; }; flock() { :; }
+warp_manage refresh
+[[ $(cat "$WARP_DIR/config.json") == original ]]
+[[ ! -s "$ACTION_FILE" ]]
+bash -n "$WARP_DIR/healthcheck" && bash -n "$WARP_DIR/link-up"
+grep -q 'apply-port' "$WARP_DIR/preflight"
+grep -q 'InvocationID' "$WARP_DIR/healthcheck"
+""")
 
     def test_warp_partial_install_cleanup_is_retryable(self):
         self.shell("""

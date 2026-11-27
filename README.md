@@ -144,7 +144,7 @@ buds hy2 warp domains reset                        # 用内置 Google 清单替�
 
 **日常检测**用B区第2项或`buds hy2 warp check`。它检查内核选路和WARP出口，并对清单覆盖的Google、YouTube逐个测试系统返回的IPv4、IPv6虚拟地址。每个HTTPS探测须返回204。检测失败会显示出错的域名和地址族，检查过程不会重启服务。客户端仍需从实际节点复测。
 
-**已有服务器升级**时先执行`buds hy2 update`，再运行`buds hy2 nodes reserve-ports`。已启用托管WARP的机器可以执行`buds hy2 warp refresh`，刷新下次启动和巡检使用的文件，当前进程和会话继续运行。早于1.7.3且还没有看门狗单元的安装，可在维护时段使用B区第14项或`buds hy2 warp repair`补齐单元并修复分流，必要时会重启WARP。
+**已有服务器升级**可在首页按U更新，随后进入B区第15项在线刷新保护。命令行先执行`buds hy2 update`，再运行`buds hy2 nodes reserve-ports`。已启用托管WARP的机器可以执行`buds hy2 warp refresh`，刷新下次启动和巡检使用的文件，当前进程和会话继续运行。早于1.7.3且还没有看门狗单元的安装，可在维护时段使用B区第14项或`buds hy2 warp repair`补齐单元并修复分流，必要时会重启WARP。
 
 **自动恢复**由`buds-warp-watch.timer`每五分钟执行。出口探针正常但Google或YouTube某个地址族异常时，巡检记录失败并保留会话。探针两次失败后会核对已选业务和原生网络；同一WARP会话跨两轮都满足重启条件时才尝试重连。启动阶段有独立的握手探测。对使用默认UDP 2408的Cloudflare入口，启动探测持续失败后，下次启动会尝试同一地址的500、1701、4500，依次循环。原始WireGuard配置继续保留。上游或线路持续不可用时，备用端口也可能失败。[Cloudflare入口及端口说明](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/deployment/firewall/)
 
