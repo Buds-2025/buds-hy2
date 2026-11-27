@@ -64,6 +64,8 @@ rc-service() {{ echo "rc-service $*" >> "$ACTION_FILE"; }}
 rc-update() {{ echo "rc-update $*" >> "$ACTION_FILE"; }}
 openrc-run() {{ :; }}
 pkill() {{ echo "pkill $*" >> "$ACTION_FILE"; }}
+# MSYS 无法创建符号链接；脚本用 ln -sfn 链接托管单元，这里以硬链接模拟其"同一文件"语义。
+ln() {{ if [[ "${{1:-}}" == -sfn ]]; then shift; command ln -f "$@"; else command ln "$@"; fi; }}
 killall() {{ echo "killall $*" >> "$ACTION_FILE"; }}
 nginx() {{ echo "nginx $*" >> "$ACTION_FILE"; }}
 sleep() {{ :; }}
@@ -736,19 +738,117 @@ if warp_tunnel_probe; then exit 9; fi
         grep -Fq "ExecStartPost=/usr/bin/env bash $WARP_DIR/link-up" "$WARP_DIR/$WARP_UNIT"
         grep -Fq "ExecStart=/usr/bin/env bash $WARP_DIR/healthcheck" "$WARP_DIR/$WARP_WATCH"
         grep -Fxq 'OnUnitActiveSec=5min' "$WARP_DIR/$WARP_TIMER"
-        [[ -e "$SANDBOX/etc/systemd/system/$WARP_TIMER" ]]
+        [[ -e "$SANDBOX/etc/systemd/system/$WARP_TIMER" && -e "$SANDBOX/etc/systemd/system/$WARP_WATCH" ]]
         [[ $(grep -c 'daemon-reload' "$ACTION_FILE") == 1 ]]
         [[ $(grep -c "start $WARP_TIMER" "$ACTION_FILE") == 1 ]]
+        # 真实安装中 /etc/systemd/system 下是指向托管文件的符号链接；此处硬链接在文件被替换后需重新指向。
+        ln -f "$WARP_DIR/$WARP_UNIT" "$SANDBOX/etc/systemd/system/$WARP_UNIT"
         : > "$ACTION_FILE"
         warp_sync_units
-        [[ ! -s "$ACTION_FILE" ]]
+        if grep -q 'daemon-reload' "$ACTION_FILE"; then exit 9; fi
+        grep -Fxq "start $WARP_TIMER" "$ACTION_FILE"
         touch "$WARP_DIR/config.json" "$WARP_DIR/healthcheck"
         # 真实安装中 /etc/systemd/system 下是指向托管文件的符号链接；此处用硬链接模拟，刷新后需重新指向。
         ln -f "$WARP_DIR/$WARP_UNIT" "$SANDBOX/etc/systemd/system/$WARP_UNIT"
         warp_remove
-        test ! -e "$WARP_DIR" && test ! -e "$SANDBOX/etc/systemd/system/$WARP_TIMER"
+        test ! -e "$WARP_DIR" && test ! -e "$SANDBOX/etc/systemd/system/$WARP_TIMER" && test ! -e "$SANDBOX/etc/systemd/system/$WARP_WATCH"
         grep -q -- "disable --now .*$WARP_TIMER" "$ACTION_FILE"
         """)
+
+    def test_warp_check_brings_an_old_install_up_to_date_without_reenabling(self):
+        python = shlex.quote(Path(sys.executable).as_posix())
+        self.shell(f'python3() {{ {python} -X utf8 "$@"; }}\n' + r"""
+        mkdir -p "$WARP_DIR" "$SANDBOX/bin" "$SANDBOX/etc/systemd/system"
+        touch "$WARP_DIR/.buds-managed"
+        printf '%s\n' '#!/usr/bin/env bash' > "$SANDBOX/bin/sing-box"
+        chmod 755 "$SANDBOX/bin/sing-box"
+        warp_exec_safe() { :; }
+        printf 'ExecStart=%s/bin/sing-box run -c %s/config.json\n' "$SANDBOX" "$WARP_DIR" > "$WARP_DIR/$WARP_UNIT"
+        ln "$WARP_DIR/$WARP_UNIT" "$SANDBOX/etc/systemd/system/$WARP_UNIT"
+        echo google.com > "$WARP_DIR/domains"
+        printf '%s\n' '{"route":{"rules":[{"ip_cidr":"198.18.240.3/32"}]}}' > "$WARP_DIR/config.json"
+        printf '%s\n' '# old link-up' > "$WARP_DIR/link-up"
+        systemctl() {
+            echo "$*" >> "$ACTION_FILE"
+            case "$1" in
+                is-active|is-enabled|daemon-reload|enable|start|restart) return 0 ;;
+                *) return 1 ;;
+            esac
+        }
+        has_systemd() { :; }
+        flock() { :; }
+        PROBES=0
+        warp_tunnel_probe() { PROBES=$((PROBES+1)); (( PROBES > 1 )); }
+        warp_verify() { :; }
+        warp_trace() { :; }
+        warp_gemini_check() { :; }
+        # 旧安装：缺少 healthcheck、link-up 无探测、隧道不通 → 升级、重启一次、再验证通过。
+        warp_manage check
+        [[ -x "$WARP_DIR/healthcheck" ]]
+        grep -q 'cdn-cgi/trace' "$WARP_DIR/link-up"
+        [[ -e "$WARP_DIR/$WARP_TIMER" ]]
+        grep -Fxq "enable $WARP_DIR/$WARP_TIMER" "$ACTION_FILE"
+        grep -Fxq "start $WARP_TIMER" "$ACTION_FILE"
+        [[ $(grep -c 'restart buds-warp-split.service' "$ACTION_FILE") == 1 ]]
+        if grep -qE ' (stop|disable) ' "$ACTION_FILE"; then exit 9; fi
+        # 隧道持续不通：报告失败而不是伪装成功。
+        : > "$ACTION_FILE"
+        warp_tunnel_probe() { return 1; }
+        if warp_manage check 2>/dev/null; then exit 9; fi
+        [[ $(grep -c 'restart buds-warp-split.service' "$ACTION_FILE") == 1 ]]
+        # 服务未运行（如重启限额停住）：清除状态并启动，不做重启。
+        : > "$ACTION_FILE"
+        systemctl() {
+            echo "$*" >> "$ACTION_FILE"
+            case "$1" in
+                is-active) return 1 ;;
+                *) return 0 ;;
+            esac
+        }
+        warp_tunnel_probe() { :; }
+        warp_manage check
+        grep -Fxq 'reset-failed buds-warp-split.service' "$ACTION_FILE"
+        grep -Fxq 'start buds-warp-split.service' "$ACTION_FILE"
+        if grep -q 'restart buds-warp-split.service' "$ACTION_FILE"; then exit 9; fi
+        """)
+
+    def test_hop_ranges_are_reserved_as_source_ports_and_converge(self):
+        manager = self.node_manager()
+        sync = manager["sync_reserved_ports"]
+        target = self.directory / "sysctl.d/99-buds-hy2-reserved-ports.conf"
+        manager["SYSCTL_FILE"] = target
+        calls = []
+        state = {"current": "50000-50010\n"}
+        def run(*args, **_):
+            calls.append(args)
+            return SimpleNamespace(returncode=0, stdout=state["current"])
+        manager["run"] = run
+        (self.config / "config.yaml").write_text("listen: :28965-49652\n", encoding="utf-8")
+        node = self.config / "nodes/work"
+        node.mkdir(parents=True)
+        node.joinpath("node.json").write_text(json.dumps({
+            "name": "work", "ports": "40000-40031", "public_ports": "40000-40031",
+            "domain": "node.example.com", "tls": "shared"}), encoding="utf-8")
+        line = "net.ipv4.ip_local_reserved_ports = "
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            # 主节点范围吸收了节点范围，文件只记录本项目范围；运行值保留其他工具设置的 50000-50010。
+            manager["PRIMARY_LISTEN"] = "28965-49652"
+            sync()
+            self.assertIn(line + "28965-49652", target.read_text(encoding="utf-8"))
+            self.assertIn(("sysctl", "-q", "-w", "net.ipv4.ip_local_reserved_ports=28965-49652,50000-50010"), calls)
+            # 跳跃改为单端口：本项目范围从运行值和文件中收回，外来范围仍在。
+            manager["PRIMARY_LISTEN"] = "24443"
+            node.joinpath("node.json").write_text(json.dumps({
+                "name": "work", "ports": "24443", "public_ports": "24443",
+                "domain": "node.example.com", "tls": "shared"}), encoding="utf-8")
+            state["current"] = "28965-49652,50000-50010\n"
+            sync()
+            self.assertIn(("sysctl", "-q", "-w", "net.ipv4.ip_local_reserved_ports=50000-50010"), calls)
+            # 外来范围已被其所属工具取消：运行值清空，文件保持移除。
+            state["current"] = "\n"
+            sync()
+        self.assertFalse(target.exists())
+        self.assertEqual(calls[-1], ("sysctl", "-q", "-w", "net.ipv4.ip_local_reserved_ports="))
 
     def test_warp_partial_install_cleanup_is_retryable(self):
         self.shell("""
@@ -831,7 +931,7 @@ systemctl() {
     case "$1" in
         is-active) [[ "${!#}" == systemd-resolved || -f "$SANDBOX/active" ]] ;;
         show) echo not-found ;;
-        enable) shift; for unit in "$@"; do ln "$unit" "$SANDBOX/etc/systemd/system/${unit##*/}"; done ;;
+        enable) shift; for unit in "$@"; do ln -f "$unit" "$SANDBOX/etc/systemd/system/${unit##*/}"; done ;;
         start|restart)
             (cd "$WARP_DIR" && python3 policy.py render base.json ../warp-domains .) || return 1
             if [[ -e "$SANDBOX/fail-once" ]]; then rm "$SANDBOX/fail-once"; return 1; fi
@@ -857,7 +957,7 @@ if warp_manage domains add 'https://wrong.example/path' accepted.example; then e
 if grep -Fxq accepted.example "$WARP_LIST"; then exit 9; fi
 warp_manage enable "$profile_path"
 [[ -s "$WARP_DIR/config.json" && -e "$unit_path" && -e "$SANDBOX/active" ]]
-[[ -e "$SANDBOX/etc/systemd/system/$WARP_TIMER" && -x "$WARP_DIR/healthcheck" ]]
+[[ -e "$SANDBOX/etc/systemd/system/$WARP_TIMER" && -e "$SANDBOX/etc/systemd/system/$WARP_WATCH" && -x "$WARP_DIR/healthcheck" ]]
 if warp_manage domains add example.net; then exit 9; fi
 if grep -Fxq example.net "$WARP_LIST"; then exit 9; fi
 warp_domain_selected child.example.com
@@ -881,6 +981,7 @@ python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); assert c["route"]["
 warp_manage domains add only.example
 warp_manage enable "$profile_path"
 warp_manage disable
+[[ ! -e "$SANDBOX/etc/systemd/system/$WARP_WATCH" && ! -e "$SANDBOX/etc/systemd/system/$WARP_TIMER" ]]
 warp_manage disable
 [[ ! -e "$WARP_DIR" && ! -e "$unit_path" && ! -e "$SANDBOX/active" && -s "$profile_path" ]]
 [[ $(warp_manage domains list) == only.example ]]
