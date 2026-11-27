@@ -123,7 +123,7 @@ check_port_available() {
         awk -v first="$first" -v last="$last" '{
             count=split($4,parts,":"); port=parts[count]
             if (port ~ /^[0-9]+$/ && port+0 >= first && port+0 <= last) {found=port; exit}
-        } END {if (found) {print "UDP " found " 已被占用。" > "/dev/stderr"; exit 1}}' <<< "$sockets"
+        } END {if (found) {print "UDP " found " 已被占用。"; exit 1}}' <<< "$sockets"
         return
     fi
     [[ -r /proc/net/udp ]] || return 2
@@ -141,7 +141,7 @@ generate_random_port() {
     local port attempts
     for ((attempts=0; attempts<100; attempts++)); do
         port=$((20000 + RANDOM % 30001))
-        if check_port_available "$port" 2>/dev/null; then
+        if check_port_available "$port" >/dev/null 2>&1; then
             printf '%s\n' "$port"
             return 0
         elif [[ $? != 1 ]]; then
@@ -165,7 +165,7 @@ install_dependencies() {
     elif command -v apk >/dev/null 2>&1; then
         apk update >/dev/null 2>&1 || true
         apk add --no-cache curl openssl ca-certificates procps >/dev/null 2>&1 || true
-        apk add --no-cache python3 util-linux >/dev/null 2>&1 || true
+        apk add --no-cache python3 py3-yaml util-linux >/dev/null 2>&1 || true
         apk add --no-cache wget iptables iproute2 bind-tools libcap shadow tzdata >/dev/null 2>&1 || true
         apk add --no-cache certbot >/dev/null 2>&1 || true
         apk add --no-cache certbot-nginx >/dev/null 2>&1 || true

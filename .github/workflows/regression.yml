@@ -25,3 +25,19 @@ jobs:
         run: /usr/bin/python3 scripts/test_regressions.py
       - name: Verify port reservations with the Linux kernel
         run: sudo unshare --net -- /usr/bin/python3 scripts/test_regressions.py --verify-netns
+  fresh-install:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['debian:bookworm-slim', 'alpine:3.22']
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install and test a native HY2 connection in a disposable container
+        env:
+          DIST_IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/src:ro" "$DIST_IMAGE" sh -ec '
+            if command -v apk >/dev/null; then apk add --no-cache bash; fi
+            exec bash /src/scripts/test_container.sh'
