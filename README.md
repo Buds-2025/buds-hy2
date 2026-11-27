@@ -20,7 +20,7 @@ install -m 0644 -o root -g root update.pub /etc/buds-hy2/update.pub
 ```bash
 (
   set -e
-  version=1.7.4
+  version=1.7.5
   base="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates/releases/$version"
   work=$(mktemp -d)
   trap 'rm -rf -- "$work"' EXIT
@@ -169,7 +169,7 @@ buds hy2 warp domains reset                        # 用内置 Google 清单替�
 ```bash
 (
   set -e
-  version=1.7.4
+  version=1.7.5
   base="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates/releases/$version"
   work=$(mktemp -d /usr/local/bin/.buds_upgrade.XXXXXX)
   trap 'rm -rf -- "$work"' EXIT
@@ -201,6 +201,10 @@ buds hy2 warp domains reset                        # 用内置 Google 清单替�
 Let's Encrypt模式会复用并启用已有续签定时器或cron任务，缺失时自动补建。无init容器需要保持cron进程运行；自签名模式不创建续签任务。卸载会清除本项目创建的定时任务和`rc.local`启动行，保留其他服务的任务。
 
 必需依赖缺失会明确停止安装，Certbot缺失仍允许使用自签名模式。Arch分支使用现有软件库索引安装依赖，不刷新索引后进行部分升级，也不自动升级整台服务器。
+
+已安装的旧节点可在管理脚本更新后执行`buds hy2 renew-hook`，将原版HY2 Certbot钩子迁移到热更新方式。命令核对原钩子内容，保留定制钩子。新钩子只处理对应证书，核对域名和私钥后替换文件，已建立的连接继续使用原会话。[Hysteria TLS 配置](https://v2.hysteria.network/docs/advanced/Full-Server-Config/#tls)
+
+全新安装会为原生客户端配置本机SOCKS5入口`127.0.0.1:1080`。新装的网络调优仅在需要时提高UDP套接字缓冲区上限。卸载会保留配置目录内的其他文件、管理员的systemd附加配置及其他程序占用的快捷命令。
 
 开发验证：`python scripts/test_regressions.py`执行隔离回归测试（需Python 3和Bash），`python scripts/sync_cli.py --check`检查CLI与安装器内嵌版本的一致性。测试使用临时文件和系统命令替身，不执行真实安装。
 

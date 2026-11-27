@@ -16,7 +16,7 @@ OVERRIDE_DIR="/etc/systemd/system/hysteria-server.service.d"
 OVERRIDE_FILE="${OVERRIDE_DIR}/override.conf"
 SERVICE_FILE="/etc/systemd/system/hysteria-server.service"
 SYSCTL_FILE="/etc/sysctl.d/99-hysteria-performance.conf"
-SCRIPT_VERSION="1.7.4"
+SCRIPT_VERSION="1.7.5"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 
@@ -111,46 +111,46 @@ detect_init_system() {
 }
 
 generate_random_string() {
-    local length=${1:-16}
-    if command -v openssl >/dev/null 2>&1; then
-        openssl rand -base64 32 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c "$length"
-    elif [[ -r /dev/urandom ]]; then
-        head /dev/urandom | tr -dc 'A-Za-z0-9' | head -c "$length" 2>/dev/null || true
-    else
-        awk -v len="$length" 'BEGIN{srand(); chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; for(i=1;i<=len;i++) s=s substr(chars, int(rand()*length(chars)+1), 1); print s}'
-    fi
+    local bytes=${1:-12} value
+    value=$(openssl rand -hex "$bytes") && (( ${#value} == bytes * 2 )) &&
+        [[ "$value" =~ ^[0-9a-fA-F]+$ ]] || return 1
+    printf '%s' "$value"
 }
 
 check_port_available() {
-    local port="$1"
-    if command -v ss >/dev/null 2>&1; then
-        if ss -ulpn 2>/dev/null | grep -E ":${port}\b" | grep -qv "hysteria"; then
-            return 1
-        fi
-    elif command -v netstat >/dev/null 2>&1; then
-        if netstat -ulpn 2>/dev/null | grep -E ":${port}\b" | grep -qv "hysteria"; then
-            return 1
-        fi
+    local first=$1 last=${2:-$1} sockets file low high
+    if sockets=$(ss -H -uan 2>/dev/null) || sockets=$(netstat -anu 2>/dev/null); then
+        awk -v first="$first" -v last="$last" '{
+            count=split($4,parts,":"); port=parts[count]
+            if (port ~ /^[0-9]+$/ && port+0 >= first && port+0 <= last) {found=port; exit}
+        } END {if (found) {print "UDP " found " 已被占用。" > "/dev/stderr"; exit 1}}' <<< "$sockets"
+        return
     fi
-    return 0
+    [[ -r /proc/net/udp ]] || return 2
+    low=$(printf 'x%04X' "$first"); high=$(printf 'x%04X' "$last")
+    for file in /proc/net/udp /proc/net/udp6; do
+        [[ -e "$file" ]] || continue
+        [[ -r "$file" ]] || return 2
+        awk -v low="$low" -v high="$high" 'NR>1 {
+            split($2,a,":"); port="x" toupper(a[2]); if (port >= low && port <= high) {found=1; exit}
+        } END {exit found ? 1 : 0}' "$file" || return $?
+    done
 }
 
 generate_random_port() {
-    local port
-    local attempts=0
-    while (( attempts < 100 )); do
-        if command -v shuf >/dev/null 2>&1; then
-            port=$(shuf -i 20000-50000 -n 1)
-        else
-            port=$(awk -v min=20000 -v max=50000 'BEGIN{srand(); print int(min+rand()*(max-min+1))}')
-        fi
-        if check_port_available "$port"; then
-            echo "$port"
+    local port attempts
+    for ((attempts=0; attempts<100; attempts++)); do
+        port=$((20000 + RANDOM % 30001))
+        if check_port_available "$port" 2>/dev/null; then
+            printf '%s\n' "$port"
             return 0
+        elif [[ $? != 1 ]]; then
+            echo "无法读取本机 UDP 套接字，请检查 ss、netstat 或 /proc/net/udp。" >&2
+            return 1
         fi
-        attempts=$((attempts + 1))
     done
-    echo "38443"
+    echo "连续抽查均未找到空闲端口，请检查本机 UDP 占用。" >&2
+    return 1
 }
 
 install_dependencies() {
@@ -282,7 +282,7 @@ collect_parameters() {
 
     validate_domain
 
-    DEFAULT_RANDOM_PORT=$(generate_random_port)
+    DEFAULT_RANDOM_PORT=$(generate_random_port) || return 1
     echo -e "\n${C_BOLD}端口配置支持以下格式：${C_RESET}"
     echo -e "  - ${C_GRAY}直接回车${C_RESET} : 随机高位单端口 (如 ${C_CYAN}${DEFAULT_RANDOM_PORT}${C_RESET})"
     echo -e "  - ${C_GRAY}指定单端口${C_RESET}: 输入具体端口号 (如 ${C_CYAN}38443${C_RESET})"
@@ -300,20 +300,13 @@ collect_parameters() {
         if [[ "$INPUT_PORT" =~ ^([0-9]+)[:\-]([0-9]+)$ ]]; then
             local hop_start="${BASH_REMATCH[1]}"
             local hop_end="${BASH_REMATCH[2]}"
-            if command -v ss >/dev/null 2>&1; then
-                local used_in_range
-                used_in_range=$(ss -H -uan 2>/dev/null | awk -v s="$hop_start" -v e="$hop_end" '
-                    {
-                        address = $4
-                        if (match(address, /:[0-9]+$/)) {
-                            p = substr(address, RSTART + 1) + 0
-                            if (p >= s && p <= e) { print p; exit }
-                        }
-                    }' || true)
-                if [[ -n "$used_in_range" ]]; then
-                    warn "端口范围 ${hop_start}-${hop_end} 内检测到 UDP 端口 ${used_in_range} 已被占用，请换一个范围。"
-                    continue
-                fi
+            if check_port_available "$hop_start" "$hop_end"; then :
+            elif [[ $? == 1 ]]; then
+                warn "范围 ${hop_start}-${hop_end} 内有已占用的 UDP 端口，请换一个范围。"
+                continue
+            else
+                error "无法读取本机 UDP 套接字。"
+                return 1
             fi
             IS_PORT_HOPPING=true
             HOP_START="$hop_start"
@@ -326,12 +319,13 @@ collect_parameters() {
             break
         else
             local single_port="$INPUT_PORT"
-            if ! check_port_available "$single_port"; then
-                warn "UDP 端口 ${single_port} 目前已被其他进程占用！"
-                read -rp "是否仍然强制使用该端口？(y/N) [默认 N]: " force_use
-                if [[ ! "$force_use" =~ ^[Yy]$ ]]; then
-                    continue
-                fi
+            if check_port_available "$single_port"; then :
+            elif [[ $? == 1 ]]; then
+                warn "UDP 端口 $single_port 已被占用，请输入其他端口。"
+                continue
+            else
+                error "无法读取本机 UDP 套接字。"
+                return 1
             fi
             IS_PORT_HOPPING=false
             SINGLE_PORT="$single_port"
@@ -357,8 +351,12 @@ collect_parameters() {
         info "请在服务商面板将公网 UDP ${CLIENT_PORT_STR} 映射到本机监听 ${LISTEN_STR#:}。"
     fi
 
-    AUTH_PASSWORD="Hy2Pass_$(generate_random_string 12)"
-    OBFS_PASSWORD="Obfs_$(generate_random_string 12)"
+    local auth_secret obfs_secret
+    auth_secret=$(generate_random_string 12) && obfs_secret=$(generate_random_string 12) &&
+        [[ "$auth_secret" =~ ^[A-Za-z0-9]{24}$ && "$obfs_secret" =~ ^[A-Za-z0-9]{24}$ ]] ||
+        { error "无法生成节点密码，请检查 OpenSSL 的随机数生成器。"; return 1; }
+    AUTH_PASSWORD="Hy2Pass_$auth_secret"
+    OBFS_PASSWORD="Obfs_$obfs_secret"
 }
 
 is_nginx_running() {
@@ -562,6 +560,65 @@ TIMER_EOF
     success "证书自动续签任务已启用。"
 }
 
+sync_node_certificate() (
+    set -euo pipefail
+    umask 077
+    local domain=$1 dest=$2 lineage="/etc/letsencrypt/live/$1" work cert_pub key_pub
+    [[ -z "${RENEWED_LINEAGE:-}" || "${RENEWED_LINEAGE%/}" == "$lineage" ]] || return 0
+    [[ -s "$lineage/fullchain.pem" && -s "$lineage/privkey.pem" ]] ||
+        { echo "找不到 $lineage 对应的证书和私钥，请核对 Certbot 的证书名称。" >&2; return 1; }
+    [[ -d "$dest" && ! -L "$dest" && ! -L "$dest/server.key" && ! -L "$dest/server.crt" ]] || return 1
+    if cmp -s "$lineage/fullchain.pem" "$dest/server.crt" && cmp -s "$lineage/privkey.pem" "$dest/server.key"; then return 0; fi
+    work=$(mktemp -d "$dest/.cert-sync.XXXXXX") || return 1
+    trap 'rm -rf -- "$work"' EXIT
+    cp -L -- "$lineage/fullchain.pem" "$work/cert" && cp -L -- "$lineage/privkey.pem" "$work/key" || return 1
+    cert_pub=$(openssl x509 -in "$work/cert" -noout -pubkey) &&
+        key_pub=$(openssl pkey -in "$work/key" -passin pass: -pubout) &&
+        [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] &&
+        openssl verify -partial_chain -trusted "$work/cert" -verify_hostname "$domain" "$work/cert" >/dev/null ||
+        { echo "新证书无效、已过期或与私钥不匹配。" >&2; return 1; }
+    if id hysteria >/dev/null 2>&1; then chown root:hysteria "$work/cert" "$work/key" || return 1; fi
+    chmod 640 "$work/cert" "$work/key" || return 1
+    if [[ -f "$dest/server.key" ]]; then cp -p -- "$dest/server.key" "$work/previous" || return 1; fi
+    mv -f -- "$work/key" "$dest/server.key" || return 1
+    if ! mv -f -- "$work/cert" "$dest/server.crt"; then
+        if [[ -f "$work/previous" ]]; then mv -f -- "$work/previous" "$dest/server.key" || { trap - EXIT; echo "原私钥保存在 $work/previous，请恢复后重试。" >&2; return 1; }
+        else rm -f -- "$dest/server.key"; fi
+        return 1
+    fi
+)
+
+render_cert_hook() {
+    printf '#!/usr/bin/env bash\n# buds-hy2 certificate deploy hook\n'
+    declare -f sync_node_certificate
+    printf 'sync_node_certificate %q %q\n' "$1" "$CONFIG_DIR"
+}
+
+cert_hook_kind() {
+    local hook=$1 domain body
+    [[ -f "$hook" && ! -L "$hook" ]] || return 1
+    domain=$(sed -nE 's/^sync_node_certificate ([A-Za-z0-9.-]+) .*/\1/p' "$hook")
+    if [[ "$domain" =~ ^[a-zA-Z0-9.-]+$ ]] && cmp -s "$hook" <(render_cert_hook "$domain"); then echo current; return 0; fi
+    body=$(tail -n +6 "$hook" | openssl dgst -sha256) || return 1
+    domain=$(sed -n '3s/^DOMAIN=//p' "$hook")
+    if [[ "${body##* }" != 0f192c00ba10902391387e2ca43bb2ac8cdc316a513b688d10019918566954d5 || ! "$domain" =~ ^[a-zA-Z0-9.-]+$ ]] ||
+            ! cmp -s <(head -n 5 "$hook") <(printf '#!/usr/bin/env bash\nset -e\nDOMAIN=%q\nCONFIG_DIR=%q\nCONFIG_FILE=%q\n' "$domain" "$CONFIG_DIR" "$CONFIG_FILE"); then
+        return 1
+    fi
+    echo legacy
+}
+
+write_cert_hook() (
+    local target=$1 domain=$2 stage
+    [[ ! -L "$target" && ! -d "$target" ]] || return 1
+    if [[ -e "$target" ]] && ! cert_hook_kind "$target" >/dev/null; then
+        echo "已保留已有续签钩子 $target，请核对其用途。" >&2; return 1
+    fi
+    stage=$(mktemp "${target}.XXXXXX") || return 1
+    trap 'rm -f -- "$stage"' EXIT
+    render_cert_hook "$domain" > "$stage" && bash -n "$stage" && chmod 755 "$stage" && mv -f -- "$stage" "$target"
+)
+
 setup_certificates() {
     info "配置 SSL 证书..."
 
@@ -660,47 +717,8 @@ setup_certificates() {
 
     mkdir -p "$CONFIG_DIR" "$HOOK_DIR"
 
-    {
-        printf '#!/usr/bin/env bash\nset -e\n'
-        printf 'DOMAIN=%q\n' "$DOMAIN"
-        printf 'CONFIG_DIR=%q\n' "$CONFIG_DIR"
-        printf 'CONFIG_FILE=%q\n' "$CONFIG_FILE"
-        cat <<'HOOK_EOF'
-if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
-    mkdir -p "${CONFIG_DIR}"
-    cp -L "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${CONFIG_DIR}/server.crt"
-    cp -L "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "${CONFIG_DIR}/server.key"
-    if id hysteria >/dev/null 2>&1; then
-        chown root:hysteria "${CONFIG_DIR}/server.crt" "${CONFIG_DIR}/server.key" 2>/dev/null || true
-    fi
-    chmod 640 "${CONFIG_DIR}/server.crt" "${CONFIG_DIR}/server.key"
-    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] && systemctl is-active --quiet hysteria-server 2>/dev/null; then
-        systemctl restart hysteria-server
-    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1 && command -v openrc-run >/dev/null 2>&1 && [[ -f /run/openrc/softlevel ]] && rc-service hysteria-server status >/dev/null 2>&1; then
-        rc-service hysteria-server restart
-    elif [[ -x /usr/local/bin/hysteria-service ]]; then
-        /usr/local/bin/hysteria-service restart
-    elif pgrep -fx "/usr/local/bin/hysteria server (-c|--config) /etc/hysteria/config[.]yaml" >/dev/null 2>&1; then
-        pkill -fx "/usr/local/bin/hysteria server (-c|--config) /etc/hysteria/config[.]yaml"
-        stopped=false
-        for _ in 1 2 3 4 5; do
-            if ! pgrep -fx "/usr/local/bin/hysteria server (-c|--config) /etc/hysteria/config[.]yaml" >/dev/null 2>&1; then
-                stopped=true
-                break
-            fi
-            sleep 1
-        done
-        if [[ "$stopped" != true ]]; then
-            echo "Hysteria 2 旧进程未停止，证书已同步，取消重新启动。" >&2
-            exit 1
-        fi
-        nohup /usr/local/bin/hysteria server -c "${CONFIG_FILE}" >/var/log/hysteria.log 2>&1 &
-    fi
-fi
-HOOK_EOF
-    } > "$HOOK_FILE"
-    chmod +x "$HOOK_FILE"
-    "$HOOK_FILE"
+    sync_node_certificate "$DOMAIN" "$CONFIG_DIR" || return 1
+    write_cert_hook "$HOOK_FILE" "$DOMAIN" || return 1
 
     configure_renewal || warn "证书已部署，但自动续签定时任务配置失败，请稍后手动检查系统 cron 或 systemd timer。"
 
@@ -809,7 +827,8 @@ ensure_service_account() {
     fi
 }
 
-generate_server_config() {
+generate_server_config() (
+    umask 077
     info "写入服务端安全加固与极致性能配置..."
     cat <<EOF > "$CONFIG_FILE"
 listen: ${LISTEN_STR}
@@ -841,53 +860,38 @@ masquerade:
 EOF
 
     if ensure_service_account; then
-        chown -R root:hysteria "$CONFIG_DIR" 2>/dev/null || true
+        chown root:hysteria "$CONFIG_DIR" "$CONFIG_FILE" "$CONFIG_DIR/server.crt" "$CONFIG_DIR/server.key" || return 1
         chmod 750 "$CONFIG_DIR"
         chmod 640 "$CONFIG_FILE"
         success "服务端配置文件写入完毕 (权限 640，归属 root:hysteria)。"
     else
-        chown -R root:root "$CONFIG_DIR" 2>/dev/null || true
+        chown root:root "$CONFIG_DIR" "$CONFIG_FILE" "$CONFIG_DIR/server.crt" "$CONFIG_DIR/server.key" || return 1
         chmod 700 "$CONFIG_DIR"
         chmod 600 "$CONFIG_FILE"
         success "服务端配置文件写入完毕 (权限 600，归属 root:root)。"
     fi
-}
+)
 
-tune_kernel_network() {
-    info "优化系统内核网络栈与 64MB UDP 缓冲区..."
-
-    # 容器环境或只读 proc 检测
-    if [[ "$IS_CONTAINER" == "true" || ! -w /proc/sys/net/core/rmem_max ]]; then
-        info "检测到容器虚拟化环境或内核参数受限，跳过底层内核网络栈修改 (保持容器兼容性)。"
+tune_kernel_network() (
+    [[ "$IS_CONTAINER" != true && -w /proc/sys/net/core/rmem_max ]] || return 0
+    local file="$SYSCTL_FILE" key current stage
+    if [[ -e "$file" || -L "$file" ]]; then
+        info "已有 $file，沿用本机调优配置。"
         return 0
     fi
-
-    modprobe tcp_bbr >/dev/null 2>&1 || true
-    modprobe sch_fq >/dev/null 2>&1 || true
-
-    if [[ -f /etc/modules ]] && ! grep -q "^tcp_bbr" /etc/modules 2>/dev/null; then
-        printf '\ntcp_bbr\n' >> /etc/modules 2>/dev/null || true
-    fi
-    if [[ -f /etc/modules ]] && ! grep -q "^sch_fq" /etc/modules 2>/dev/null; then
-        printf '\nsch_fq\n' >> /etc/modules 2>/dev/null || true
-    fi
-
-    mkdir -p /etc/sysctl.d
-    cat <<EOF > "$SYSCTL_FILE"
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
-net.core.optmem_max=65536
-net.core.netdev_max_backlog=100000
-net.ipv4.udp_rmem_min=16384
-net.ipv4.udp_wmem_min=16384
-net.ipv4.conf.default.rp_filter=2
-net.ipv4.conf.all.rp_filter=2
-EOF
-    sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || warn "部分网络调优未能应用，请核对本项目的 sysctl 文件。"
-    success "内核网络栈调优已生效 (64MB UDP 缓冲区 + BBR 拥塞控制)。"
-}
+    mkdir -p /etc/sysctl.d || return 1
+    stage=$(mktemp "${file}.XXXXXX") || return 1
+    trap 'rm -f -- "$stage"' EXIT
+    echo '# buds-hy2 UDP socket buffers' > "$stage"
+    for key in net.core.rmem_max net.core.wmem_max; do
+        current=$(sysctl -n "$key") && [[ "$current" =~ ^[0-9]+$ ]] || continue
+        if (( current < 67108864 )); then printf '%s=67108864\n' "$key" >> "$stage"; fi
+    done
+    grep -q '^net' "$stage" || return 0
+    chmod 644 "$stage" && ln -- "$stage" "$file" || return 1
+    if sysctl -p "$file" >/dev/null; then success "已提高 UDP 套接字缓冲区上限。"
+    else warn "部分缓冲区上限未能应用，请核对 $file。"; fi
+)
 
 configure_service() {
     info "设置服务守护进程与高可用自愈..."
@@ -1184,6 +1188,15 @@ start_service() {
     fi
 }
 
+ensure_hy2_alias() {
+    if [[ -L "$HY2_CLI" && $(readlink -- "$HY2_CLI") == "$BUDS_CLI" || "$HY2_CLI" -ef "$BUDS_CLI" ]]; then return 0; fi
+    if [[ -e "$HY2_CLI" || -L "$HY2_CLI" ]]; then
+        echo "$HY2_CLI 已被占用。可使用 buds hy2。" >&2
+        return 1
+    fi
+    ln -s -- "$BUDS_CLI" "$HY2_CLI"
+}
+
 setup_cli() {
     local client_insecure="false" client_pin="" pin_line=""
     if is_cert_self_signed; then
@@ -1199,7 +1212,7 @@ setup_cli() {
         chmod 600 "${CONFIG_DIR}/.nat-mode"
     fi
 
-    cat <<EOF > "$CLIENT_CONFIG_FILE"
+    (umask 077; cat <<EOF > "$CLIENT_CONFIG_FILE"
 server: ${DOMAIN}:${CLIENT_PORT_STR}
 auth: "${AUTH_PASSWORD}"
 tls:
@@ -1210,18 +1223,27 @@ obfs:
   type: salamander
   salamander:
     password: "${OBFS_PASSWORD}"
+socks5:
+  listen: 127.0.0.1:1080
 # 带宽配置（Brutal 拥塞控制）：填入本地实际上下行速率；如在 TUN 模式遇 QoS 偶发断流，可注释此段以平滑走标准 BBR
 bandwidth:
   up: 100 mbps
   down: 300 mbps
 EOF
+    ) || return 1
     chown root:root "$CLIENT_CONFIG_FILE" 2>/dev/null || true
     chmod 600 "$CLIENT_CONFIG_FILE"
 
     # 生成极客优雅的全局管理命令 /usr/local/bin/buds
-    write_buds_cli || return 1
-    chmod 755 "$BUDS_CLI"
-    ln -sf "$BUDS_CLI" "$HY2_CLI"
+    (
+        local installed="$BUDS_CLI" stage
+        stage=$(mktemp "${installed}.XXXXXX") || exit 1
+        trap 'rm -f -- "$stage"' EXIT
+        BUDS_CLI="$stage"
+        write_buds_cli && bash -n "$stage" && chmod 755 "$stage" &&
+            [[ ! -d "$installed" ]] && mv -f -- "$stage" "$installed"
+    ) || return 1
+    if ! ensure_hy2_alias; then success "管理命令已安装，请使用 buds hy2。"; return 0; fi
     success "已配置快捷管理命令：'buds hy2' 或 'hy2'。"
 }
 
@@ -1233,7 +1255,7 @@ set -e
 CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.yaml"
-SCRIPT_VERSION="1.7.4"
+SCRIPT_VERSION="1.7.5"
 BUDS_CLI="/usr/local/bin/buds"
 HY2_CLI="/usr/local/bin/hy2"
 UPDATE_REPO_URL="https://raw.githubusercontent.com/Buds-2025/buds-hy2/updates"
@@ -1281,7 +1303,7 @@ get_domain() {
         domain=$(awk -F': *' '/^[[:space:]]*sni:/ {gsub(/^["'\'' ]+|["'\'' \r]+$/, "", $2); print $2; exit}' "$CLIENT_CONFIG_FILE" 2>/dev/null)
     fi
     if [[ -z "$domain" ]]; then
-        domain=$(grep -o 'live/[^/]*' /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh 2>/dev/null | cut -d'/' -f2 | head -1)
+        domain=$(sed -nE 's/^DOMAIN=([A-Za-z0-9.-]+)$/\1/p; s/^sync_node_certificate ([A-Za-z0-9.-]+) .*/\1/p' /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh 2>/dev/null | head -1)
     fi
     if [[ -z "$domain" && -f "${CONFIG_DIR}/server.crt" ]]; then
         domain=$(openssl x509 -in "${CONFIG_DIR}/server.crt" -noout -subject -nameopt RFC2253 2>/dev/null |
@@ -1702,7 +1724,7 @@ client() {
     [[ -n "$base_port" ]] || base_port=443
 
     if [[ ! -f "$CLIENT_CONFIG_FILE" ]]; then
-        cat <<CLIENT_YAML_EOF > "$CLIENT_CONFIG_FILE"
+        (umask 077; cat <<CLIENT_YAML_EOF > "$CLIENT_CONFIG_FILE"
 server: ${domain}:${public_ports}
 auth: "${password}"
 tls:
@@ -1713,11 +1735,14 @@ obfs:
   type: salamander
   salamander:
     password: "${obfs_pwd}"
+socks5:
+  listen: 127.0.0.1:1080
 # 带宽配置（Brutal 拥塞控制）：填入本地实际上下行速率；如在 TUN 模式遇 QoS 偶发断流，可注释此段以平滑走标准 BBR
 bandwidth:
   up: 100 mbps
   down: 300 mbps
 CLIENT_YAML_EOF
+        ) || return 1
         chown root:root "$CLIENT_CONFIG_FILE" 2>/dev/null || true
         chmod 600 "$CLIENT_CONFIG_FILE"
     else
@@ -1741,11 +1766,15 @@ CLIENT_YAML_EOF
             in_obfs && /^[[:space:]]+password:[[:space:]]*("")?[[:space:]]*$/ {
                 sub(/password:.*/, ""); print $0 "password: \"" ENVIRON["BUDS_EXPORT_OBFS"] "\""; next
             }
+            /^[^[:space:]#]/ && !/^(server|auth|tls|obfs|bandwidth):/ {custom=1}
             /^tls:[[:space:]]*$/ {found=1; in_tls=1; print; security(); next}
             /^[^[:space:]#]/ {in_tls=0}
             in_tls && /^[[:space:]]*(insecure|pinSHA256):/ {next}
             {print}
-            END {if (!found) {print "tls:"; print "  sni: " domain; security()}}
+            END {
+                if (!found) {print "tls:"; print "  sni: " domain; security()}
+                if (!custom) {print "socks5:"; print "  listen: 127.0.0.1:1080"}
+            }
         ' "$CLIENT_CONFIG_FILE" > "$updated"; then
             rm -f "$updated"
             return 1
@@ -1810,12 +1839,84 @@ CLIENT_YAML_EOF
     echo -e "${C_RESET}"
 }
 
+sync_node_certificate() (
+    set -euo pipefail
+    umask 077
+    local domain=$1 dest=$2 lineage="/etc/letsencrypt/live/$1" work cert_pub key_pub
+    [[ -z "${RENEWED_LINEAGE:-}" || "${RENEWED_LINEAGE%/}" == "$lineage" ]] || return 0
+    [[ -s "$lineage/fullchain.pem" && -s "$lineage/privkey.pem" ]] ||
+        { echo "找不到 $lineage 对应的证书和私钥，请核对 Certbot 的证书名称。" >&2; return 1; }
+    [[ -d "$dest" && ! -L "$dest" && ! -L "$dest/server.key" && ! -L "$dest/server.crt" ]] || return 1
+    if cmp -s "$lineage/fullchain.pem" "$dest/server.crt" && cmp -s "$lineage/privkey.pem" "$dest/server.key"; then return 0; fi
+    work=$(mktemp -d "$dest/.cert-sync.XXXXXX") || return 1
+    trap 'rm -rf -- "$work"' EXIT
+    cp -L -- "$lineage/fullchain.pem" "$work/cert" && cp -L -- "$lineage/privkey.pem" "$work/key" || return 1
+    cert_pub=$(openssl x509 -in "$work/cert" -noout -pubkey) &&
+        key_pub=$(openssl pkey -in "$work/key" -passin pass: -pubout) &&
+        [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] &&
+        openssl verify -partial_chain -trusted "$work/cert" -verify_hostname "$domain" "$work/cert" >/dev/null ||
+        { echo "新证书无效、已过期或与私钥不匹配。" >&2; return 1; }
+    if id hysteria >/dev/null 2>&1; then chown root:hysteria "$work/cert" "$work/key" || return 1; fi
+    chmod 640 "$work/cert" "$work/key" || return 1
+    if [[ -f "$dest/server.key" ]]; then cp -p -- "$dest/server.key" "$work/previous" || return 1; fi
+    mv -f -- "$work/key" "$dest/server.key" || return 1
+    if ! mv -f -- "$work/cert" "$dest/server.crt"; then
+        if [[ -f "$work/previous" ]]; then mv -f -- "$work/previous" "$dest/server.key" || { trap - EXIT; echo "原私钥保存在 $work/previous，请恢复后重试。" >&2; return 1; }
+        else rm -f -- "$dest/server.key"; fi
+        return 1
+    fi
+)
+
+render_cert_hook() {
+    printf '#!/usr/bin/env bash\n# buds-hy2 certificate deploy hook\n'
+    declare -f sync_node_certificate
+    printf 'sync_node_certificate %q %q\n' "$1" "$CONFIG_DIR"
+}
+
+cert_hook_kind() {
+    local hook=$1 domain body
+    [[ -f "$hook" && ! -L "$hook" ]] || return 1
+    domain=$(sed -nE 's/^sync_node_certificate ([A-Za-z0-9.-]+) .*/\1/p' "$hook")
+    if [[ "$domain" =~ ^[a-zA-Z0-9.-]+$ ]] && cmp -s "$hook" <(render_cert_hook "$domain"); then echo current; return 0; fi
+    body=$(tail -n +6 "$hook" | openssl dgst -sha256) || return 1
+    domain=$(sed -n '3s/^DOMAIN=//p' "$hook")
+    if [[ "${body##* }" != 0f192c00ba10902391387e2ca43bb2ac8cdc316a513b688d10019918566954d5 || ! "$domain" =~ ^[a-zA-Z0-9.-]+$ ]] ||
+            ! cmp -s <(head -n 5 "$hook") <(printf '#!/usr/bin/env bash\nset -e\nDOMAIN=%q\nCONFIG_DIR=%q\nCONFIG_FILE=%q\n' "$domain" "$CONFIG_DIR" "$CONFIG_FILE"); then
+        return 1
+    fi
+    echo legacy
+}
+
+write_cert_hook() (
+    local target=$1 domain=$2 stage
+    [[ ! -L "$target" && ! -d "$target" ]] || return 1
+    if [[ -e "$target" ]] && ! cert_hook_kind "$target" >/dev/null; then
+        echo "已保留已有续签钩子 $target，请核对其用途。" >&2; return 1
+    fi
+    stage=$(mktemp "${target}.XXXXXX") || return 1
+    trap 'rm -f -- "$stage"' EXIT
+    render_cert_hook "$domain" > "$stage" && bash -n "$stage" && chmod 755 "$stage" && mv -f -- "$stage" "$target"
+)
+
+upgrade_cert_hook() {
+    local hook=/etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh domain
+    [[ -f "$hook" && ! -L "$hook" ]] || { echo "没有可迁移的 HY2 续签钩子。"; return 0; }
+    local kind
+    if ! kind=$(cert_hook_kind "$hook"); then echo "此钩子经过定制，已保留，请按本机续签方式维护。" >&2; return 1; fi
+    if [[ "$kind" == current ]]; then echo "已安装热更新钩子。"; return 0; fi
+    domain=$(sed -n '3s/^DOMAIN=//p' "$hook")
+    write_cert_hook "$hook" "$domain" && echo "已更新 HY2 续签钩子，下次续签生效。"
+}
+
 renew_test() {
     if is_cert_self_signed; then
         echo -e "\n  ${C_BAR}  ${C_GREEN}✔ 当前节点使用极速自签名 ECC 证书 (100 年超长有效)，无需执行续签。${C_RESET}\n"
     elif [[ -f "/etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh" ]] && command -v certbot >/dev/null 2>&1; then
         echo -e "\n  ${C_BAR}  ${C_ORANGE_BOLD}模拟执行 Let's Encrypt 证书自动续签与挂钩同步...${C_RESET}\n"
-        certbot renew --dry-run --run-deploy-hooks
+        local domain
+        domain=$(get_domain) || return 1
+        [[ "$domain" =~ ^[a-zA-Z0-9.-]+$ ]] || { echo "无法确定节点证书名称，请检查配置。" >&2; return 1; }
+        certbot renew --cert-name "$domain" --dry-run --run-deploy-hooks
     else
         echo -e "\n  ${C_BAR}  ${C_AMBER}未检测到 Let's Encrypt 自动续签配置。${C_RESET}\n"
     fi
@@ -2544,6 +2645,10 @@ try:
     action, *args = sys.argv[1:]
     if action == "render":
         render(*args)
+    elif action == "same-rules":
+        planned, active = (json.loads(Path(path).read_text()) for path in args)
+        # 域名与地址族管理只修改这两个区段。端点 IP 和备用端口由启动流程确定。
+        sys.exit(0 if all(planned[key] == active[key] for key in ("dns", "route")) else 1)
     elif action == "check-resolved":
         check_resolved_domains(*args)
     elif action in ("next-port", "apply-port"):
@@ -2661,7 +2766,7 @@ warp_edit_domains() (
         python3 -I "$WARP_DIR/policy.py" render "$WARP_DIR/base.json" "$domains" "$work" "$family" &&
             (cd "$work" && "$binary" check -c config.json) || return 1
         if systemctl is-active --quiet "$WARP_UNIT"; then
-            if cmp -s "$work/domains" "$WARP_DIR/domains" && cmp -s "$work/config.json" "$WARP_DIR/config.json"; then
+            if cmp -s "$work/domains" "$WARP_DIR/domains" && python3 -I "$WARP_DIR/policy.py" same-rules "$work/config.json" "$WARP_DIR/config.json"; then
                 mv -f -- "$work/next" "$changed" || return 1
                 echo "$label 已保存，当前选路无需重载。"
                 return 0
@@ -4101,6 +4206,22 @@ def save_node(args):
     path = ROOT / args.name
     old = load_node(path) if args.action == "edit" else {}
     data = apply_preferences(args, old)
+    if old and data["public_ports"] != old["public_ports"] and dict(old, public_ports=data["public_ports"]) == data:
+        check_unit_link(path)
+        client = path / "client.yaml"
+        original = client.read_text()
+        pattern = r"^server:[ \t]*" + re.escape(data["domain"] + ":" + old["public_ports"]) + r"[ \t]*$"
+        if len(re.findall(pattern, original, re.M)) != 1:
+            raise ValueError("客户端地址已自定义，无法安全更新公网映射。")
+        updated = re.sub(pattern, "server: " + data["domain"] + ":" + data["public_ports"], original, flags=re.M)
+        atomic_text(client, updated)
+        try:
+            atomic_text(path / "node.json", json.dumps(data, indent=2) + "\n")
+        except (OSError, ValueError, KeyboardInterrupt):
+            atomic_text(client, original)
+            raise
+        print(f"公网 UDP 已改为 {data['public_ports']}。请重新导入客户端配置。")
+        return
     check_hopping(ports(data["ports"]))
     ROOT.mkdir(exist_ok=True)
     if ROOT.is_symlink():
@@ -4129,6 +4250,8 @@ def save_node(args):
             shutil.rmtree(work)
         else:
             print(f"原配置保存在 {previous}，请核对服务后再清理。", file=sys.stderr)
+    if not old or old["ports"] != data["ports"]:
+        sync_reserved_ports()
     print(f"节点 {args.name} 已保存 · 本地 UDP {data['ports']} · 公网 UDP {data['public_ports']}")
     print(f"查看连接信息：buds hy2 nodes link {args.name}")
 
@@ -4482,7 +4605,6 @@ def main():
             print("正在生成认证密码、混淆密码和证书，并启动节点…", flush=True)
             fcntl.flock(9, fcntl.LOCK_EX)
         save_node(args)
-        sync_reserved_ports()
         return
     if args.name == "main":
         raise ValueError("主节点卸载和维护请使用节点区中的主节点菜单。")
@@ -4869,8 +4991,12 @@ uninstall() (
                 systemctl is-enabled --quiet hysteria-server; then
                 systemctl disable hysteria-server || return 1
             fi
-            rm -rf /etc/systemd/system/hysteria-server.service.d || return 1
-            rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service || return 1
+            local override=/etc/systemd/system/hysteria-server.service.d/override.conf
+            if [[ -f "$override" && ! -L "$override" ]] && cmp -s "$override" <(printf '%s\n' '[Service]' 'Restart=on-failure' 'RestartSec=3s' 'LimitNOFILE=1048576' 'Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'); then
+                rm -f -- "$override" || return 1
+            fi
+            rm -f /etc/systemd/system/hysteria-server.service || return 1
+            rmdir /etc/systemd/system/hysteria-server.service.d 2>/dev/null || true
             systemctl daemon-reload || return 1
         fi
         if has_openrc; then
@@ -4882,10 +5008,22 @@ uninstall() (
         if [[ -f /etc/rc.local ]]; then
             sed -i '\|^/usr/local/bin/hysteria-service start$|d' /etc/rc.local
         fi
-        rm -f /usr/local/bin/hysteria /usr/local/bin/buds /usr/local/bin/hy2 /usr/local/bin/hysteria-service
-        rm -rf /etc/hysteria /var/log/hysteria.log /etc/logrotate.d/hysteria
-        rm -f /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh
-        rm -f /etc/sysctl.d/99-hysteria-performance.conf
+        if [[ "$HY2_CLI" -ef "$BUDS_CLI" || ( -L "$HY2_CLI" && $(readlink -- "$HY2_CLI") == "$BUDS_CLI" ) ]]; then rm -f -- "$HY2_CLI" || return 1; fi
+        rm -f /usr/local/bin/hysteria "$BUDS_CLI" /usr/local/bin/hysteria-service || return 1
+        rm -f -- "$CONFIG_DIR"/{config.yaml,client.yaml,server.crt,server.key,.public_port,.nat-mode,.version_cache} /var/log/hysteria.log /etc/logrotate.d/hysteria || return 1
+        [[ ! -d "$CONFIG_DIR/nodes" ]] || rmdir -- "$CONFIG_DIR/nodes" || return 1
+        if [[ -d "$CONFIG_DIR" ]] && ! rmdir -- "$CONFIG_DIR"; then echo "已保留 $CONFIG_DIR 中的其他文件。"; fi
+        local hook=/etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh
+        if cert_hook_kind "$hook" >/dev/null; then rm -f -- "$hook" || return 1; fi
+        local tuning=/etc/sysctl.d/99-hysteria-performance.conf sum
+        if [[ -f "$tuning" && ! -L "$tuning" ]]; then
+            sum=$(openssl dgst -sha256 "$tuning") || return 1
+            if [[ "${sum##* }" == 54d17670bc7606e5ac88346aad06d753546e3249faba858bf18edfca278264dd ]] ||
+                    { grep -Fxq '# buds-hy2 UDP socket buffers' "$tuning" &&
+                        ! grep -Evq '^(# buds-hy2 UDP socket buffers|net[.]core[.][rw]mem_max=67108864)$' "$tuning"; }; then
+                rm -f -- "$tuning" || return 1
+            fi
+        fi
         nodes_tool reserve-ports || echo "  未能清理源端口保留，请检查 /etc/sysctl.d/99-buds-hy2-reserved-ports.conf。" >&2
         echo -e "\n  ${C_BAR}  ${C_GREEN}✔ Hysteria 2 服务已卸载，本项目创建的防火墙规则已清理，原有 Nginx 及其他系统服务未作修改。${C_RESET}\n"
     else
@@ -4971,6 +5109,15 @@ check_remote_version() {
     printf '%s\n' "$remote_ver"
 }
 
+ensure_hy2_alias() {
+    if [[ -L "$HY2_CLI" && $(readlink -- "$HY2_CLI") == "$BUDS_CLI" || "$HY2_CLI" -ef "$BUDS_CLI" ]]; then return 0; fi
+    if [[ -e "$HY2_CLI" || -L "$HY2_CLI" ]]; then
+        echo "$HY2_CLI 已被占用。可使用 buds hy2。" >&2
+        return 1
+    fi
+    ln -s -- "$BUDS_CLI" "$HY2_CLI"
+}
+
 update_script() (
     if [[ ! -s "$UPDATE_PUBLIC_KEY" ]]; then
         printf '缺少可信发布公钥 %s，请按 README 安装。\n' "$UPDATE_PUBLIC_KEY" >&2
@@ -5039,7 +5186,7 @@ update_script() (
         echo "无法替换管理脚本，已保留现有脚本。" >&2
         return 1
     fi
-    if ! ln -sf "$BUDS_CLI" "$HY2_CLI"; then
+    if ! ensure_hy2_alias; then
         echo "主脚本已更新，hy2 快捷链接创建失败，可继续使用 buds。" >&2
     fi
     rm -f "$VERSION_CACHE_FILE" 2>/dev/null || true
@@ -5268,6 +5415,7 @@ case "$1" in
     restart|stop|start|link|client) nodes_manage "$1" main ;;
     warp) shift; warp_manage "$@" ;;
     nodes|node) shift; nodes_manage "$@" ;;
+    renew-hook) upgrade_cert_hook ;;
     renew-test) renew_test ;;
     uninstall) uninstall ;;
     update) update_script ;;

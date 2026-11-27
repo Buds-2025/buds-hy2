@@ -18,6 +18,16 @@ left = updated.index("record_firewall_rule() {")
 right = updated.index("start_service() {", left)
 updated = updated[:left] + shared + updated[right:]
 
+cert_helpers = buds_content[buds_content.index("sync_node_certificate() ("):buds_content.index("upgrade_cert_hook() {")]
+left = updated.index("sync_node_certificate() (")
+right = updated.index("setup_certificates() {", left)
+updated = updated[:left] + cert_helpers + updated[right:]
+
+alias_helper = buds_content[buds_content.index("ensure_hy2_alias() {"):buds_content.index("update_script() (")]
+left = updated.index("ensure_hy2_alias() {")
+right = updated.index("setup_cli() {", left)
+updated = updated[:left] + alias_helper + updated[right:]
+
 if "--check" in sys.argv:
     if text != updated:
         print("Embedded CLI differs; run: python scripts/sync_cli.py", file=sys.stderr)

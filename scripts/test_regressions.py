@@ -1091,6 +1091,10 @@ if grep -Fxq accepted.example "$WARP_LIST"; then exit 9; fi
 warp_manage enable "$profile_path"
 [[ -s "$WARP_DIR/config.json" && -e "$unit_path" && -e "$SANDBOX/active" ]]
 [[ -e "$SANDBOX/etc/systemd/system/$WARP_TIMER" && -e "$SANDBOX/etc/systemd/system/$WARP_WATCH" && -x "$WARP_DIR/healthcheck" ]]
+python3 -c 'import json,sys; p=sys.argv[1]; c=json.load(open(p)); c["endpoints"][0]["peers"][0].update(address="192.0.2.1",port=500); open(p,"w").write(json.dumps(c))' "$WARP_DIR/config.json"
+restart_count=$(grep -c '^restart ' "$ACTION_FILE" || :)
+warp_manage domains add example.com
+[[ $(grep -c '^restart ' "$ACTION_FILE" || :) == "$restart_count" ]] || exit 9
 if warp_manage domains add example.net; then exit 9; fi
 if grep -Fxq example.net "$WARP_LIST"; then exit 9; fi
 warp_domain_selected child.example.com
@@ -1322,7 +1326,7 @@ ensure_service_account
         common = """
 validate_domain() { :; }
 generate_random_port() { echo 24443; }
-generate_random_string() { echo random; }
+generate_random_string() { echo 0123456789abcdef01234567; }
 check_port_available() { return 0; }
 IS_NAT=true; IS_CONTAINER=true
 """
@@ -1487,8 +1491,9 @@ cleanup_firewall
         (self.config / ".public_port").write_text("19957\n")
         binary_dir = self.directory / "usr/local/bin"
         binary_dir.mkdir(parents=True)
-        for name in ("buds", "hy2", "hysteria"):
+        for name in ("buds", "hysteria"):
             (binary_dir / name).write_text("old-install")
+        os.link(binary_dir / "buds", binary_dir / "hy2")
         runner = binary_dir / "hysteria-service"
         runner.write_text('#!/usr/bin/env bash\n[[ "$1" == stop ]]\n', encoding="utf-8", newline="\n")
         runner.chmod(0o755)
@@ -2063,33 +2068,90 @@ uninstall <<<'y'
 """)
         self.assertFalse(self.config.exists())
 
-    def test_certificate_hook_escapes_domain_and_waits_for_old_process(self):
-        (self.directory / "etc/letsencrypt/live/node.example.com").mkdir(parents=True)
-        for name in ("fullchain.pem", "privkey.pem"):
-            (self.directory / "etc/letsencrypt/live/node.example.com" / name).write_text("certificate")
-        # Extract the deployment hook from setup_certificates without issuing a certificate.
-        body = self.sources["install.sh"].split("    {\n        printf '#!/usr/bin/env bash", 1)[1]
-        body = body.split("    } > \"$HOOK_FILE\"", 1)[0]
-        hook_script = "    {\n        printf '#!/usr/bin/env bash" + body + '    } > "$HOOK_FILE"\n'
-        self.shell('mkdir -p "$HOOK_DIR"\nDOMAIN=node.example.com\n' + hook_script, "install.sh")
+    def test_cert_hook_filters_lineage_and_validates_pair_before_live_install(self):
+        self.certificates()
+        exported = self.directory / "etc/letsencrypt/live/node.example.com"
+        exported.mkdir(parents=True)
+        shutil.copy(self.directory / "signed.crt", exported / "fullchain.pem")
+        shutil.copy(self.config / "server.key", exported / "privkey.pem")
         hook = self.directory / "etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh"
-        self.assertIn("DOMAIN=node.example.com", hook.read_text(encoding="utf-8"))
-        out = self.shell(f"""
-command() {{ if [[ "$1" == -v && "$2" =~ ^(systemctl|rc-service|rc-update|openrc-run)$ ]]; then return 1; fi; builtin command "$@"; }}
-pgrep() {{ return 0; }}
-pkill() {{ return 0; }}
-nohup() {{ echo UNEXPECTED_RESTART >> "$ACTION_FILE"; }}
-export -f pgrep pkill nohup command
-export SANDBOX ACTION_FILE
-bash "$SANDBOX/etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh"
-""", expected=1)
-        self.assertNotIn("UNEXPECTED_RESTART", self.actions())
+        self.shell(r"""
+mkdir -p "$HOOK_DIR"
+write_cert_hook "$HOOK_FILE" node.example.com
+[[ $(cert_hook_kind "$HOOK_FILE") == current ]] || exit 9
+export ACTION_FILE
+systemctl() { echo unexpected-service-action >> "$ACTION_FILE"; return 1; }
+export -f systemctl chown
+RENEWED_LINEAGE=/unrelated bash "$HOOK_FILE"
+! cmp -s "$CONFIG_DIR/server.crt" "$SANDBOX/signed.crt" || exit 9
+bash "$HOOK_FILE"
+cmp "$CONFIG_DIR/server.crt" "$SANDBOX/signed.crt"
+[[ ! -s "$ACTION_FILE" ]]
+""", "install.sh")
+        before = [(self.config / name).read_bytes() for name in ("server.crt", "server.key")]
+        shutil.copy(self.config / "ca.key", exported / "privkey.pem")
+        self.shell('export -f chown; if bash "$HOOK_FILE"; then exit 9; fi', "install.sh")
+        self.assertEqual(before, [(self.config / name).read_bytes() for name in ("server.crt", "server.key")])
+        self.assertIn("sync_node_certificate", hook.read_text())
+
+    def test_uninstall_preserves_other_configs_units_and_command(self):
+        self.node_config()
+        self.shell(r"""
+has_systemd() { :; }; has_openrc() { return 1; }
+dir="$SANDBOX/etc/systemd/system"
+mkdir -p "$dir/hysteria-server.service.d" "$SANDBOX/usr/local/bin"
+touch "$dir/hysteria-server@.service" "$dir/hysteria-server.service.d/override.conf"
+touch "$CONFIG_DIR/other.yaml" "$SANDBOX/usr/local/bin/hy2"
+hook="$SANDBOX/etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh"
+mkdir -p "$(dirname "$hook")"
+printf '%s\n' '# locally maintained' > "$hook"
+uninstall <<<'y'
+grep -Fxq '# locally maintained' "$hook"
+[[ -f "$CONFIG_DIR/other.yaml" && ! -e "$CONFIG_FILE" && -f "$SANDBOX/usr/local/bin/hy2" ]]
+[[ -f "$dir/hysteria-server@.service" && -f "$dir/hysteria-server.service.d/override.conf" ]]
+""")
+
+    def test_additional_node_public_port_edit_preserves_runtime_and_recovers_from_failed_save(self):
+        m = self.node_manager()
+        node = self.config / "nodes/work"
+        node.mkdir(parents=True)
+        old = {"name": "work", "domain": "node.example.com", "public_ports": "24443", "ports": "24443"}
+        path = node / "client.yaml"
+        original = "server: node.example.com:24443\n# custom client content\n"
+        path.write_text(original)
+        m.update(load_node=lambda _: old, apply_preferences=lambda *_: dict(old, public_ports="30300"),
+                 check_unit_link=lambda _: None)
+        args = SimpleNamespace(name="work", action="edit")
+        def fail_metadata(target, value):
+            if target.name == "node.json":
+                raise OSError("disk full")
+            target.write_text(value)
+        m["atomic_text"] = fail_metadata
+        with self.assertRaisesRegex(OSError, "disk full"):
+            m["save_node"](args)
+        self.assertEqual(path.read_text(), original)
+        m["atomic_text"] = lambda target, value: target.write_text(value)
+        with redirect_stdout(StringIO()):
+            m["save_node"](args)
+        self.assertEqual(path.read_text(), original.replace("24443", "30300"))
+        self.assertEqual(json.loads((node / "node.json").read_text())["public_ports"], "30300")
+
+    def test_random_port_and_credential_generation_fail_closed(self):
+        self.shell(r"""
+ss() { printf '%s\n' 'ESTAB 0 0 [::]:42000 [::]:32000'; }
+if check_port_available 42000; then exit 9; fi
+check_port_available 32000
+check_port_available() { return 1; }
+if generate_random_port; then exit 9; fi
+openssl() { return 1; }
+if generate_random_string; then exit 9; fi
+""", "install.sh")
 
     def test_range_port_check_is_awk_compatible(self):
         output = self.shell("""
 ss() { printf 'UNCONN 0 0 0.0.0.0:20005 0.0.0.0:* users:(("other",pid=1,fd=1))\\n'; }
 validate_domain() { :; }; generate_random_port() { echo 24443; }
-generate_random_string() { echo random; }
+generate_random_string() { echo 0123456789abcdef01234567; }
 IS_NAT=false; IS_CONTAINER=false
 collect_parameters <<'INPUT'
 node.example.com
